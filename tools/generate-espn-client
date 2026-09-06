@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+spec=${ESPN_OPENAPI_SPEC:-"$repo_root/clients/espn/openapi/site-api.json"}
+generator=${OPENAPI2ZIG:-openapi2zig}
+generated="$repo_root/clients/espn/src/generated.zig"
+
+if ! command -v "$generator" >/dev/null 2>&1; then
+    echo "openapi2zig is required. Run 'mise install' or set OPENAPI2ZIG." >&2
+    exit 1
+fi
+if [ ! -f "$spec" ]; then
+    echo "ESPN spec not found: $spec" >&2
+    echo "set ESPN_OPENAPI_SPEC to an OpenAPI JSON file" >&2
+    exit 1
+fi
+
+"$generator" generate \
+    -i "$spec" \
+    -o "$generated" \
+    --base-url https://site.api.espn.com/apis/site/v2
+zig fmt "$generated"

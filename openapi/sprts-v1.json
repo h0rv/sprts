@@ -1,0 +1,107 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sprts API",
+    "version": "1.0.0",
+    "description": "Provider-neutral sports scores and schedules."
+  },
+  "paths": {
+    "/api/v1/leagues": {
+      "get": {
+        "operationId": "listLeagues",
+        "responses": {
+          "200": {
+            "description": "Supported leagues",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LeagueList" } } }
+          }
+        }
+      }
+    },
+    "/api/v1/{league}": {
+      "get": {
+        "operationId": "getScoreboard",
+        "parameters": [
+          { "name": "league", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "date", "in": "query", "required": false, "schema": { "type": "string", "format": "date" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Scores for one league and date",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Scoreboard" } } }
+          },
+          "400": { "description": "Invalid date" },
+          "404": { "description": "Unknown league" },
+          "502": { "description": "The upstream provider is unavailable" }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "League": {
+        "type": "object",
+        "required": ["slug", "name", "sport"],
+        "properties": {
+          "slug": { "type": "string" },
+          "name": { "type": "string" },
+          "sport": { "type": "string" }
+        }
+      },
+      "LeagueList": {
+        "type": "object",
+        "required": ["schema_version", "leagues"],
+        "properties": {
+          "schema_version": { "const": "1" },
+          "leagues": { "type": "array", "items": { "$ref": "#/components/schemas/League" } }
+        }
+      },
+      "Participant": {
+        "type": "object",
+        "description": "A team, athlete, driver, fighter, or other entrant.",
+        "required": ["id", "name", "abbreviation", "score", "winner", "home_away"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "abbreviation": { "type": "string" },
+          "score": { "type": "string" },
+          "winner": { "type": "boolean" },
+          "home_away": {
+            "description": "The team-sport side when the provider supplies one.",
+            "oneOf": [
+              { "type": "string", "enum": ["home", "away"] },
+              { "type": "null" }
+            ]
+          }
+        }
+      },
+      "Game": {
+        "type": "object",
+        "description": "One game, bout, race, tournament, or other competition.",
+        "required": ["id", "name", "starts_at", "state", "status", "participants"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "starts_at": { "type": "string", "format": "date-time" },
+          "state": { "type": "string", "enum": ["pre", "in", "post"] },
+          "status": { "type": "string" },
+          "participants": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Participant" }
+          }
+        }
+      },
+      "Scoreboard": {
+        "type": "object",
+        "required": ["schema_version", "league", "league_name", "date", "source", "games"],
+        "properties": {
+          "schema_version": { "const": "1" },
+          "league": { "type": "string" },
+          "league_name": { "type": "string" },
+          "date": { "type": "string", "format": "date" },
+          "source": { "type": "string" },
+          "games": { "type": "array", "items": { "$ref": "#/components/schemas/Game" } }
+        }
+      }
+    }
+  }
+}

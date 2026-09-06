@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+.env
+node_modules/
+.wrangler/
+.dev.vars

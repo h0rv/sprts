@@ -1,0 +1,22 @@
+.{
+    .name = .sprts,
+    .version = "0.1.0",
+    .fingerprint = 0xc645edd4755df2e6,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sprts_core = .{ .path = "packages/core" },
+        .espn_client = .{ .path = "clients/espn" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "apps",
+        "packages",
+        "clients",
+        "tools",
+        "openapi",
+        "README.md",
+        "LICENSE",
+        "mise.toml",
+    },
+}

@@ -1,0 +1,11 @@
+.{
+    .name = .sprts_server,
+    .version = "0.1.0",
+    .fingerprint = 0x953d7b9c90b89096,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sprts_core = .{ .path = "../../packages/core" },
+        .espn_client = .{ .path = "../../clients/espn" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
+}
