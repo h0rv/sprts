@@ -56,6 +56,10 @@
       "build": {
         "command": "mise exec -- zig build wasm"
       },
+      // The container env's DO migration is inheritable: without this
+      // override miniflare wraps a phantom "SprtsContainer" export that the
+      // Zig entry point doesn't provide (Class extends value undefined).
+      "migrations": [],
       "observability": {
         "enabled": true,
         "logs": {
