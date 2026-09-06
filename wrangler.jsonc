@@ -4,12 +4,6 @@
   "main": "cloudflare/index.ts",
   "compatibility_date": "2026-09-06",
   "compatibility_flags": ["nodejs_compat"],
-  "routes": [
-    {
-      "pattern": "sprts.horv.co",
-      "custom_domain": true
-    }
-  ],
   "containers": [
     {
       "class_name": "SprtsContainer",
@@ -49,7 +43,7 @@
       "compatibility_flags": ["nodejs_compat"],
       "routes": [
         {
-          "pattern": "wasm.sprts.horv.co",
+          "pattern": "sprts.horv.co",
           "custom_domain": true
         }
       ],
