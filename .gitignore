@@ -1,5 +1,7 @@
 .zig-cache/
 zig-out/
+zig-pkg/
+apps/server/zig-pkg/
 .env
 node_modules/
 .wrangler/

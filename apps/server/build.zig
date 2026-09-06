@@ -5,11 +5,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const core = b.dependency("sprts_core", .{ .target = target, .optimize = optimize }).module("sprts_core");
     const espn = b.dependency("espn_client", .{ .target = target, .optimize = optimize }).module("espn_client");
+    const zchema = b.dependency("zchema", .{ .target = target, .optimize = optimize }).module("zchema");
     const server = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "sprts_core", .module = core }, .{ .name = "espn_client", .module = espn } },
+        .imports = &.{ .{ .name = "sprts_core", .module = core }, .{ .name = "espn_client", .module = espn }, .{ .name = "zchema", .module = zchema } },
     });
     const exe = b.addExecutable(.{
         .name = "sprts",
@@ -17,7 +18,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "sprts_server", .module = server }, .{ .name = "sprts_core", .module = core } },
+            .imports = &.{ .{ .name = "sprts_server", .module = server }, .{ .name = "sprts_core", .module = core }, .{ .name = "zchema", .module = zchema } },
         }),
     });
     b.installArtifact(exe);

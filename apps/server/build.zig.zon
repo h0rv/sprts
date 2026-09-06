@@ -6,6 +6,10 @@
     .dependencies = .{
         .sprts_core = .{ .path = "../../packages/core" },
         .espn_client = .{ .path = "../../clients/espn" },
+        .zchema = .{
+            .url = "git+https://github.com/h0rv/zchema.git#db677f499d7e807c0bed04b6092a0375bf79aed3",
+            .hash = "zchema-0.0.0-ShyKcdn9AQBJ3yNdS8aWHeeTlbYE4PlYVb7nSGd9AZnb",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
 }

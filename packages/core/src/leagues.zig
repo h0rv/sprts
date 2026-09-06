@@ -4,6 +4,18 @@ pub const League = struct {
     slug: []const u8,
     name: []const u8,
     sport: []const u8,
+
+    pub const jsonschema = .{ .name = "League" };
+};
+
+pub const LeagueList = struct {
+    schema_version: []const u8 = "1",
+    leagues: []const League,
+
+    pub const jsonschema = .{
+        .name = "LeagueList",
+        .fields = .{ .schema_version = .{ .@"const" = "1" } },
+    };
 };
 
 /// Adding a competition is deliberately data-only: no router, adapter, or

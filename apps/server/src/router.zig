@@ -13,6 +13,7 @@ pub const Route = union(enum) {
     home: Format,
     leagues,
     scoreboard: ScoreboardRoute,
+    openapi,
     health,
     not_found,
     bad_date,
@@ -27,6 +28,7 @@ pub fn parse(target: []const u8, accept: []const u8, user_agent: []const u8) Rou
 
     if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = format };
     if (std.mem.eql(u8, path, "/healthz")) return .health;
+    if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
 
     const api_prefix = "/api/v1/";

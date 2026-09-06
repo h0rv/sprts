@@ -66,6 +66,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
 
     switch (server_app.router.parse(request.head.target, accept, user_agent)) {
         .health => try respond(request, "ok\n", .text, .ok, &.{.{ .name = "cache-control", .value = "no-store" }}),
+        .openapi => try respond(request, try server_app.spec.openApiJson(arena), .json, .ok, commonHeaders()),
         .home => |format| try respond(request, try server_app.render.home(arena, format), format, .ok, commonHeaders()),
         .leagues => try respond(request, try server_app.render.leaguesJson(arena), .json, .ok, commonHeaders()),
         .bad_date => try respondError(arena, request, "date must be YYYY-MM-DD", .text, .bad_request),

@@ -1,11 +1,22 @@
 const std = @import("std");
 const core = @import("sprts_core");
+const z = @import("zchema");
 const domain = core.domain;
 const leagues = core.leagues;
 const dates = core.date;
 const router = @import("router.zig");
 
 pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
+    // Validate against the schema derived from the domain types before
+    // rendering. A normalization bug becomes a 502 upstream error instead of
+    // silently shipping invalid JSON. Validation scratch lives in a temporary
+    // arena so `std.testing.allocator` tests don't leak.
+    {
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const validation_json = try z.serializeAndValidate(domain.Scoreboard, tmp.allocator(), board, true);
+        _ = validation_json;
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try std.json.Stringify.value(board, .{ .whitespace = .indent_2 }, &out.writer);
@@ -106,31 +117,32 @@ pub fn home(allocator: std.mem.Allocator, format: router.Format) ![]u8 {
             for (leagues.all) |league| try w.print("<a href=\"/{s}\"><b>{s}</b><span>{s}</span></a>", .{ league.slug, league.name, league.sport });
             try w.writeAll("</div><footer><a href=\"/api/v1/leagues\">JSON API</a> · curl-friendly by default</footer></main></body></html>");
         },
-        .json => try writeLeaguesJson(w),
+        .json => {
+            const list = leagues.LeagueList{ .leagues = &leagues.all };
+            {
+                var tmp = std.heap.ArenaAllocator.init(allocator);
+                defer tmp.deinit();
+                _ = try z.serializeAndValidate(leagues.LeagueList, tmp.allocator(), list, true);
+            }
+            try std.json.Stringify.value(list, .{ .whitespace = .indent_2 }, w);
+            try w.writeByte('\n');
+        },
     }
     return out.toOwnedSlice();
 }
 
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
+    const list = leagues.LeagueList{ .leagues = &leagues.all };
+    {
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        _ = try z.serializeAndValidate(leagues.LeagueList, tmp.allocator(), list, true);
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try writeLeaguesJson(&out.writer);
+    try std.json.Stringify.value(list, .{ .whitespace = .indent_2 }, &out.writer);
+    try out.writer.writeByte('\n');
     return out.toOwnedSlice();
-}
-
-fn writeLeaguesJson(w: *std.Io.Writer) !void {
-    try w.writeAll("{\n  \"schema_version\": \"1\",\n  \"leagues\": [\n");
-    for (leagues.all, 0..) |league, i| {
-        if (i != 0) try w.writeAll(",\n");
-        try w.writeAll("    {\"slug\":");
-        try std.json.Stringify.value(league.slug, .{}, w);
-        try w.writeAll(",\"name\":");
-        try std.json.Stringify.value(league.name, .{}, w);
-        try w.writeAll(",\"sport\":");
-        try std.json.Stringify.value(league.sport, .{}, w);
-        try w.writeByte('}');
-    }
-    try w.writeAll("\n  ]\n}\n");
 }
 
 pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: router.Format) ![]u8 {
