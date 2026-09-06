@@ -6,6 +6,8 @@ const leagues = core.leagues;
 const dates = core.date;
 const router = @import("router.zig");
 
+const inner_width = 50;
+
 pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     // Validate against the schema derived from the domain types before
     // rendering. A normalization bug becomes a 502 upstream error instead of
@@ -24,26 +26,41 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     return out.toOwnedSlice();
 }
 
-pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
+pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.print("sprts  {s}  {s}\n", .{ board.league_name, board.date });
-    try w.writeAll("────────────────────────────────────────\n");
+    try writeRule(w, .top);
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
+    defer allocator.free(heading);
+    try writeRow(w, heading, inner_width - 2, "2", color);
     if (board.games.len == 0) {
-        try w.writeAll("No games scheduled.\n");
+        try writeRule(w, .mid);
+        try writeRow(w, "No games scheduled.", inner_width - 2, null, color);
     }
-    for (board.games, 0..) |game, index| {
-        if (index != 0) try w.writeByte('\n');
-        try w.print("{s}\n", .{game.status});
-        if (game.participants.len == 0) try w.print("{s}\n", .{game.name});
-        for (game.participants) |participant| try writeParticipantLine(w, participant);
+    for (board.games) |game| {
+        try writeRule(w, .mid);
+        try writeRow(w, game.status, inner_width - 2, statusColor(game.state), color);
+        if (teamArtForGame(board.league, &game)) |mark| {
+            var lines = std.mem.splitScalar(u8, mark, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try writeArtRow(w, line);
+            }
+        }
+        if (game.participants.len == 0) {
+            try writeRow(w, game.name, inner_width - 2, null, color);
+        }
+        for (game.participants) |participant| {
+            try writeParticipantRow(w, participant, color);
+        }
     }
+    try writeRule(w, .bottom);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
     defer allocator.free(next);
-    try w.print("\n← /{s}?date={s}    /{s}?date={s} →\n", .{
+    try w.print("/{s}?date={s}    /{s}?date={s}\n", .{
         board.league,
         previous,
         board.league,
@@ -52,82 +69,140 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn writeParticipantLine(w: *std.Io.Writer, participant: domain.Participant) !void {
-    try w.print("{s: <5} {s: <28} {s: >3}{s}\n", .{
-        participant.abbreviation,
-        participant.name,
-        participant.score,
-        if (participant.winner) "  ✓" else "",
-    });
+fn statusColor(state: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, state, "in")) return "1;31";
+    if (std.mem.eql(u8, state, "pre")) return "33";
+    return null;
 }
 
-pub fn html(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
+fn teamArtForGame(league_slug: []const u8, game: *const domain.Game) ?[]const u8 {
+    for (game.participants) |participant| {
+        if (core.art.teamArt(league_slug, participant.abbreviation, .sm)) |mark| return mark;
+    }
+    return null;
+}
+
+/// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
+/// byte-based writeCell would slice glyphs and break the rules. Count code
+/// points instead; the tool guarantees single-cell glyphs.
+fn writeArtRow(w: *std.Io.Writer, line: []const u8) !void {
+    try w.writeAll("│ ");
+    try w.writeAll(line);
+    var cells: usize = 0;
+    var view = std.unicode.Utf8View.init(line) catch return error.InvalidArt;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |_| cells += 1;
+    var i: usize = cells;
+    while (i < inner_width - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(" │\n");
+}
+
+fn writeParticipantRow(w: *std.Io.Writer, participant: domain.Participant, color: bool) !void {
+    const mark: ?[]const u8 = if (participant.winner) "32" else null;
+    try w.writeAll("│ ");
+    try writeCell(w, participant.abbreviation, 4, mark, color);
+    try w.writeByte(' ');
+    try writeCell(w, participant.name, 36, mark, color);
+    try w.writeByte(' ');
+    try writeCellRight(w, participant.score, 4, mark, color);
+    if (participant.winner) {
+        if (color) try w.writeAll("\x1b[32m");
+        try w.writeAll(" ✓");
+        if (color) try w.writeAll("\x1b[0m");
+    } else {
+        try w.writeAll("  ");
+    }
+    try w.writeAll(" │\n");
+}
+
+fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+    try w.writeAll("│ ");
+    try writeCell(w, s, width, code, color);
+    try w.writeAll(" │\n");
+}
+
+const Rule = enum { top, mid, bottom };
+
+fn writeRule(w: *std.Io.Writer, which: Rule) !void {
+    const left: []const u8 = switch (which) {
+        .top => "┌",
+        .mid => "├",
+        .bottom => "└",
+    };
+    const right: []const u8 = switch (which) {
+        .top => "┐\n",
+        .mid => "┤\n",
+        .bottom => "┘\n",
+    };
+    try w.writeAll(left);
+    var i: usize = 0;
+    while (i < inner_width) : (i += 1) try w.writeAll("─");
+    try w.writeAll(right);
+}
+
+/// Writes `s` fitted to exactly `width` bytes, truncating at a code point
+/// boundary with an ellipsis when too long. Escape bytes are never part of
+/// the width: color wraps the fitted bytes only.
+fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+    const end, const ellipsis = fit(s, width);
+    const use_color = color and code != null;
+    if (use_color) try w.print("\x1b[{s}m", .{code.?});
+    try w.writeAll(s[0..end]);
+    if (ellipsis) try w.writeAll("…");
+    if (use_color) try w.writeAll("\x1b[0m");
+    const pad: usize = end + (if (ellipsis) "...".len else 0);
+    // "…" is 3 bytes; byte padding keeps the rules aligned for the
+    // Latin names this server renders.
+    var i: usize = pad;
+    while (i < width) : (i += 1) try w.writeByte(' ');
+}
+
+fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+    const end, const ellipsis = fit(s, width);
+    const use_color = color and code != null;
+    const pad: usize = end + (if (ellipsis) "...".len else 0);
+    var spaces: usize = 0;
+    while (pad + spaces < width) : (spaces += 1) {}
+    while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
+    if (use_color) try w.print("\x1b[{s}m", .{code.?});
+    try w.writeAll(s[0..end]);
+    if (ellipsis) try w.writeAll("…");
+    if (use_color) try w.writeAll("\x1b[0m");
+}
+
+fn fit(s: []const u8, width: usize) struct { usize, bool } {
+    if (s.len <= width) return .{ s.len, false };
+    if (width < 4) return .{ 0, true };
+    var end: usize = width - 3;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return .{ end, true };
+}
+
+fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !void {
+    if (!enabled) {
+        try w.writeAll(s);
+        return;
+    }
+    try w.print("\x1b[{s}m", .{code});
+    try w.writeAll(s);
+    try w.writeAll("\x1b[0m");
+}
+
+pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    try w.print("<title>{s} scores · sprts</title>", .{board.league_name});
-    try w.writeAll(style ++ "</head><body><main><header><a class=\"brand\" href=\"/\">sprts</a><span>scores without the noise</span></header>");
-    try w.print("<section class=\"title\"><h1>{s}</h1><time>{s}</time></section>", .{ board.league_name, board.date });
-    const previous = try dates.shift(allocator, board.date, -1);
-    defer allocator.free(previous);
-    const next = try dates.shift(allocator, board.date, 1);
-    defer allocator.free(next);
-    try w.print("<nav><a href=\"/{s}?date={s}\" rel=\"prev\">← Previous</a><a href=\"/{s}\">Today</a><a href=\"/{s}?date={s}\" rel=\"next\">Next →</a></nav>", .{ board.league, previous, board.league, board.league, next });
-    if (board.games.len == 0) try w.writeAll("<p class=\"empty\">No games scheduled.</p>");
-    for (board.games) |game| {
-        try w.writeAll("<article><div class=\"status\">");
-        try escape(w, game.status);
-        try w.writeAll("</div>");
-        if (game.participants.len == 0) {
-            try w.writeAll("<div class=\"team\"><span>");
-            try escape(w, game.name);
-            try w.writeAll("</span></div>");
-        }
-        for (game.participants) |participant| try htmlParticipant(w, participant);
-        try w.writeAll("</article>");
+    try colorize(w, "2", "sprts\n", color);
+    try writeRule(w, .top);
+    for (leagues.all) |league| {
+        try w.writeAll("│ ");
+        try writeCell(w, league.slug, 13, null, color);
+        try w.writeByte(' ');
+        try writeCell(w, league.name, 36, null, color);
+        try w.writeAll(" │\n");
     }
-    try w.print("<footer>Data: {s} · <a href=\"/api/v1/{s}?date={s}\">JSON API</a></footer></main></body></html>", .{ board.source, board.league, board.date });
-    return out.toOwnedSlice();
-}
-
-fn htmlParticipant(w: *std.Io.Writer, participant: domain.Participant) !void {
-    try w.writeAll("<div class=\"team\"><b>");
-    try escape(w, participant.abbreviation);
-    try w.writeAll("</b><span>");
-    try escape(w, participant.name);
-    try w.writeAll("</span><strong>");
-    try escape(w, participant.score);
-    if (participant.winner) try w.writeAll(" ✓");
-    try w.writeAll("</strong></div>");
-}
-
-pub fn home(allocator: std.mem.Allocator, format: router.Format) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-    switch (format) {
-        .text => {
-            try w.writeAll("sprts — live scores without the noise\n\n");
-            for (leagues.all) |league| try w.print("{s: <13} {s}\n", .{ league.slug, league.name });
-            try w.writeAll("\nTry: curl localhost:8080/mlb\n");
-        },
-        .html => {
-            try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>sprts</title>" ++ style ++ "</head><body><main><header><span class=\"brand\">sprts</span><span>scores without the noise</span></header><section class=\"title\"><h1>Leagues</h1></section><div class=\"leagues\">");
-            for (leagues.all) |league| try w.print("<a href=\"/{s}\"><b>{s}</b><span>{s}</span></a>", .{ league.slug, league.name, league.sport });
-            try w.writeAll("</div><footer><a href=\"/api/v1/leagues\">JSON API</a> · curl-friendly by default</footer></main></body></html>");
-        },
-        .json => {
-            const list = leagues.LeagueList{ .leagues = &leagues.all };
-            {
-                var tmp = std.heap.ArenaAllocator.init(allocator);
-                defer tmp.deinit();
-                _ = try z.serializeAndValidate(leagues.LeagueList, tmp.allocator(), list, true);
-            }
-            try std.json.Stringify.value(list, .{ .whitespace = .indent_2 }, w);
-            try w.writeByte('\n');
-        },
-    }
+    try writeRule(w, .bottom);
+    try colorize(w, "2", "Try: curl localhost:8080/mlb\n", color);
     return out.toOwnedSlice();
 }
 
@@ -150,11 +225,6 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
     errdefer out.deinit();
     switch (format) {
         .text => try out.writer.print("sprts: {s}\n", .{message}),
-        .html => {
-            try out.writer.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>sprts error</title>");
-            try out.writer.writeAll(style);
-            try out.writer.print("</head><body><main><h1>sprts</h1><p>{s}</p><p><a href=\"/\">View leagues</a></p></main></body></html>", .{message});
-        },
         .json => {
             try out.writer.writeAll("{\"error\":");
             try std.json.Stringify.value(message, .{}, &out.writer);
@@ -164,26 +234,148 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
     return out.toOwnedSlice();
 }
 
-fn escape(w: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| switch (byte) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(byte),
-    };
-}
-
-const style =
-    \\<style>
-    \\:root{color-scheme:light dark;--bg:#f5f1e8;--ink:#17201c;--muted:#68716b;--card:#fffdf7;--line:#d7d2c6;--accent:#087f5b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}main{max-width:760px;margin:auto;padding:28px 18px}header{display:flex;align-items:baseline;gap:18px;border-bottom:2px solid var(--ink);padding-bottom:12px}.brand{color:var(--ink);font-size:28px;font-weight:900;text-decoration:none}header span:last-child,.status,footer,.leagues span{color:var(--muted)}.title{display:flex;align-items:baseline;justify-content:space-between;margin:28px 0 12px}.title h1{margin:0;font:700 26px ui-sans-serif,system-ui,sans-serif}nav{display:flex;justify-content:space-between;margin-bottom:20px}a{color:var(--accent)}article{background:var(--card);border:1px solid var(--line);margin:10px 0;padding:14px 16px}.status{font-size:13px;margin-bottom:7px}.team{display:grid;grid-template-columns:4em 1fr auto;gap:8px;padding:5px 0}.team strong{font-size:19px}.empty{padding:30px 0}.leagues{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.leagues a{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--line);padding:13px;text-decoration:none}.leagues a:hover{border-color:var(--accent)}footer{font-size:13px;margin-top:28px}@media(prefers-color-scheme:dark){:root{--bg:#111714;--ink:#edf2ec;--muted:#99a49d;--card:#18201c;--line:#354039;--accent:#69dbad}}
-    \\</style>
-;
-
 test "JSON renderer exposes stable schema marker" {
     const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
     const output = try json(std.testing.allocator, board);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
+}
+
+test "text renderer draws a table and no HTML" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "│") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "└") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+}
+
+test "text renderer colors by default and strips with the flag off" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "3", .winner = true },
+                },
+            },
+        },
+    };
+    const colored = try text(std.testing.allocator, board, true);
+    defer std.testing.allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[1;31m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[32m") != null);
+    const plain = try text(std.testing.allocator, board, false);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
+}
+
+test "text renderer never splits a code point when truncating" {
+    const board: domain.Scoreboard = .{
+        .league = "laliga",
+        .league_name = "La Liga",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Atletico Madrid at a team with a very long name indeed",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Atlético Madrid Club de Fútbol with extra", .abbreviation = "ATM", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false);
+    defer std.testing.allocator.free(output);
+    _ = try std.unicode.Utf8View.init(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "…") != null);
+}
+
+test "text renderer prints the mark for teams that have one" {
+    const mark = core.art.teamArt("mlb", "PHI", .sm).?;
+    const first_line = mark[0..std.mem.indexOfScalar(u8, mark, '\n').?];
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, first_line) != null);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "text renderer prints no mark for teams without one" {
+    const mark = core.art.teamArt("mlb", "PHI", .sm).?;
+    const first_line = mark[0..std.mem.indexOfScalar(u8, mark, '\n').?];
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, first_line) == null);
 }

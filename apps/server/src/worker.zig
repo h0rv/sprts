@@ -1,9 +1,10 @@
 //! Cloudflare Worker entry for sprts (wasm32+wasi, JSPI).
 //!
-//! Maps each Worker request to `(target path+query, accept, user-agent)`,
-//! routes via the shared `router.parse`, serves scoreboards through
-//! `EspnAdapter` with a `WorkerTransport` + Workers Cache API edge cache, and
-//! renders with the shared `render`/`spec` modules.
+//! Maps each Worker request to its target path+query, routes via the shared
+//! `router.parse`, serves scoreboards through `EspnAdapter` with a
+//! `WorkerTransport` + Workers Cache API edge cache, and renders with the
+//! shared `render`/`spec` modules. Every human route returns plain text;
+//! JSON lives under `/api/v1/` only.
 //!
 //! Worker notes:
 //! - `workers.fetch` / `Cache.match` / `Cache.put` are JSPI-suspending but
@@ -12,10 +13,13 @@
 //!   (see `edge_cache.upstreamHeaders`; header construction is unit-tested
 //!   natively since live header delivery can only be observed on deploy).
 //! - The edge cache is keyed on the normalized board (lowercase league slug +
-//!   concrete day + negotiated format; see `edge_cache.zig`). Fresh hits
+//!   concrete day + format; see `edge_cache.zig`). Fresh hits
 //!   (same 30s bucket) are served directly; on upstream failure a stale entry
 //!   from the current 300s bucket is served, else 502. Errors are never
 //!   cached. All formats render from a single normalized board fetch.
+//!   Render flags stay out of the key: `?color` is applied after the fetch.
+//! - Color defaults to on; `?color=0` turns it off and `?color=1` forces it
+//!   on. A `NO_COLOR` worker env var flips the default off.
 //! - Allocation is per-request via `env.allocator` only. This module never
 //!   imports `main.zig`: no `std.http.Server`, sockets, threads, or system
 //!   clock in the worker path (epoch seconds come from `workers.now()`).
@@ -73,25 +77,11 @@ fn epochSecondsNow() i64 {
     return @intFromFloat(@floor(workers.now() / 1000.0));
 }
 
-/// First case-insensitive match for an incoming request header.
-fn incomingHeader(request: *const workers.Request, name: []const u8) !?[]const u8 {
-    const entries = try request.headers();
-    for (entries) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
-    }
-    return null;
-}
-
 pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) !workers.Response {
     // Per-request arena; freed automatically when the request ends.
     const alloc = env.allocator;
 
     const target = edge.targetFromUrl(try request.url());
-    // NOTE: workers-zig's Request.header() does not compile (it returns an
-    // `![]const u8` error union where `!?[]const u8` is declared), so scan
-    // the headers() entries instead.
-    const accept = (try incomingHeader(request, "accept")) orelse "";
-    const user_agent = (try incomingHeader(request, "user-agent")) orelse "";
 
     const method = request.method();
     if (method != .GET and method != .HEAD) {
@@ -103,7 +93,9 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         return resp;
     }
 
-    switch (router.parse(target, accept, user_agent)) {
+    const format: router.Format = if (router.isJsonTarget(target)) .json else .text;
+
+    switch (router.parse(target)) {
         .health => {
             var resp = workers.Response.new();
             resp.setStatus(.ok);
@@ -116,27 +108,37 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             const body = try spec.openApiJson(alloc);
             return staticResponse(body, contentType(.json), null);
         },
-        .home => |format| {
-            const body = try render.home(alloc, format);
-            return staticResponse(body, contentType(format), null);
+        .home => |color| {
+            const body = try render.home(alloc, color orelse try colorDefault(env));
+            return staticResponse(body, contentType(.text), null);
         },
         .leagues => {
             const body = try render.leaguesJson(alloc);
             return staticResponse(body, contentType(.json), null);
         },
-        .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", .text, .bad_request),
-        .not_found => return errorResponse(alloc, "route not found", .text, .not_found),
-        .scoreboard => |route| return serveBoard(env, alloc, route),
+        .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", format, .bad_request),
+        .not_found => return errorResponse(alloc, "route not found", format, .not_found),
+        .scoreboard => |route| return serveBoard(env, alloc, target, route),
     }
+}
+
+/// Worker color default: on unless the `NO_COLOR` env var is set.
+/// A remote client's own environment never reaches us; `?color` is the
+/// remote switch.
+fn colorDefault(env: *workers.Env) !bool {
+    return (try env.get("NO_COLOR")) == null;
 }
 
 fn serveBoard(
     env: *workers.Env,
     alloc: std.mem.Allocator,
+    target: []const u8,
     route: router.ScoreboardRoute,
 ) !workers.Response {
+    const format: router.Format = if (router.isJsonTarget(target)) .json else .text;
+    const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
-        return errorResponse(alloc, "unknown league; see /api/v1/leagues", route.format, .not_found);
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
     };
 
     // Canonicalize: lowercase slug, concrete day (missing ?date resolves via
@@ -144,7 +146,7 @@ fn serveBoard(
     const epoch_s = epochSecondsNow();
     const slug = try edge.canonicalSlug(alloc, league.slug);
     const day = try edge.resolveDay(alloc, route.date, epoch_s);
-    const tag = edge.formatTag(route.format);
+    const tag = edge.formatTag(format);
     const board_key = try edge.boardKey(alloc, slug, day, tag);
     const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
     const stale_key = try edge.staleKey(alloc, board_key, epoch_s);
@@ -179,15 +181,14 @@ fn serveBoard(
             resp.setHeader("x-sprts-cache", "stale");
             return resp;
         }
-        return errorResponse(alloc, "scores are temporarily unavailable", route.format, .bad_gateway);
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
-    const body = switch (route.format) {
-        .text => try render.text(alloc, board),
-        .html => try render.html(alloc, board),
+    const body = switch (format) {
+        .text => try render.text(alloc, board, color),
         .json => try render.json(alloc, board),
     };
 
-    var resp = boardResponse(body, route.format, "miss");
+    var resp = boardResponse(body, format, "miss");
 
     // Store fresh (30s retention) + stale (300s retention) renders.
     // Only successful renders reach this point, so errors are never cached.
@@ -203,7 +204,6 @@ fn serveBoard(
 fn contentType(format: router.Format) []const u8 {
     return switch (format) {
         .text => "text/plain; charset=utf-8",
-        .html => "text/html; charset=utf-8",
         .json => "application/json; charset=utf-8",
     };
 }
@@ -215,7 +215,6 @@ fn staticResponse(body: []const u8, content_type: []const u8, cache_state: ?[]co
     resp.setStatus(.ok);
     resp.setHeader("content-type", content_type);
     resp.setHeader("cache-control", edge.client_cache_control);
-    resp.setHeader("vary", edge.vary_value);
     resp.setHeader("x-content-type-options", "nosniff");
     if (cache_state) |state| resp.setHeader("x-sprts-cache", state);
     resp.setBody(body);

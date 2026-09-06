@@ -4,10 +4,10 @@
 //! unit-tested natively via the server module and reused verbatim by the
 //! wasm worker. The worker wires these pieces to workers-zig's Cache API:
 //!
-//! - One board namespace per normalized `(league, date, negotiated format)`:
+//! - One board namespace per `(league, date, format)`:
 //!   `sprts/v1/board/<slug>/<day>/<format>`. The path prefix (`/mlb` vs
 //!   `/api/v1/mlb`) and non-`date` query parameters are excluded, so both
-//!   spellings share a namespace modulo negotiated format.
+//!   spellings share a namespace modulo format.
 //! - Freshness is enforced with time-bucketed keys, not by reading cached
 //!   bodies back (the Cache API match result is served whole):
 //!   `<board>/f<epoch/30>` proves age < 30s on a hit (TTL max-age=30);
@@ -16,9 +16,9 @@
 //! - Only successful renders are ever stored; errors are never cached.
 //!
 //! Note on the format tag: the Workers Cache API `match`/`put` pair ignores
-//! `stale-if-error` and performs no `Vary` negotiation, so the negotiated
-//! format is part of the key. Every format is still rendered from a single
-//! normalized board fetch per request.
+//! `stale-if-error`, so the format is part of the key. Every format is still
+//! rendered from a single normalized board fetch per request. The address
+//! alone decides the format, so no `Vary` header is sent.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -34,7 +34,6 @@ pub const stale_ttl_s: i64 = 300;
 /// (The Cache API ignores `stale-if-error` on match/put, hence the manual
 /// stale path above; downstream HTTP caches still honor it.)
 pub const client_cache_control = "public, max-age=30, stale-if-error=300";
-pub const vary_value = "accept, user-agent";
 
 /// Retention headers stored on fresh/stale edge entries so old time buckets
 /// can be reaped by the edge.
@@ -64,11 +63,10 @@ pub fn resolveDay(arena: std.mem.Allocator, date: ?[]const u8, epoch_s: i64) ![]
     return core.date.todayFromEpoch(arena, epoch_s);
 }
 
-/// Negotiated render format as a cache-key tag.
+/// Render format as a cache-key tag. The address alone decides the format.
 pub fn formatTag(format: router.Format) []const u8 {
     return switch (format) {
         .text => "text",
-        .html => "html",
         .json => "json",
     };
 }
@@ -131,7 +129,7 @@ test "resolveDay prefers explicit date and otherwise uses epoch" {
 }
 
 test "board keys unify path spellings and strip non-date query" {
-    // The key inputs are (slug, day, negotiated format) only: /mlb and
+    // The key inputs are (slug, day, format) only: /mlb and
     // /api/v1/mlb with the same date and format produce the same key, and
     // non-date query parameters never reach the key.
     const arena = std.testing.allocator;
@@ -142,9 +140,9 @@ test "board keys unify path spellings and strip non-date query" {
     try std.testing.expectEqualStrings(from_short, from_api);
     try std.testing.expectEqualStrings("sprts/v1/board/mlb/2026-09-06/json", from_short);
 
-    const html = try boardKey(arena, "mlb", "2026-09-06", "html");
-    defer arena.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "html") != null);
+    const text = try boardKey(arena, "mlb", "2026-09-06", "text");
+    defer arena.free(text);
+    try std.testing.expect(!std.mem.eql(u8, text, from_short));
 }
 
 test "fresh and stale buckets bound entry age" {

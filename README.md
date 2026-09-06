@@ -1,8 +1,8 @@
 # sprts
 
-sprts is a small server for live sports scores and schedules. A browser gets
-HTML, `curl` gets plain text, and scripts can use the versioned JSON API. The
-server does not use accounts, ads, tracking, or client side JavaScript.
+sprts is a small server for live sports scores and schedules. Browsers and
+`curl` get the same plain text, and scripts can use the versioned JSON API.
+The server does not use accounts, ads, tracking, or client side JavaScript.
 
 ## Run it
 
@@ -51,14 +51,13 @@ Cloudflare Containers require a Workers Paid plan on the target account.
 
 ## Routes
 
-`/{league}` returns HTML to browsers and plain text to terminal clients. Use
-the `date=YYYY-MM-DD` query parameter to select a date. The
+`/{league}` and `/` return plain text for every client, browsers included.
+Use the `date=YYYY-MM-DD` query parameter to select a date. The
 `/api/v1/{league}` route always returns JSON, and `/api/v1/leagues` lists the
 supported league slugs.
 
-The response also honors `Accept: application/json` and `Accept: text/plain`.
-You can use `format=html`, `format=text`, or `format=json` when you need an
-explicit format on the short route.
+ANSI color is on by default. Use `?color=0` to turn it off and `?color=1` to
+force it on. The address alone decides the bytes. Headers change nothing.
 
 ## Repository layout
 

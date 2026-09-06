@@ -1,16 +1,16 @@
 const std = @import("std");
 const dates = @import("sprts_core").date;
 
-pub const Format = enum { text, html, json };
+pub const Format = enum { text, json };
 
 pub const ScoreboardRoute = struct {
     league: []const u8,
     date: ?[]const u8,
-    format: Format,
+    color: ?bool,
 };
 
 pub const Route = union(enum) {
-    home: Format,
+    home: ?bool,
     leagues,
     scoreboard: ScoreboardRoute,
     openapi,
@@ -19,14 +19,13 @@ pub const Route = union(enum) {
     bad_date,
 };
 
-pub fn parse(target: []const u8, accept: []const u8, user_agent: []const u8) Route {
+pub fn parse(target: []const u8) Route {
     const query_at = std.mem.indexOfScalar(u8, target, '?');
     const path = target[0 .. query_at orelse target.len];
     const query = if (query_at) |at| target[at + 1 ..] else "";
-    const requested_format = queryValue(query, "format");
-    const format = chooseFormat(accept, user_agent, requested_format);
+    const color = parseColor(queryValue(query, "color"));
 
-    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = format };
+    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = color };
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
@@ -45,8 +44,14 @@ pub fn parse(target: []const u8, accept: []const u8, user_agent: []const u8) Rou
     return .{ .scoreboard = .{
         .league = slug,
         .date = day,
-        .format = if (std.mem.startsWith(u8, path, api_prefix)) .json else format,
+        .color = color,
     } };
+}
+
+pub fn isJsonTarget(target: []const u8) bool {
+    const query_at = std.mem.indexOfScalar(u8, target, '?');
+    const path = target[0 .. query_at orelse target.len];
+    return std.mem.startsWith(u8, path, "/api/v1/");
 }
 
 fn queryValue(query: []const u8, wanted: []const u8) ?[]const u8 {
@@ -58,34 +63,41 @@ fn queryValue(query: []const u8, wanted: []const u8) ?[]const u8 {
     return null;
 }
 
-fn chooseFormat(accept: []const u8, user_agent: []const u8, explicit: ?[]const u8) Format {
-    if (explicit) |value| {
-        if (std.ascii.eqlIgnoreCase(value, "json")) return .json;
-        if (std.ascii.eqlIgnoreCase(value, "html")) return .html;
-        if (std.ascii.eqlIgnoreCase(value, "text")) return .text;
-    }
-    if (containsIgnoreCase(accept, "application/json")) return .json;
-    if (containsIgnoreCase(accept, "text/plain")) return .text;
-    if (startsWithIgnoreCase(user_agent, "curl/") or startsWithIgnoreCase(user_agent, "wget/") or startsWithIgnoreCase(user_agent, "httpie/")) return .text;
-    return .html;
+fn parseColor(value: ?[]const u8) ?bool {
+    const v = value orelse return null;
+    if (v.len == 1 and v[0] == '0') return false;
+    if (v.len == 1 and v[0] == '1') return true;
+    return null;
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index..][0..needle.len], needle)) return true;
-    }
-    return false;
+test "short routes are text and API routes are JSON" {
+    const short = parse("/mlb");
+    try std.testing.expect(short == .scoreboard);
+    try std.testing.expect(!isJsonTarget("/mlb"));
+    try std.testing.expect(!isJsonTarget("/mlb?date=2026-09-06"));
+    try std.testing.expect(isJsonTarget("/api/v1/mlb?date=2026-09-06"));
+    try std.testing.expect(isJsonTarget("/api/v1/leagues"));
+    try std.testing.expect(!isJsonTarget("/"));
 }
 
-fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
-    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+test "headers change nothing" {
+    // parse takes the target only. There is no Accept or User-Agent
+    // sniffing, so a browser address and a curl address route identically.
+    const route = parse("/mlb");
+    try std.testing.expect(route == .scoreboard);
+    try std.testing.expectEqualStrings("mlb", route.scoreboard.league);
 }
 
-test "curl gets text while browsers get HTML and API is JSON" {
-    try std.testing.expectEqual(Format.text, parse("/mlb", "*/*", "curl/8.0").scoreboard.format);
-    try std.testing.expectEqual(Format.html, parse("/mlb", "text/html", "Mozilla/5.0").scoreboard.format);
-    try std.testing.expectEqual(Format.json, parse("/api/v1/mlb?date=2026-09-06", "*/*", "curl/8.0").scoreboard.format);
-    try std.testing.expect(parse("/mlb?date=tomorrow", "", "") == .bad_date);
+test "color flag parsing is exact" {
+    try std.testing.expect(parse("/mlb").scoreboard.color == null);
+    try std.testing.expect(parse("/mlb?color=0").scoreboard.color.? == false);
+    try std.testing.expect(parse("/mlb?color=1").scoreboard.color.? == true);
+    try std.testing.expect(parse("/mlb?color=off").scoreboard.color == null);
+    try std.testing.expect(parse("/?color=0").home.? == false);
+}
+
+test "bad dates and unknown shapes still route" {
+    try std.testing.expect(parse("/mlb?date=tomorrow") == .bad_date);
+    try std.testing.expect(parse("/mlb/extra") == .not_found);
+    try std.testing.expect(parse("/api/v1/mlb?date=tomorrow") == .bad_date);
 }
