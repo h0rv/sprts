@@ -1,12 +1,14 @@
 const std = @import("std");
 const dates = @import("sprts_core").date;
 
-pub const Format = enum { text, json };
+pub const Format = enum { text, html, json };
 
 pub const ScoreboardRoute = struct {
     league: []const u8,
     date: ?[]const u8,
     color: ?bool,
+    width: ?u32,
+    height: ?u32,
 };
 
 pub const Route = union(enum) {
@@ -45,7 +47,26 @@ pub fn parse(target: []const u8) Route {
         .league = slug,
         .date = day,
         .color = color,
+        .width = queryUint(queryValue(query, "width")),
+        .height = queryUint(queryValue(query, "height")),
     } };
+}
+
+/// Response format for a request. The address decides first: `/api/v1/`
+/// routes are always JSON. Otherwise an explicit `?format=text` or
+/// `?format=html` wins, then the Accept header (browsers send text/html),
+/// and plain text is the default. No User-Agent sniffing.
+pub fn formatFor(target: []const u8, accept: []const u8) Format {
+    if (isJsonTarget(target)) return .json;
+    const query_at = std.mem.indexOfScalar(u8, target, '?');
+    const query = if (query_at) |at| target[at + 1 ..] else "";
+    if (queryValue(query, "format")) |explicit| {
+        if (std.ascii.eqlIgnoreCase(explicit, "html")) return .html;
+        if (std.ascii.eqlIgnoreCase(explicit, "text")) return .text;
+    }
+    if (containsIgnoreCase(accept, "application/json")) return .json;
+    if (containsIgnoreCase(accept, "text/html")) return .html;
+    return .text;
 }
 
 pub fn isJsonTarget(target: []const u8) bool {
@@ -70,7 +91,21 @@ fn parseColor(value: ?[]const u8) ?bool {
     return null;
 }
 
-test "short routes are text and API routes are JSON" {
+fn queryUint(value: ?[]const u8) ?u32 {
+    const v = value orelse return null;
+    return std.fmt.parseInt(u32, v, 10) catch null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "short routes parse and API targets are JSON" {
     const short = parse("/mlb");
     try std.testing.expect(short == .scoreboard);
     try std.testing.expect(!isJsonTarget("/mlb"));
@@ -80,12 +115,15 @@ test "short routes are text and API routes are JSON" {
     try std.testing.expect(!isJsonTarget("/"));
 }
 
-test "headers change nothing" {
-    // parse takes the target only. There is no Accept or User-Agent
-    // sniffing, so a browser address and a curl address route identically.
-    const route = parse("/mlb");
-    try std.testing.expect(route == .scoreboard);
-    try std.testing.expectEqualStrings("mlb", route.scoreboard.league);
+test "format comes from address, query, then Accept" {
+    try std.testing.expectEqual(Format.text, formatFor("/mlb", "*/*"));
+    try std.testing.expectEqual(Format.html, formatFor("/mlb", "text/html,application/xhtml+xml"));
+    try std.testing.expectEqual(Format.text, formatFor("/mlb?format=text", "text/html"));
+    try std.testing.expectEqual(Format.html, formatFor("/mlb?format=html", "*/*"));
+    try std.testing.expectEqual(Format.json, formatFor("/mlb", "application/json"));
+    try std.testing.expectEqual(Format.json, formatFor("/api/v1/mlb", "*/*"));
+    try std.testing.expectEqual(Format.text, formatFor("/", "*/*"));
+    try std.testing.expectEqual(Format.html, formatFor("/", "text/html"));
 }
 
 test "color flag parsing is exact" {

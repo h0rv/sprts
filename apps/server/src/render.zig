@@ -206,6 +206,76 @@ pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Minimal browser page: the same table as text, never ANSI, with real
+/// links. Browsers cannot use terminal escapes, so HTML output is always
+/// uncolored and the text renderer stays the single source of layout.
+pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
+    const body = try text(allocator, board, false);
+    defer allocator.free(body);
+    const previous = try dates.shift(allocator, board.date, -1);
+    defer allocator.free(previous);
+    const next = try dates.shift(allocator, board.date, 1);
+    defer allocator.free(next);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const title = try std.fmt.allocPrint(allocator, "{s} scores", .{board.league_name});
+    defer allocator.free(title);
+    try pageHead(w, title);
+    try w.writeAll("<pre>");
+    try escapeInto(w, body);
+    try w.writeAll("</pre><nav>");
+    try w.print("<a href=\"/{s}?date={s}\">earlier</a>", .{ board.league, previous });
+    try w.print("<a href=\"/{s}\">today</a>", .{board.league});
+    try w.print("<a href=\"/{s}?date={s}\">later</a>", .{ board.league, next });
+    try w.print("<a href=\"/api/v1/{s}?date={s}\">json</a>", .{ board.league, board.date });
+    try w.writeAll("</nav></main></body></html>");
+    return out.toOwnedSlice();
+}
+
+pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try pageHead(w, "sprts");
+    try w.writeAll("<pre>sprts\n");
+    try writeRule(w, .top);
+    for (leagues.all) |league| {
+        try w.writeAll("│ ");
+        try w.print("<a href=\"/{s}\">", .{league.slug});
+        try writeCell(w, league.slug, 13, null, false);
+        try w.writeByte(' ');
+        try writeCell(w, league.name, 36, null, false);
+        try w.writeAll("</a> │\n");
+    }
+    try writeRule(w, .bottom);
+    try w.writeAll("Try: curl localhost:8080/mlb\n");
+    try w.writeAll("</pre><nav><a href=\"/api/v1/leagues\">json</a></nav></main></body></html>");
+    return out.toOwnedSlice();
+}
+
+fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
+    try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    try escapeInto(w, title);
+    try w.writeAll("</title>" ++ page_style ++ "</head><body><main>");
+}
+
+fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
+    for (value) |byte| switch (byte) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(byte),
+    };
+}
+
+const page_style =
+    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}nav{margin-top:14px;display:flex;gap:16px;font:14px ui-monospace,monospace}a{color:#6fd3a0}</style>
+;
+
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
     const list = leagues.LeagueList{ .leagues = &leagues.all };
     {
@@ -225,6 +295,12 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
     errdefer out.deinit();
     switch (format) {
         .text => try out.writer.print("sprts: {s}\n", .{message}),
+        .html => {
+            try pageHead(&out.writer, "sprts error");
+            try out.writer.writeAll("<pre>sprts: ");
+            try escapeInto(&out.writer, message);
+            try out.writer.writeAll("</pre><nav><a href=\"/\">leagues</a></nav></main></body></html>");
+        },
         .json => {
             try out.writer.writeAll("{\"error\":");
             try std.json.Stringify.value(message, .{}, &out.writer);
@@ -323,6 +399,44 @@ test "text renderer never splits a code point when truncating" {
     defer std.testing.allocator.free(output);
     _ = try std.unicode.Utf8View.init(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "…") != null);
+}
+
+test "HTML pages link and never carry ANSI" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final <OT>",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const page = try scoreHtml(std.testing.allocator, board);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-05\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb?date=2026-09-06\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+
+    const homepage = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(homepage);
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/mlb\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "\x1b[") == null);
+
+    const err = try errorBody(std.testing.allocator, "a<b", .html);
+    defer std.testing.allocator.free(err);
+    try std.testing.expect(std.mem.indexOf(u8, err, "a&lt;b") != null);
 }
 
 test "text renderer prints the mark for teams that have one" {

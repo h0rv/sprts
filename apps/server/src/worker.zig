@@ -77,11 +77,24 @@ fn epochSecondsNow() i64 {
     return @intFromFloat(@floor(workers.now() / 1000.0));
 }
 
+/// First case-insensitive match for an incoming request header.
+fn incomingHeader(request: *const workers.Request, name: []const u8) !?[]const u8 {
+    const entries = try request.headers();
+    for (entries) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+    }
+    return null;
+}
+
 pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) !workers.Response {
     // Per-request arena; freed automatically when the request ends.
     const alloc = env.allocator;
 
     const target = edge.targetFromUrl(try request.url());
+    // NOTE: workers-zig's Request.header() does not compile (it returns an
+    // `![]const u8` error union where `!?[]const u8` is declared), so scan
+    // the headers() entries instead.
+    const accept = (try incomingHeader(request, "accept")) orelse "";
 
     const method = request.method();
     if (method != .GET and method != .HEAD) {
@@ -93,7 +106,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         return resp;
     }
 
-    const format: router.Format = if (router.isJsonTarget(target)) .json else .text;
+    const format = router.formatFor(target, accept);
 
     switch (router.parse(target)) {
         .health => {
@@ -109,8 +122,12 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             return staticResponse(body, contentType(.json), null);
         },
         .home => |color| {
-            const body = try render.home(alloc, color orelse try colorDefault(env));
-            return staticResponse(body, contentType(.text), null);
+            const body = switch (format) {
+                .text => try render.home(alloc, color orelse try colorDefault(env)),
+                .html => try render.homeHtml(alloc),
+                .json => try render.leaguesJson(alloc),
+            };
+            return staticResponse(body, contentType(format), null);
         },
         .leagues => {
             const body = try render.leaguesJson(alloc);
@@ -118,7 +135,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         },
         .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", format, .bad_request),
         .not_found => return errorResponse(alloc, "route not found", format, .not_found),
-        .scoreboard => |route| return serveBoard(env, alloc, target, route),
+        .scoreboard => |route| return serveBoard(env, alloc, route, format),
     }
 }
 
@@ -132,10 +149,9 @@ fn colorDefault(env: *workers.Env) !bool {
 fn serveBoard(
     env: *workers.Env,
     alloc: std.mem.Allocator,
-    target: []const u8,
     route: router.ScoreboardRoute,
+    format: router.Format,
 ) !workers.Response {
-    const format: router.Format = if (router.isJsonTarget(target)) .json else .text;
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
         return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
@@ -185,6 +201,7 @@ fn serveBoard(
     };
     const body = switch (format) {
         .text => try render.text(alloc, board, color),
+        .html => try render.scoreHtml(alloc, board),
         .json => try render.json(alloc, board),
     };
 
@@ -204,6 +221,7 @@ fn serveBoard(
 fn contentType(format: router.Format) []const u8 {
     return switch (format) {
         .text => "text/plain; charset=utf-8",
+        .html => "text/html; charset=utf-8",
         .json => "application/json; charset=utf-8",
     };
 }
@@ -215,6 +233,7 @@ fn staticResponse(body: []const u8, content_type: []const u8, cache_state: ?[]co
     resp.setStatus(.ok);
     resp.setHeader("content-type", content_type);
     resp.setHeader("cache-control", edge.client_cache_control);
+    resp.setHeader("vary", edge.vary_value);
     resp.setHeader("x-content-type-options", "nosniff");
     if (cache_state) |state| resp.setHeader("x-sprts-cache", state);
     resp.setBody(body);

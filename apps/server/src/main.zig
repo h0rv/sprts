@@ -60,14 +60,26 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         return respond(request, "method not allowed\n", .text, .method_not_allowed, &.{.{ .name = "allow", .value = "GET, HEAD" }});
     }
 
+    var accept: []const u8 = "";
+    var headers = request.iterateHeaders();
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "accept")) accept = header.value;
+    }
+
     const target = request.head.target;
-    const json_route = server_app.router.isJsonTarget(target);
-    const format: server_app.router.Format = if (json_route) .json else .text;
+    const format = server_app.router.formatFor(target, accept);
 
     switch (server_app.router.parse(target)) {
         .health => try respond(request, "ok\n", .text, .ok, &.{.{ .name = "cache-control", .value = "no-store" }}),
         .openapi => try respond(request, try server_app.spec.openApiJson(arena), .json, .ok, commonHeaders()),
-        .home => |color| try respond(request, try server_app.render.home(arena, color orelse color_default), .text, .ok, commonHeaders()),
+        .home => |color| {
+            const body = switch (format) {
+                .text => try server_app.render.home(arena, color orelse color_default),
+                .html => try server_app.render.homeHtml(arena),
+                .json => try server_app.render.leaguesJson(arena),
+            };
+            try respond(request, body, format, .ok, commonHeaders());
+        },
         .leagues => try respond(request, try server_app.render.leaguesJson(arena), .json, .ok, commonHeaders()),
         .bad_date => try respondError(arena, request, "date must be YYYY-MM-DD", format, .bad_request),
         .not_found => try respondError(arena, request, "route not found", format, .not_found),
@@ -84,6 +96,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             const body = switch (format) {
                 .text => try server_app.render.text(arena, board, score_route.color orelse color_default),
+                .html => try server_app.render.scoreHtml(arena, board),
                 .json => try server_app.render.json(arena, board),
             };
             try respond(request, body, format, .ok, commonHeaders());
@@ -98,6 +111,7 @@ fn respondError(arena: std.mem.Allocator, request: *std.http.Server.Request, mes
 fn respond(request: *std.http.Server.Request, body: []const u8, format: server_app.router.Format, status: std.http.Status, extra: []const std.http.Header) !void {
     const content_type = switch (format) {
         .text => "text/plain; charset=utf-8",
+        .html => "text/html; charset=utf-8",
         .json => "application/json; charset=utf-8",
     };
     var headers: [5]std.http.Header = undefined;
@@ -113,6 +127,7 @@ fn respond(request: *std.http.Server.Request, body: []const u8, format: server_a
 fn commonHeaders() []const std.http.Header {
     return &.{
         .{ .name = "cache-control", .value = "public, max-age=30, stale-if-error=300" },
+        .{ .name = "vary", .value = "accept" },
         .{ .name = "x-content-type-options", .value = "nosniff" },
     };
 }

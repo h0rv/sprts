@@ -1,17 +1,24 @@
 # Renderer
 
-Every page a person reads returns plain text. Scripts use the JSON API
-under `/api/v1/`. Rendering changes never alter JSON field names.
+Every page a person reads returns plain text or a minimal page around the
+same table. Scripts use the JSON API under `/api/v1/`. Rendering changes
+never alter JSON field names.
 
 ## Formats and routes
 
-- Two formats exist: `text` and `json`.
-- `/{league}` and `/` return `text/plain` for every client.
+- Three formats exist: `text`, `html`, and `json`.
+- `/{league}` and `/` return text for terminal clients and a minimal HTML
+  page for browsers. The HTML page holds the same table inside a `pre`
+  block plus links for date navigation, today, and the JSON API. It never
+  carries ANSI escapes.
 - `/api/v1/{league}` and `/api/v1/leagues` return `application/json`.
 - `/openapi.json` returns `application/json`. `/healthz` returns `text/plain`.
-- The address alone decides the bytes. Headers change nothing.
-- No `vary` header is sent. `cache-control` and `nosniff` are sent.
-- Errors under `/api/v1/` return JSON. All other errors return text.
+- The address decides first, then an explicit `?format=text` or
+  `?format=html`, then the Accept header. Browsers send `text/html` and
+  get the HTML page. No User-Agent sniffing happens.
+- Responses carry `Vary: accept`. `cache-control` and `nosniff` are sent.
+- Errors under `/api/v1/` return JSON. All other errors match the request
+  format.
 
 ## Text layout
 
@@ -43,12 +50,15 @@ switch.
 
 ## Code shape
 
-- `router.parse` takes the request target only. `Route.home` carries no
-  payload. `ScoreboardRoute` carries league and date only.
+- `router.parse` takes the request target only. `router.formatFor` takes
+  the target and the Accept header. `Route.home` carries the color flag.
+  `ScoreboardRoute` carries league, date, color, and terminal width and
+  height.
 - `render.text` takes the allocator, the board, and a color flag.
-  `render.home` takes the allocator and a color flag. `render.errorBody`
-  takes the allocator, the message, and the format.
-- `main.respond` serves `text/plain` and `application/json` only.
+  `render.home` takes the allocator and a color flag. `render.scoreHtml`
+  and `render.homeHtml` take no color flag and never emit escapes.
+  `render.errorBody` takes the allocator, the message, and the format.
+- `main.respond` serves `text/plain`, `text/html`, and `application/json`.
 - Responses render from the cached board. Render flags stay out of the
   cache key.
 
