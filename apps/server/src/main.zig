@@ -95,8 +95,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 return;
             };
             const body = switch (format) {
-                .text => try server_app.render.text(arena, board, score_route.color orelse color_default),
-                .html => try server_app.render.scoreHtml(arena, board),
+                .text => try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
+                .html => try server_app.render.scoreHtml(arena, board, score_route.width, score_route.height),
                 .json => try server_app.render.json(arena, board),
             };
             try respond(request, body, format, .ok, commonHeaders());

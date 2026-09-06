@@ -17,7 +17,8 @@
 //!   (same 30s bucket) are served directly; on upstream failure a stale entry
 //!   from the current 300s bucket is served, else 502. Errors are never
 //!   cached. All formats render from a single normalized board fetch.
-//!   Render flags stay out of the key: `?color` is applied after the fetch.
+//!   Render flags stay out of the key: `?color`/`?width`/`?height` are
+//!   applied after the fetch.
 //! - Color defaults to on; `?color=0` turns it off and `?color=1` forces it
 //!   on. A `NO_COLOR` worker env var flips the default off.
 //! - Allocation is per-request via `env.allocator` only. This module never
@@ -200,8 +201,8 @@ fn serveBoard(
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
     const body = switch (format) {
-        .text => try render.text(alloc, board, color),
-        .html => try render.scoreHtml(alloc, board),
+        .text => try render.text(alloc, board, color, route.width, route.height),
+        .html => try render.scoreHtml(alloc, board, route.width, route.height),
         .json => try render.json(alloc, board),
     };
 

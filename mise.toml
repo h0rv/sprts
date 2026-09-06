@@ -11,3 +11,6 @@ run = "zig build run"
 
 [tasks."generate:espn"]
 run = "tools/generate-espn-client"
+
+[tasks."generate:art"]
+run = "tools/generate-art --write"

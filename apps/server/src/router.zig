@@ -7,8 +7,8 @@ pub const ScoreboardRoute = struct {
     league: []const u8,
     date: ?[]const u8,
     color: ?bool,
-    width: ?u32,
-    height: ?u32,
+    width: ?u16,
+    height: ?u16,
 };
 
 pub const Route = union(enum) {
@@ -91,9 +91,18 @@ fn parseColor(value: ?[]const u8) ?bool {
     return null;
 }
 
-fn queryUint(value: ?[]const u8) ?u32 {
+/// Strict positive integer for display params: all digits, fits u16,
+/// nonzero. Anything else is ignored (falls back to the default).
+fn queryUint(value: ?[]const u8) ?u16 {
     const v = value orelse return null;
-    return std.fmt.parseInt(u32, v, 10) catch null;
+    if (v.len == 0 or v.len > 5) return null;
+    var n: u32 = 0;
+    for (v) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n == 0 or n > 65535) return null;
+    return @intCast(n);
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -132,6 +141,17 @@ test "color flag parsing is exact" {
     try std.testing.expect(parse("/mlb?color=1").scoreboard.color.? == true);
     try std.testing.expect(parse("/mlb?color=off").scoreboard.color == null);
     try std.testing.expect(parse("/?color=0").home.? == false);
+}
+
+test "display params parse strict" {
+    try std.testing.expect(parse("/mlb").scoreboard.width == null);
+    try std.testing.expect(parse("/mlb").scoreboard.height == null);
+    try std.testing.expect(parse("/mlb?width=80").scoreboard.width.? == 80);
+    try std.testing.expect(parse("/mlb?height=10").scoreboard.height.? == 10);
+    try std.testing.expect(parse("/mlb?width=abc").scoreboard.width == null);
+    try std.testing.expect(parse("/mlb?width=0").scoreboard.width == null);
+    try std.testing.expect(parse("/mlb?width=999999").scoreboard.width == null);
+    try std.testing.expect(parse("/mlb?width=80x").scoreboard.width == null);
 }
 
 test "bad dates and unknown shapes still route" {

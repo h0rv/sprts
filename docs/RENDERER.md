@@ -24,16 +24,17 @@ never alter JSON field names.
 
 Each scoreboard is one fixed width table with `|` pipes and box rules.
 Each game has a status row plus one row per entrant in the form
-`ABBR | Name | Score`, and the winner carries its mark. The status prefix
-comes from `Game.state` (`pre`, `in`, `post`) with the start time from
-`starts_at`, and entrants keep provider order unless `home_away` says
-otherwise.
+`ABBR | Name | Score`, and the winner carries its mark. The status row
+shows the provider status text verbatim, colored from `Game.state`
+(`in` reads live, `pre` reads upcoming). Entrants render in provider
+order.
 
-Names truncate at the column width with `…`. Truncation walks code
-points and pads by display width, because a byte cut can split a letter
-and shift the rules. Lines never wrap. The footer is plain date
-navigation of the form `/{slug}?date=YYYY-MM-DD` for the previous and
-next day. A day with no games prints `No games scheduled.`
+Names truncate at the column width with `…`. Truncation never splits a
+code point, because a byte cut can emit invalid output. Padding counts
+bytes, so Latin names align and wide glyphs can shift the rules. Lines
+never wrap. The footer is plain date navigation of the form
+`/{slug}?date=YYYY-MM-DD` for the previous and next day. A day with no
+games prints `No games scheduled.`
 
 ## Color
 
@@ -65,7 +66,7 @@ switch.
 ## Tests
 
 - `mise run check` passes.
-- Table borders are present and rules stay aligned on long names.
+- Table borders are present and rows share one display width.
 - ANSI is present by default and absent with `?color=0`.
-- No response contains `<html`.
+- HTML pages carry links and zero escape bytes.
 - JSON fields validate against `openapi/sprts-v1.json`.

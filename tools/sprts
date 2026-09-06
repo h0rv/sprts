@@ -1,0 +1,7 @@
+#!/bin/sh
+# sprts — scores in your terminal. needs: curl, tput.
+# install: install -m755 tools/sprts ~/.local/bin/sprts
+# usage: sprts [league] [date]   e.g. sprts mlb 2026-09-06
+# width = terminal columns (server clamps 52..200), height = max games shown,
+# color = on when stdout is a tty.
+exec curl -s "https://sprts.horv.co/${1:-mlb}?${2:+date=$2&}width=$(tput cols 2>/dev/null || echo 52)&height=$(tput lines 2>/dev/null || echo 0)&color=$([ -t 1 ] && echo 1 || echo 0)"

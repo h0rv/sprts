@@ -6,7 +6,8 @@ const leagues = core.leagues;
 const dates = core.date;
 const router = @import("router.zig");
 
-const inner_width = 50;
+/// Classic box: 52 terminal columns, 50 between the borders.
+const default_inner_width = 50;
 
 pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     // Validate against the schema derived from the domain types before
@@ -26,36 +27,42 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     return out.toOwnedSlice();
 }
 
-pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool) ![]u8 {
+/// `width` is total terminal columns; the borders take 2. Never shrinks
+/// below the classic 52-wide box, so team art and the fixed participant
+/// cells always fit — extra room stretches the flexible rows and names.
+/// `height` caps the games listed (`+N more` trailer); null/0 = all.
+pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16) ![]u8 {
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const shown: usize = @min(height orelse board.games.len, board.games.len);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try writeRule(w, .top);
+    try writeRule(w, .top, inner);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
     defer allocator.free(heading);
-    try writeRow(w, heading, inner_width - 2, "2", color);
+    try writeRow(w, heading, inner - 2, "2", color);
     if (board.games.len == 0) {
-        try writeRule(w, .mid);
-        try writeRow(w, "No games scheduled.", inner_width - 2, null, color);
+        try writeRule(w, .mid, inner);
+        try writeRow(w, "No games scheduled.", inner - 2, null, color);
     }
-    for (board.games) |game| {
-        try writeRule(w, .mid);
-        try writeRow(w, game.status, inner_width - 2, statusColor(game.state), color);
-        if (teamArtForGame(board.league, &game)) |mark| {
-            var lines = std.mem.splitScalar(u8, mark, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                try writeArtRow(w, line);
-            }
-        }
+    for (board.games[0..shown]) |game| {
+        try writeRule(w, .mid, inner);
+        try writeRow(w, game.status, inner - 2, statusColor(game.state), color);
+        try writeGameMarks(w, allocator, board.league, &game, inner);
         if (game.participants.len == 0) {
-            try writeRow(w, game.name, inner_width - 2, null, color);
+            try writeRow(w, game.name, inner - 2, null, color);
         }
         for (game.participants) |participant| {
-            try writeParticipantRow(w, participant, color);
+            try writeParticipantRow(w, participant, color, inner);
         }
     }
-    try writeRule(w, .bottom);
+    if (shown < board.games.len) {
+        const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
+        defer allocator.free(more);
+        try writeRule(w, .mid, inner);
+        try writeRow(w, more, inner - 2, "2", color);
+    }
+    try writeRule(w, .bottom, inner);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -75,34 +82,91 @@ fn statusColor(state: []const u8) ?[]const u8 {
     return null;
 }
 
-fn teamArtForGame(league_slug: []const u8, game: *const domain.Game) ?[]const u8 {
-    for (game.participants) |participant| {
-        if (core.art.teamArt(league_slug, participant.abbreviation, .sm)) |mark| return mark;
+/// Both teams' marks side by side at `.xs`: a horizontal card instead of
+/// a tall stacked block. A side with no mark is skipped; if the pair is
+/// wider than the box, the marks stack vertically.
+fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []const u8, game: *const domain.Game, inner: usize) !void {
+    var marks: [2][]const u8 = undefined;
+    var n: usize = 0;
+    for (game.participants) |p| {
+        if (n == marks.len) break;
+        if (core.art.teamArt(league, p.abbreviation, .xs)) |mark| {
+            marks[n] = mark;
+            n += 1;
+        }
     }
-    return null;
+    if (n == 0) return;
+
+    var rows: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
+    defer for (rows[0..n]) |*r| r.deinit(allocator);
+    var widths: [2]usize = .{ 0, 0 };
+    for (marks[0..n], 0..) |mark, i| {
+        var lines = std.mem.splitScalar(u8, mark, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            widths[i] = @max(widths[i], countCells(line));
+            try rows[i].append(allocator, line);
+        }
+    }
+
+    const gap: usize = 2;
+    if (n < 2 or widths[0] + gap + widths[1] > inner - 2) {
+        for (marks[0..n]) |mark| {
+            var lines = std.mem.splitScalar(u8, mark, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try writeArtRow(w, line, inner);
+            }
+        }
+        return;
+    }
+    const height = @max(rows[0].items.len, rows[1].items.len);
+    for (0..height) |r| {
+        try w.writeAll("│ ");
+        for (0..2) |i| {
+            if (i == 1) {
+                var g: usize = 0;
+                while (g < gap) : (g += 1) try w.writeByte(' ');
+            }
+            const line = if (r < rows[i].items.len) rows[i].items[r] else "";
+            try w.writeAll(line);
+            var pad: usize = widths[i] - countCells(line);
+            while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        }
+        var fill: usize = inner - 2 - (widths[0] + gap + widths[1]);
+        while (fill > 0) : (fill -= 1) try w.writeByte(' ');
+        try w.writeAll(" │\n");
+    }
+}
+
+/// Terminal cells in a line. The tool guarantees single-cell glyphs, so
+/// code points are cells; on invalid UTF-8 fall back to bytes.
+fn countCells(line: []const u8) usize {
+    var view = std.unicode.Utf8View.init(line) catch return line.len;
+    var cells: usize = 0;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |_| cells += 1;
+    return cells;
 }
 
 /// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
 /// byte-based writeCell would slice glyphs and break the rules. Count code
 /// points instead; the tool guarantees single-cell glyphs.
-fn writeArtRow(w: *std.Io.Writer, line: []const u8) !void {
+fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     try w.writeAll("│ ");
     try w.writeAll(line);
-    var cells: usize = 0;
-    var view = std.unicode.Utf8View.init(line) catch return error.InvalidArt;
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| cells += 1;
-    var i: usize = cells;
-    while (i < inner_width - 2) : (i += 1) try w.writeByte(' ');
+    var i: usize = countCells(line);
+    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
 }
 
-fn writeParticipantRow(w: *std.Io.Writer, participant: domain.Participant, color: bool) !void {
+fn writeParticipantRow(w: *std.Io.Writer, participant: domain.Participant, color: bool, inner: usize) !void {
     const mark: ?[]const u8 = if (participant.winner) "32" else null;
     try w.writeAll("│ ");
     try writeCell(w, participant.abbreviation, 4, mark, color);
     try w.writeByte(' ');
-    try writeCell(w, participant.name, 36, mark, color);
+    // Fixed cells around the name: abbr 4 + spaces 2 + score 4 + check 2.
+    try writeCell(w, participant.name, inner - 2 - 12, mark, color);
     try w.writeByte(' ');
     try writeCellRight(w, participant.score, 4, mark, color);
     if (participant.winner) {
@@ -123,7 +187,7 @@ fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, c
 
 const Rule = enum { top, mid, bottom };
 
-fn writeRule(w: *std.Io.Writer, which: Rule) !void {
+fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     const left: []const u8 = switch (which) {
         .top => "┌",
         .mid => "├",
@@ -136,7 +200,7 @@ fn writeRule(w: *std.Io.Writer, which: Rule) !void {
     };
     try w.writeAll(left);
     var i: usize = 0;
-    while (i < inner_width) : (i += 1) try w.writeAll("─");
+    while (i < inner) : (i += 1) try w.writeAll("─");
     try w.writeAll(right);
 }
 
@@ -193,15 +257,15 @@ pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     errdefer out.deinit();
     const w = &out.writer;
     try colorize(w, "2", "sprts\n", color);
-    try writeRule(w, .top);
+    try writeRule(w, .top, default_inner_width);
     for (leagues.all) |league| {
         try w.writeAll("│ ");
         try writeCell(w, league.slug, 13, null, color);
         try w.writeByte(' ');
-        try writeCell(w, league.name, 36, null, color);
+        try writeCell(w, league.name, 34, null, color);
         try w.writeAll(" │\n");
     }
-    try writeRule(w, .bottom);
+    try writeRule(w, .bottom, default_inner_width);
     try colorize(w, "2", "Try: curl localhost:8080/mlb\n", color);
     return out.toOwnedSlice();
 }
@@ -209,8 +273,8 @@ pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
 /// Minimal browser page: the same table as text, never ANSI, with real
 /// links. Browsers cannot use terminal escapes, so HTML output is always
 /// uncolored and the text renderer stays the single source of layout.
-pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
-    const body = try text(allocator, board, false);
+pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16) ![]u8 {
+    const body = try text(allocator, board, false, width, height);
     defer allocator.free(body);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
@@ -239,16 +303,16 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
     const w = &out.writer;
     try pageHead(w, "sprts");
     try w.writeAll("<pre>sprts\n");
-    try writeRule(w, .top);
+    try writeRule(w, .top, default_inner_width);
     for (leagues.all) |league| {
         try w.writeAll("│ ");
         try w.print("<a href=\"/{s}\">", .{league.slug});
         try writeCell(w, league.slug, 13, null, false);
         try w.writeByte(' ');
-        try writeCell(w, league.name, 36, null, false);
+        try writeCell(w, league.name, 34, null, false);
         try w.writeAll("</a> │\n");
     }
-    try writeRule(w, .bottom);
+    try writeRule(w, .bottom, default_inner_width);
     try w.writeAll("Try: curl localhost:8080/mlb\n");
     try w.writeAll("</pre><nav><a href=\"/api/v1/leagues\">json</a></nav></main></body></html>");
     return out.toOwnedSlice();
@@ -337,7 +401,7 @@ test "text renderer draws a table and no HTML" {
             },
         },
     };
-    const output = try text(std.testing.allocator, board, false);
+    const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "┌") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "│") != null);
@@ -367,11 +431,11 @@ test "text renderer colors by default and strips with the flag off" {
             },
         },
     };
-    const colored = try text(std.testing.allocator, board, true);
+    const colored = try text(std.testing.allocator, board, true, null, null);
     defer std.testing.allocator.free(colored);
     try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[1;31m") != null);
     try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[32m") != null);
-    const plain = try text(std.testing.allocator, board, false);
+    const plain = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
 }
@@ -395,7 +459,7 @@ test "text renderer never splits a code point when truncating" {
             },
         },
     };
-    const output = try text(std.testing.allocator, board, false);
+    const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
     _ = try std.unicode.Utf8View.init(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "…") != null);
@@ -421,7 +485,7 @@ test "HTML pages link and never carry ANSI" {
             },
         },
     };
-    const page = try scoreHtml(std.testing.allocator, board);
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-05\">") != null);
@@ -439,9 +503,87 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, err, "a&lt;b") != null);
 }
 
-test "text renderer prints the mark for teams that have one" {
-    const mark = core.art.teamArt("mlb", "PHI", .sm).?;
-    const first_line = mark[0..std.mem.indexOfScalar(u8, mark, '\n').?];
+fn expectAlignedTable(output: []const u8) !void {
+    // Every table line (rules and rows) must share one display width, or
+    // the right border drifts. Byte length is the wrong check: one box
+    // rule is 3 bytes per column. Widths here count columns per code
+    // point (Latin and box characters are narrow, astral pair output
+    // counts wide). Header, hint, and navigation lines live outside the
+    // table and are skipped.
+    var width: ?usize = null;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] != 0xE2) continue;
+        const w = displayWidth(line);
+        if (width) |first| {
+            try std.testing.expectEqual(first, w);
+        } else {
+            width = w;
+        }
+        count += 1;
+    }
+    try std.testing.expect(count > 0);
+}
+
+fn displayWidth(s: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const b = s[i];
+        if (b < 0x80) {
+            w += 1;
+            i += 1;
+        } else if (b & 0xE0 == 0xC0) {
+            w += 1;
+            i += 2;
+        } else if (b & 0xF0 == 0xE0) {
+            w += 1;
+            i += 3;
+        } else {
+            w += 2;
+            i += 4;
+        }
+    }
+    return w;
+}
+
+test "home table rows align with the frame" {
+    const output = try home(std.testing.allocator, false);
+    defer std.testing.allocator.free(output);
+    try expectAlignedTable(output);
+}
+
+test "scoreboard table rows align with the frame" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(output);
+    try expectAlignedTable(output);
+}
+
+test "text renderer prints both marks side by side" {
+    const home_mark = core.art.teamArt("mlb", "PHI", .xs).?;
+    const home_first = home_mark[0..std.mem.indexOfScalar(u8, home_mark, '\n').?];
+    const away_mark = core.art.teamArt("mlb", "NYM", .xs).?;
+    const away_first = away_mark[0..std.mem.indexOfScalar(u8, away_mark, '\n').?];
     const board: domain.Scoreboard = .{
         .league = "mlb",
         .league_name = "MLB",
@@ -461,14 +603,21 @@ test "text renderer prints the mark for teams that have one" {
             },
         },
     };
-    const output = try text(std.testing.allocator, board, false);
+    const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, first_line) != null);
+    // Both first rows land on the same output line: horizontal card.
+    var found = false;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, home_first) != null and
+            std.mem.indexOf(u8, line, away_first) != null) found = true;
+    }
+    try std.testing.expect(found);
     _ = try std.unicode.Utf8View.init(output);
 }
 
 test "text renderer prints no mark for teams without one" {
-    const mark = core.art.teamArt("mlb", "PHI", .sm).?;
+    const mark = core.art.teamArt("mlb", "PHI", .xs).?;
     const first_line = mark[0..std.mem.indexOfScalar(u8, mark, '\n').?];
     const board: domain.Scoreboard = .{
         .league = "mlb",
@@ -489,7 +638,81 @@ test "text renderer prints no mark for teams without one" {
             },
         },
     };
-    const output = try text(std.testing.allocator, board, false);
+    const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, first_line) == null);
+}
+
+fn testBoard() domain.Scoreboard {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "2",
+                .name = "Second at Third",
+                .starts_at = "2026-09-06T19:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "c", .name = "Second", .abbreviation = "SEC", .score = "", .winner = false },
+                    .{ .id = "d", .name = "Third", .abbreviation = "THI", .score = "", .winner = false },
+                },
+            },
+            .{
+                .id = "3",
+                .name = "Fourth at Fifth",
+                .starts_at = "2026-09-06T21:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "e", .name = "Fourth", .abbreviation = "FOU", .score = "", .winner = false },
+                    .{ .id = "f", .name = "Fifth", .abbreviation = "FIF", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+}
+
+test "text renderer honors an explicit width" {
+    const board = testBoard();
+    const wide = try text(std.testing.allocator, board, false, 80, null);
+    defer std.testing.allocator.free(wide);
+    // Top rule: ┌ + 78 × ─ + ┐\n.
+    const eol = std.mem.indexOfScalar(u8, wide, '\n').?;
+    try std.testing.expectEqual(@as(usize, 3 + 78 * 3 + 3), eol);
+    _ = try std.unicode.Utf8View.init(wide);
+
+    // Narrow requests never shrink below the classic 52-wide box.
+    const narrow = try text(std.testing.allocator, board, false, 40, null);
+    defer std.testing.allocator.free(narrow);
+    const narrow_eol = std.mem.indexOfScalar(u8, narrow, '\n').?;
+    try std.testing.expectEqual(@as(usize, 3 + 50 * 3 + 3), narrow_eol);
+}
+
+test "text renderer caps games with height and counts the rest" {
+    const board = testBoard();
+    const capped = try text(std.testing.allocator, board, false, null, 2);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "Final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "Fourth at Fifth") == null);
+    _ = try std.unicode.Utf8View.init(capped);
+
+    const all = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "more") == null);
 }
