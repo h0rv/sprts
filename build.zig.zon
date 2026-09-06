@@ -10,6 +10,10 @@
             .url = "git+https://github.com/h0rv/zchema.git#db677f499d7e807c0bed04b6092a0375bf79aed3",
             .hash = "zchema-0.0.0-ShyKcdn9AQBJ3yNdS8aWHeeTlbYE4PlYVb7nSGd9AZnb",
         },
+        .@"workers-zig" = .{
+            .url = "git+https://github.com/nilslice/workers-zig.git#c82686d8c4c612ce59b4ba197d0054a8546c5738",
+            .hash = "workers_zig-0.1.0-7F3MZK7LBgDTU0y0ejOJpIW1cK2vLCsHl3NSZJ2pDgPd",
+        },
     },
     .paths = .{
         "build.zig",

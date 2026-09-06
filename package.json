@@ -4,7 +4,9 @@
   "scripts": {
     "cf:types": "wrangler types",
     "cf:check": "tsc --noEmit && wrangler deploy --dry-run",
-    "cf:deploy": "wrangler deploy"
+    "cf:deploy": "wrangler deploy",
+    "cf:deploy:wasm": "wrangler deploy --env wasm",
+    "cf:dev:wasm": "wrangler dev --env wasm"
   },
   "dependencies": {
     "@cloudflare/containers": "0.3.7"

@@ -41,6 +41,32 @@
       "enabled": true,
       "head_sampling_rate": 0.05
     }
+  },
+  "env": {
+    "wasm": {
+      "main": "zig-out/bin/entry.js",
+      "compatibility_date": "2026-09-06",
+      "compatibility_flags": ["nodejs_compat"],
+      "routes": [
+        {
+          "pattern": "wasm.sprts.horv.co",
+          "custom_domain": true
+        }
+      ],
+      "build": {
+        "command": "mise exec -- zig build wasm"
+      },
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "head_sampling_rate": 1
+        },
+        "traces": {
+          "enabled": true,
+          "head_sampling_rate": 0.05
+        }
+      }
+    }
   }
 }
 

@@ -2,24 +2,44 @@ const std = @import("std");
 const core = @import("sprts_core");
 const espn = @import("espn_client");
 
+pub const ClockFn = *const fn (io: std.Io) i64;
+
+fn realClock(io: std.Io) i64 {
+    return std.Io.Clock.real.now(io).toSeconds();
+}
+
 pub const EspnAdapter = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     base_url: []const u8 = "https://site.api.espn.com/apis/site/v2",
+    transport: ?espn.HttpTransport = null,
+    clock: ClockFn = realClock,
+
+    pub fn today(self: EspnAdapter, arena: std.mem.Allocator) ![]u8 {
+        return core.date.todayFromEpoch(arena, self.clock(self.io));
+    }
 
     pub fn fetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) !core.domain.Scoreboard {
         const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
         const compact_day = try core.date.compact(arena, day);
-        var client = espn.Client.init(self.allocator, self.io, "");
-        defer client.deinit();
-        client.withBaseUrl(self.base_url);
-        var response = try espn.getScoreboardRaw(&client, endpoint.sport, endpoint.league, compact_day, null, null, null);
-        defer response.deinit();
-        if (response.status != .ok) {
-            std.log.warn("ESPN returned HTTP {d}", .{@intFromEnum(response.status)});
+        const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, null, null, null);
+        var status: std.http.Status = undefined;
+        var body: []const u8 = undefined;
+        if (self.transport) |transport| {
+            const result = try transport.fetch(arena, url, espn.default_headers);
+            status = result.status;
+            body = result.body;
+        } else {
+            var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io };
+            const result = try std_transport.fetch(arena, url, espn.default_headers);
+            status = result.status;
+            body = result.body;
+        }
+        if (status != .ok) {
+            std.log.warn("ESPN returned HTTP {d}", .{@intFromEnum(status)});
             return error.UpstreamResponse;
         }
-        return parseAndNormalize(arena, league, day, response.body);
+        return parseAndNormalize(arena, league, day, body);
     }
 };
 
@@ -103,7 +123,7 @@ const Identity = struct {
     abbreviation: []const u8,
 };
 
-fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, body: []const u8) !core.domain.Scoreboard {
+pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, body: []const u8) !core.domain.Scoreboard {
     const response = try std.json.parseFromSliceLeaky(ScoreboardResponse, arena, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -185,4 +205,52 @@ test "raw ESPN response is normalized without depending on unrelated fields" {
     try std.testing.expectEqual(@as(usize, 1), board.games.len);
     try std.testing.expectEqualStrings("Home", board.games[0].participants[1].name);
     try std.testing.expect(board.games[0].participants[1].winner);
+}
+
+const FakeTransportState = struct {
+    seen_url: ?[]const u8 = null,
+    body: []const u8,
+    status: std.http.Status = .ok,
+
+    fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
+        _ = extra_headers;
+        const self: *FakeTransportState = @ptrCast(@alignCast(ptr));
+        self.seen_url = try arena.dupe(u8, url);
+        return .{ .status = self.status, .body = try arena.dupe(u8, self.body) };
+    }
+
+    fn asTransport(self: *FakeTransportState) espn.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+fn fakeClock(_: std.Io) i64 {
+    return 1788739200; // 2026-09-07T00:00:00Z
+}
+
+test "EspnAdapter accepts injected transport and clock" {
+    const fixture =
+        \\{"events":[]}
+    ;
+    var fake = FakeTransportState{ .body = fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const test_io = threaded.io();
+    const adapter = EspnAdapter{
+        .allocator = std.testing.allocator,
+        .io = test_io,
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+    const day = try adapter.today(arena);
+    try std.testing.expectEqualStrings("2026-09-07", day);
+    const board = try adapter.fetch(arena, core.leagues.find("mlb").?, "2026-09-06");
+    try std.testing.expectEqualStrings("mlb", board.league);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/baseball/mlb/scoreboard?dates=20260906",
+        fake.seen_url.?,
+    );
 }

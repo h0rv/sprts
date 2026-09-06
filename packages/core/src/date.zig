@@ -20,9 +20,12 @@ pub fn compact(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 }
 
 pub fn today(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    const seconds = std.Io.Clock.real.now(io).toSeconds();
-    if (seconds < 0) return error.InvalidDate;
-    return fromEpochDay(allocator, @intCast(@divFloor(seconds, std.time.s_per_day)));
+    return todayFromEpoch(allocator, std.Io.Clock.real.now(io).toSeconds());
+}
+
+pub fn todayFromEpoch(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
+    if (epoch_seconds < 0) return error.InvalidDate;
+    return fromEpochDay(allocator, @intCast(@divFloor(epoch_seconds, std.time.s_per_day)));
 }
 
 pub fn shift(allocator: std.mem.Allocator, value: []const u8, delta: i32) ![]u8 {
@@ -71,4 +74,14 @@ test "dates validate and shift across leap day" {
     const next = try shift(std.testing.allocator, "2024-02-29", 1);
     defer std.testing.allocator.free(next);
     try std.testing.expectEqualStrings("2024-03-01", next);
+}
+
+test "todayFromEpoch maps epoch seconds to UTC date" {
+    const at_midnight = try todayFromEpoch(std.testing.allocator, 1788739200);
+    defer std.testing.allocator.free(at_midnight);
+    try std.testing.expectEqualStrings("2026-09-07", at_midnight);
+    const before_midnight = try todayFromEpoch(std.testing.allocator, 1788739200 - 1);
+    defer std.testing.allocator.free(before_midnight);
+    try std.testing.expectEqualStrings("2026-09-06", before_midnight);
+    try std.testing.expectError(error.InvalidDate, todayFromEpoch(std.testing.allocator, -1));
 }
