@@ -137,6 +137,9 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", format, .bad_request),
         .not_found => return errorResponse(alloc, "route not found", format, .not_found),
         .scoreboard => |route| return serveBoard(env, alloc, route, format),
+        // Streams own these: game detail (wt-detail) and team view (wt-team).
+        .game => return errorResponse(alloc, "game view coming soon", format, .not_found),
+        .team => return errorResponse(alloc, "team view coming soon", format, .not_found),
     }
 }
 

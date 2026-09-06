@@ -101,6 +101,9 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             try respond(request, body, format, .ok, commonHeaders());
         },
+        // Streams own these: game detail (wt-detail) and team view (wt-team).
+        .game => try respondError(arena, request, "game view coming soon", format, .not_found),
+        .team => try respondError(arena, request, "team view coming soon", format, .not_found),
     }
 }
 

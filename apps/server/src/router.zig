@@ -11,10 +11,28 @@ pub const ScoreboardRoute = struct {
     height: ?u16,
 };
 
+pub const GameRoute = struct {
+    league: []const u8,
+    id: []const u8,
+    color: ?bool,
+    width: ?u16,
+    height: ?u16,
+};
+
+pub const TeamRoute = struct {
+    league: []const u8,
+    abbr: []const u8,
+    color: ?bool,
+    width: ?u16,
+    height: ?u16,
+};
+
 pub const Route = union(enum) {
     home: ?bool,
     leagues,
     scoreboard: ScoreboardRoute,
+    game: GameRoute,
+    team: TeamRoute,
     openapi,
     health,
     not_found,
@@ -39,7 +57,34 @@ pub fn parse(target: []const u8) Route {
         path[1..]
     else
         return .not_found;
-    if (slug.len == 0 or std.mem.indexOfScalar(u8, slug, '/') != null) return .not_found;
+    if (slug.len == 0) return .not_found;
+    // Two-segment addresses: /{league}/{id} (all digits) is a game view,
+    // /{league}/{abbr} is a team view. Deeper paths are not routes.
+    if (std.mem.indexOfScalar(u8, slug, '/')) |slash| {
+        const league = slug[0..slash];
+        const segment = slug[slash + 1 ..];
+        if (league.len == 0 or segment.len == 0 or
+            std.mem.indexOfScalar(u8, segment, '/') != null) return .not_found;
+        const display = .{
+            .color = color,
+            .width = queryUint(queryValue(query, "width")),
+            .height = queryUint(queryValue(query, "height")),
+        };
+        if (isAllDigits(segment)) return .{ .game = .{
+            .league = league,
+            .id = segment,
+            .color = display.color,
+            .width = display.width,
+            .height = display.height,
+        } };
+        return .{ .team = .{
+            .league = league,
+            .abbr = segment,
+            .color = display.color,
+            .width = display.width,
+            .height = display.height,
+        } };
+    }
 
     const day = queryValue(query, "date");
     if (day) |value| if (!dates.validate(value)) return .bad_date;
@@ -50,6 +95,12 @@ pub fn parse(target: []const u8) Route {
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
     } };
+}
+
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
 }
 
 /// Response format for a request. The address decides first: `/api/v1/`
@@ -156,6 +207,22 @@ test "display params parse strict" {
 
 test "bad dates and unknown shapes still route" {
     try std.testing.expect(parse("/mlb?date=tomorrow") == .bad_date);
-    try std.testing.expect(parse("/mlb/extra") == .not_found);
+    try std.testing.expect(parse("/mlb/a/b") == .not_found);
     try std.testing.expect(parse("/api/v1/mlb?date=tomorrow") == .bad_date);
+}
+
+test "second segment splits game ids from team abbrevs" {
+    const game = parse("/mlb/401816828").game;
+    try std.testing.expectEqualStrings("mlb", game.league);
+    try std.testing.expectEqualStrings("401816828", game.id);
+    const api_game = parse("/api/v1/mlb/401816828").game;
+    try std.testing.expectEqualStrings("401816828", api_game.id);
+    const team = parse("/mlb/phi").team;
+    try std.testing.expectEqualStrings("mlb", team.league);
+    try std.testing.expectEqualStrings("phi", team.abbr);
+    const api_team = parse("/api/v1/nfl/kc?width=90").team;
+    try std.testing.expectEqualStrings("kc", api_team.abbr);
+    try std.testing.expect(api_team.width.? == 90);
+    try std.testing.expect(parse("/mlb/") == .not_found);
+    try std.testing.expect(parse("//phi") == .not_found);
 }
