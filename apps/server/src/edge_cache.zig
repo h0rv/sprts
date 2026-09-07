@@ -194,3 +194,135 @@ test "upstreamHeaders always carries the ESPN UA and JSON accept" {
     }
     try std.testing.expect(seen_ua and seen_accept);
 }
+
+// ---- Per-team view keys (append-only; board fns above are untouched) ----
+//
+// Cache scheme mirrors the board's fresh + stale bucketing, with windows
+// tuned per upstream cost and change rate:
+//
+// - teams-list: the abbreviation→id resolution. Changes only when ESPN adds
+//   or renames teams, so it sits in a LONG 24h namespace
+//   (`sprts/v1/teams/<slug>` + 24h buckets). Never shorter than the board
+//   TTLs; resolution churn is nil compared to scores.
+// - schedule: a full season of one team (~60s fresh + 600s stale buckets).
+//   Fresher than the teams list because game states move, but a longer
+//   stale window than the board: the view still renders usefully stale
+//   (last/next barely move in 10 minutes) and the schedule payload is heavy.
+// - team JSON render: cached per `(slug, abbr, format)` like the board
+//   namespace so text/html/json share one normalized TeamView fetch per
+//   request. The league slug and abbrev are lowercased before keying.
+
+/// Teams-list window: 24h fresh + 24h stale (resolution barely changes).
+pub const teams_fresh_ttl_s: i64 = 24 * 60 * 60;
+pub const teams_stale_ttl_s: i64 = 24 * 60 * 60;
+
+/// Schedule window: 60s fresh + 600s stale (game states move; payload heavy).
+pub const schedule_fresh_ttl_s: i64 = 60;
+pub const schedule_stale_ttl_s: i64 = 600;
+
+/// Lowercase a team abbreviation for cache-key canonicalization.
+pub fn canonicalAbbr(arena: std.mem.Allocator, abbr: []const u8) ![]u8 {
+    const out = try arena.dupe(u8, abbr);
+    for (out) |*byte| byte.* = std.ascii.toLower(byte.*);
+    return out;
+}
+
+/// Teams-list namespace: `sprts/v1/teams/<slug>`.
+pub fn teamsKey(arena: std.mem.Allocator, slug: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/teams/{s}", .{slug});
+}
+
+/// Teams-list fresh key: 24h bucket; a hit proves age < 24h.
+pub fn teamsFreshKey(arena: std.mem.Allocator, teams_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/f{d}", .{ teams_key, @divFloor(epoch_s, teams_fresh_ttl_s) });
+}
+
+/// Teams-list stale key: 24h bucket for upstream-error fallback.
+pub fn teamsStaleKey(arena: std.mem.Allocator, teams_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/s{d}", .{ teams_key, @divFloor(epoch_s, teams_stale_ttl_s) });
+}
+
+/// Schedule namespace: `sprts/v1/schedule/<slug>/<abbr>/<season>`.
+pub fn scheduleKey(arena: std.mem.Allocator, slug: []const u8, abbr: []const u8, season: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/schedule/{s}/{s}/{s}", .{ slug, abbr, season });
+}
+
+/// Schedule fresh key: 60s bucket; a hit proves age < 60s.
+pub fn scheduleFreshKey(arena: std.mem.Allocator, schedule_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/f{d}", .{ schedule_key, @divFloor(epoch_s, schedule_fresh_ttl_s) });
+}
+
+/// Schedule stale key: 600s bucket, served on upstream failure (else 502).
+pub fn scheduleStaleKey(arena: std.mem.Allocator, schedule_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/s{d}", .{ schedule_key, @divFloor(epoch_s, schedule_stale_ttl_s) });
+}
+
+/// Team render namespace: `sprts/v1/team/<slug>/<abbr>/<format>`.
+/// Render flags stay out of the key (`?color`/`?width`/`?height` apply after
+/// the fetch); non-JSON formats share the normalized fetch modulo format.
+pub fn teamKey(arena: std.mem.Allocator, slug: []const u8, abbr: []const u8, tag: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/team/{s}/{s}/{s}", .{ slug, abbr, tag });
+}
+
+/// Team fresh key: same 60s window as the schedule (renders track it).
+pub fn teamFreshKey(arena: std.mem.Allocator, team_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/f{d}", .{ team_key, @divFloor(epoch_s, schedule_fresh_ttl_s) });
+}
+
+/// Team stale key: same 600s window as the schedule.
+pub fn teamStaleKey(arena: std.mem.Allocator, team_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/s{d}", .{ team_key, @divFloor(epoch_s, schedule_stale_ttl_s) });
+}
+
+test "team keys canonicalize slug and abbrev" {
+    const arena = std.testing.allocator;
+    const slug = try canonicalSlug(arena, "MLB");
+    defer arena.free(slug);
+    const abbr = try canonicalAbbr(arena, "PHI");
+    defer arena.free(abbr);
+    const key = try teamKey(arena, slug, abbr, "json");
+    defer arena.free(key);
+    try std.testing.expectEqualStrings("sprts/v1/team/mlb/phi/json", key);
+
+    const teams = try teamsKey(arena, slug);
+    defer arena.free(teams);
+    try std.testing.expectEqualStrings("sprts/v1/teams/mlb", teams);
+
+    const sched = try scheduleKey(arena, slug, abbr, "2026");
+    defer arena.free(sched);
+    try std.testing.expectEqualStrings("sprts/v1/schedule/mlb/phi/2026", sched);
+}
+
+test "team buckets bound entry age" {
+    const arena = std.testing.allocator;
+    const teams = try teamsKey(arena, "mlb");
+    defer arena.free(teams);
+    const teams_a = try teamsFreshKey(arena, teams, 0);
+    defer arena.free(teams_a);
+    const teams_b = try teamsFreshKey(arena, teams, teams_fresh_ttl_s - 1);
+    defer arena.free(teams_b);
+    const teams_c = try teamsFreshKey(arena, teams, teams_fresh_ttl_s);
+    defer arena.free(teams_c);
+    try std.testing.expectEqualStrings(teams_a, teams_b);
+    try std.testing.expect(!std.mem.eql(u8, teams_a, teams_c));
+
+    const sched = try scheduleKey(arena, "mlb", "phi", "2026");
+    defer arena.free(sched);
+    const fresh_a = try scheduleFreshKey(arena, sched, 0);
+    defer arena.free(fresh_a);
+    const fresh_b = try scheduleFreshKey(arena, sched, 59);
+    defer arena.free(fresh_b);
+    const fresh_c = try scheduleFreshKey(arena, sched, 60);
+    defer arena.free(fresh_c);
+    try std.testing.expectEqualStrings(fresh_a, fresh_b);
+    try std.testing.expect(!std.mem.eql(u8, fresh_a, fresh_c));
+
+    const stale_a = try scheduleStaleKey(arena, sched, 0);
+    defer arena.free(stale_a);
+    const stale_b = try scheduleStaleKey(arena, sched, 599);
+    defer arena.free(stale_b);
+    const stale_c = try scheduleStaleKey(arena, sched, 600);
+    defer arena.free(stale_c);
+    try std.testing.expectEqualStrings(stale_a, stale_b);
+    try std.testing.expect(!std.mem.eql(u8, stale_a, stale_c));
+}

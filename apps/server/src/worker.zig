@@ -38,6 +38,7 @@ const espn = @import("espn_client");
 
 const router = @import("router.zig");
 const render = @import("render.zig");
+const team_view = @import("team_view.zig");
 const spec = @import("spec.zig");
 const provider = @import("provider.zig");
 const edge = @import("edge_cache.zig");
@@ -139,7 +140,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .scoreboard => |route| return serveBoard(env, alloc, route, format),
         // Streams own these: game detail (wt-detail) and team view (wt-team).
         .game => return errorResponse(alloc, "game view coming soon", format, .not_found),
-        .team => return errorResponse(alloc, "team view coming soon", format, .not_found),
+        .team => |route| return serveTeam(env, alloc, route, format),
     }
 }
 
@@ -246,6 +247,79 @@ fn staticResponse(body: []const u8, content_type: []const u8, cache_state: ?[]co
 
 fn boardResponse(body: []const u8, format: router.Format, cache_state: []const u8) workers.Response {
     return staticResponse(body, contentType(format), cache_state);
+}
+
+/// Team view through the edge cache. Mirrors `serveBoard` with the team
+/// key scheme (see edge_cache.zig): one normalized `fetchTeam` per request,
+/// every format rendered from it; fresh 60s bucket served directly, stale
+/// 600s bucket on upstream failure (else 502), errors never cached.
+/// Unknown abbrev (`error.TeamNotFound`) is a 404, never a cache entry.
+fn serveTeam(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TeamRoute,
+    format: router.Format,
+) !workers.Response {
+    const color = route.color orelse try colorDefault(env);
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+
+    const epoch_s = epochSecondsNow();
+    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const abbr = try edge.canonicalAbbr(alloc, route.abbr);
+    const tag = edge.formatTag(format);
+    const key = try edge.teamKey(alloc, slug, abbr, tag);
+    const fresh_key = try edge.teamFreshKey(alloc, key, epoch_s);
+    const stale_key = try edge.teamStaleKey(alloc, key, epoch_s);
+
+    const cache = workers.Cache.default();
+
+    if (cache.match(.{ .url = fresh_key })) |hit| {
+        var resp = hit.clone();
+        resp.setHeader("cache-control", edge.client_cache_control);
+        resp.setHeader("x-sprts-cache", "hit");
+        return resp;
+    }
+
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
+        if (err == error.TeamNotFound) {
+            return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN team fetch failed for {s} {s}", .{ slug, abbr });
+        if (cache.match(.{ .url = stale_key })) |stale| {
+            var resp = stale.clone();
+            resp.setHeader("cache-control", edge.client_cache_control);
+            resp.setHeader("x-sprts-cache", "stale");
+            return resp;
+        }
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const body = switch (format) {
+        .text => try team_view.renderText(alloc, view, color, route.width, route.height),
+        .html => try team_view.teamHtml(alloc, view, league.slug, route.width, route.height),
+        .json => try team_view.renderJson(alloc, view),
+    };
+
+    var resp = boardResponse(body, format, "miss");
+
+    var for_fresh = resp.clone();
+    cache.put(.{ .url = fresh_key }, &for_fresh);
+    var for_stale = resp.clone();
+    for_stale.setHeader("cache-control", edge.stale_cache_control);
+    for_stale.setHeader("x-sprts-cache", "stale");
+    cache.put(.{ .url = stale_key }, &for_stale);
+    return resp;
 }
 
 fn errorResponse(
