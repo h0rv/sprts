@@ -1,7 +1,32 @@
 #!/bin/sh
 # sprts — scores in your terminal. needs: curl, tput.
 # install: install -m755 tools/sprts ~/.local/bin/sprts
-# usage: sprts [league] [date]   e.g. sprts mlb 2026-09-06
+# usage: sprts [league] [date] [--watch [secs]]   e.g. sprts mlb 2026-09-06 --watch 10
 # width = terminal columns (server clamps 52..200), height = max games shown,
-# color = on when stdout is a tty.
-exec curl -s "https://sprts.horv.co/${1:-mlb}?${2:+date=$2&}width=$(tput cols 2>/dev/null || echo 52)&height=$(tput lines 2>/dev/null || echo 0)&color=$([ -t 1 ] && echo 1 || echo 0)"
+# color = on when stdout is a tty. --watch repaints on an interval until Ctrl-C.
+watch=0
+for arg in "$@"; do
+    case "$arg" in
+        --watch) watch=1 ;;
+        --watch=*) watch=1; interval="${arg#--watch=}" ;;
+    esac
+done
+args=""
+for arg in "$@"; do
+    case "$arg" in --watch*) ;; *) args="$args $arg" ;; esac
+done
+set -- $args
+fetch() {
+    curl -s "https://sprts.horv.co/${1:-mlb}?${2:+date=$2&}width=$(tput cols 2>/dev/null || echo 52)&height=$(tput lines 2>/dev/null || echo 0)&color=$([ -t 1 ] && echo 1 || echo 0)"
+}
+if [ "$watch" -eq 0 ]; then
+    fetch "$@"
+    exit
+fi
+trap 'printf "\033[?25h\n"; exit 0' INT TERM
+printf "\033[?25l"
+while true; do
+    printf "\033[2J\033[H"
+    fetch "$@"
+    sleep "${interval:-15}"
+done
