@@ -105,6 +105,11 @@ const Competitor = struct {
     winner: bool = false,
     team: ?Team = null,
     athlete: ?Athlete = null,
+    records: []const Record = &.{},
+};
+const Record = struct {
+    type: []const u8 = "",
+    summary: []const u8 = "",
 };
 const Team = struct {
     id: []const u8 = "",
@@ -142,9 +147,15 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                     if (competitor.athlete) |athlete| break :identity Identity{
                         .id = competitor.id,
                         .name = if (athlete.displayName.len > 0) athlete.displayName else athlete.fullName,
-                        .abbreviation = athlete.shortName,
+                        .abbreviation = "",
                     };
                     continue;
+                };
+                const record: ?[]const u8 = record: {
+                    for (competitor.records) |r| {
+                        if (std.mem.eql(u8, r.type, "total") and r.summary.len > 0) break :record r.summary;
+                    }
+                    break :record null;
                 };
                 const score = if (competitor.score.len > 0)
                     competitor.score
@@ -159,6 +170,7 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                     .score = score,
                     .winner = competitor.winner,
                     .home_away = if (competitor.homeAway.len > 0) competitor.homeAway else null,
+                    .record = record,
                 });
             }
             const status_type = if (competition.status) |status|
@@ -205,6 +217,35 @@ test "raw ESPN response is normalized without depending on unrelated fields" {
     try std.testing.expectEqual(@as(usize, 1), board.games.len);
     try std.testing.expectEqualStrings("Home", board.games[0].participants[1].name);
     try std.testing.expect(board.games[0].participants[1].winner);
+}
+
+test "athlete competitors use full names with no abbreviation" {
+    const fixture =
+        \\{"events":[{"id":"600057442","name":"Pirelli Italian Grand Prix","date":"2026-09-04T10:30Z","competitions":[{"id":"401839098","date":"2026-09-04T10:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"5498","order":1,"winner":false,"athlete":{"displayName":"Charles Leclerc","fullName":"Charles Leclerc","shortName":"C. Leclerc"}},{"id":"868","order":2,"winner":true,"athlete":{"displayName":"Lewis Hamilton","fullName":"Lewis Hamilton","shortName":"L. Hamilton"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const board = try parseAndNormalize(arena_state.allocator(), core.leagues.find("f1").?, "2026-09-06", fixture);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqual(@as(usize, 2), board.games[0].participants.len);
+    try std.testing.expectEqualStrings("Charles Leclerc", board.games[0].participants[0].name);
+    try std.testing.expectEqualStrings("", board.games[0].participants[0].abbreviation);
+    try std.testing.expectEqualStrings("Lewis Hamilton", board.games[0].participants[1].name);
+    try std.testing.expectEqualStrings("", board.games[0].participants[1].abbreviation);
+    try std.testing.expect(board.games[0].participants[1].winner);
+}
+
+test "competitor records normalize the total summary" {
+    const fixture =
+        \\{"events":[{"id":"401","name":"Away at Home","date":"2026-09-06T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"competitors":[{"homeAway":"away","score":"2","winner":false,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"},"records":[{"name":"overall","type":"total","summary":"69-74"},{"name":"Home","type":"home","summary":"36-38"}]},{"homeAway":"home","score":"5","winner":true,"team":{"id":"h","displayName":"Home","abbreviation":"HME"},"records":[{"name":"Home","type":"home","summary":"40-30"}]}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const board = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", fixture);
+    try std.testing.expectEqualStrings("69-74", board.games[0].participants[0].record.?);
+    try std.testing.expect(board.games[0].participants[1].record == null);
+    // Team identities keep their abbreviations.
+    try std.testing.expectEqualStrings("AWY", board.games[0].participants[0].abbreviation);
 }
 
 const FakeTransportState = struct {
