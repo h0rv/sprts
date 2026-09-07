@@ -37,32 +37,33 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try writeRule(w, .top, inner);
+    const table = Table{ .writer = w, .inner = inner, .color = color };
+    try table.rule(.top);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
     defer allocator.free(heading);
-    try writeRow(w, heading, inner - 2, "2", color);
+    try table.row(heading, "2");
     if (board.games.len == 0) {
-        try writeRule(w, .mid, inner);
-        try writeRow(w, "No games scheduled.", inner - 2, null, color);
+        try table.rule(.mid);
+        try table.row("No games scheduled.", null);
     }
     for (board.games[0..shown]) |game| {
-        try writeRule(w, .mid, inner);
-        try writeRow(w, game.status, inner - 2, statusColor(game.state), color);
+        try table.rule(.mid);
+        try table.row(game.status, statusColor(game.state));
         try writeGameMarks(w, allocator, board.league, &game, inner);
         if (game.participants.len == 0) {
-            try writeRow(w, game.name, inner - 2, null, color);
+            try table.row(game.name, null);
         }
         for (game.participants) |participant| {
-            try writeParticipantRow(w, participant, color, inner);
+            try table.participantRow(participant);
         }
     }
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
         defer allocator.free(more);
-        try writeRule(w, .mid, inner);
-        try writeRow(w, more, inner - 2, "2", color);
+        try table.rule(.mid);
+        try table.row(more, "2");
     }
-    try writeRule(w, .bottom, inner);
+    try table.rule(.bottom);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -161,31 +162,73 @@ fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
 }
 
 fn writeParticipantRow(w: *std.Io.Writer, participant: domain.Participant, color: bool, inner: usize) !void {
-    const mark: ?[]const u8 = if (participant.winner) "32" else null;
-    try w.writeAll("│ ");
-    try writeCell(w, participant.abbreviation, 4, mark, color);
-    try w.writeByte(' ');
-    // Fixed cells around the name: abbr 4 + spaces 2 + score 4 + check 2.
-    try writeCell(w, participant.name, inner - 2 - 12, mark, color);
-    try w.writeByte(' ');
-    try writeCellRight(w, participant.score, 4, mark, color);
-    if (participant.winner) {
-        if (color) try w.writeAll("\x1b[32m");
-        try w.writeAll(" ✓");
-        if (color) try w.writeAll("\x1b[0m");
-    } else {
-        try w.writeAll("  ");
-    }
-    try w.writeAll(" │\n");
+    const table = Table{ .writer = w, .inner = inner, .color = color };
+    try table.participantRow(participant);
 }
+
+pub const Rule = enum { top, mid, bottom };
+
+pub const Table = struct {
+    writer: *std.Io.Writer,
+    inner: usize,
+    color: bool,
+
+    pub fn rule(self: Table, which: Rule) !void {
+        try writeRule(self.writer, which, self.inner);
+    }
+
+    pub fn row(self: Table, line: []const u8, code: ?[]const u8) !void {
+        try writeRow(self.writer, line, self.inner - 2, code, self.color);
+    }
+
+    pub fn participantRow(self: Table, participant: domain.Participant) !void {
+        const mark: ?[]const u8 = if (participant.winner) "32" else null;
+        const w = self.writer;
+        const inner = self.inner;
+        const suffix_len: usize = if (participant.record) |record|
+            2 + countCells(record) + 1
+        else
+            0;
+        try w.writeAll("│ ");
+        // Fixed cells around the name: abbr 4 + spaces 2 + score 4 + check 2.
+        var name_width: usize = undefined;
+        if (participant.abbreviation.len > 0) {
+            try writeCell(w, participant.abbreviation, 4, mark, self.color);
+            try w.writeByte(' ');
+            name_width = inner - 2 - 12;
+        } else {
+            // Athlete identities carry no abbreviation: the name absorbs
+            // the abbr cell plus its separator.
+            name_width = inner - 2 - 7;
+        }
+        name_width = name_width -| suffix_len;
+        try writeCell(w, participant.name, name_width, mark, self.color);
+        try w.writeByte(' ');
+        try writeCellRight(w, participant.score, 4, mark, self.color);
+        if (participant.record) |record| {
+            const use_color = self.color and mark != null;
+            if (use_color) try w.print("\x1b[{s}m", .{mark.?});
+            try w.writeAll(" (");
+            try w.writeAll(record);
+            try w.writeByte(')');
+            if (use_color) try w.writeAll("\x1b[0m");
+        }
+        if (participant.winner) {
+            if (self.color) try w.writeAll("\x1b[32m");
+            try w.writeAll(" ✓");
+            if (self.color) try w.writeAll("\x1b[0m");
+        } else {
+            try w.writeAll("  ");
+        }
+        try w.writeAll(" │\n");
+    }
+};
 
 fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
     try w.writeAll("│ ");
     try writeCell(w, s, width, code, color);
     try w.writeAll(" │\n");
 }
-
-const Rule = enum { top, mid, bottom };
 
 fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     const left: []const u8 = switch (which) {
@@ -204,7 +247,7 @@ fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     try w.writeAll(right);
 }
 
-/// Writes `s` fitted to exactly `width` bytes, truncating at a code point
+/// Writes `s` fitted to exactly `width` cells, truncating at a code point
 /// boundary with an ellipsis when too long. Escape bytes are never part of
 /// the width: color wraps the fitted bytes only.
 fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
@@ -214,19 +257,16 @@ fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, 
     try w.writeAll(s[0..end]);
     if (ellipsis) try w.writeAll("…");
     if (use_color) try w.writeAll("\x1b[0m");
-    const pad: usize = end + (if (ellipsis) "...".len else 0);
-    // "…" is 3 bytes; byte padding keeps the rules aligned for the
-    // Latin names this server renders.
-    var i: usize = pad;
+    const n_written: usize = countCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
+    var i: usize = n_written;
     while (i < width) : (i += 1) try w.writeByte(' ');
 }
 
 fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
     const end, const ellipsis = fit(s, width);
     const use_color = color and code != null;
-    const pad: usize = end + (if (ellipsis) "...".len else 0);
-    var spaces: usize = 0;
-    while (pad + spaces < width) : (spaces += 1) {}
+    const n_written: usize = countCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
+    var spaces: usize = width -| n_written;
     while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
     if (use_color) try w.print("\x1b[{s}m", .{code.?});
     try w.writeAll(s[0..end]);
@@ -234,6 +274,9 @@ fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const
     if (use_color) try w.writeAll("\x1b[0m");
 }
 
+/// Fits `s` into `width` columns, truncating at a code point boundary
+/// with an ellipsis when too long. Unchanged byte-budget truncation:
+/// only the padding in the callers moved from bytes to cells.
 fn fit(s: []const u8, width: usize) struct { usize, bool } {
     if (s.len <= width) return .{ s.len, false };
     if (width < 4) return .{ 0, true };
@@ -641,6 +684,95 @@ test "text renderer prints no mark for teams without one" {
     const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, first_line) == null);
+}
+
+test "athlete-style rows show the full name with an empty abbr cell" {
+    const board: domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2026-09-06T10:30Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "5498", .name = "Charles Leclerc", .abbreviation = "", .score = "#1", .winner = false },
+                    .{ .id = "868", .name = "Lewis Hamilton", .abbreviation = "", .score = "#2", .winner = true },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Charles Leclerc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Lewis Hamilton") != null);
+    // Empty abbr cell + separator shift the name over, never truncated.
+    var abbr_ellipsis = false;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Leclerc") != null or
+            std.mem.indexOf(u8, line, "Hamilton") != null)
+        {
+            abbr_ellipsis = abbr_ellipsis or (std.mem.indexOf(u8, line, "…") != null);
+        }
+    }
+    try std.testing.expect(!abbr_ellipsis);
+    try expectAlignedTable(output);
+}
+
+test "records render after the score in team rows" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, " (69-74)") != null);
+    try expectAlignedTable(output);
+}
+
+test "multibyte names keep the frame aligned" {
+    const board: domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2026-09-06T10:30Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "27", .name = "Nico Hülkenberg", .abbreviation = "", .score = "#7", .winner = false },
+                },
+            },
+        },
+    };
+    const output = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Hülkenberg") != null);
+    try expectAlignedTable(output);
 }
 
 fn testBoard() domain.Scoreboard {

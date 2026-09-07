@@ -5,12 +5,14 @@ pub const Participant = struct {
     score: []const u8,
     winner: bool,
     home_away: ?[]const u8 = null,
+    record: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "Participant",
         .description = "A team, athlete, driver, fighter, or other entrant.",
         .fields = .{
             .home_away = .{ .description = "The team-sport side when the provider supplies one." },
+            .record = .{ .description = "The win-loss style overall record when the provider supplies one." },
         },
     };
 };
