@@ -101,7 +101,6 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             try respond(request, body, format, .ok, commonHeaders());
         },
-        // Streams own these: game detail (wt-detail) and team view (wt-team).
         .game => |game_route| {
             const league = core.leagues.find(game_route.league) orelse {
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
@@ -125,7 +124,29 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             try respond(request, body, format, .ok, commonHeaders());
         },
-        .team => try respondError(arena, request, "team view coming soon", format, .not_found),
+        .team => |team_route| {
+            const league = core.leagues.find(team_route.league) orelse {
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const view = server_app.provider.fetchTeam(adapter, arena, league, team_route.abbr) catch |err| switch (err) {
+                error.TeamNotFound => {
+                    try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
+                    return;
+                },
+                else => {
+                    std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, team_route.abbr, err });
+                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                    return;
+                },
+            };
+            const body = switch (format) {
+                .text => try server_app.team_view.renderText(arena, view, team_route.color orelse color_default, team_route.width, team_route.height),
+                .html => try server_app.team_view.teamHtml(arena, view, league.slug, team_route.width, team_route.height),
+                .json => try server_app.team_view.renderJson(arena, view),
+            };
+            try respond(request, body, format, .ok, commonHeaders());
+        },
     }
 }
 

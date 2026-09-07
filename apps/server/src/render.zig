@@ -224,13 +224,13 @@ pub const Table = struct {
     }
 };
 
-fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+pub fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
     try w.writeAll("│ ");
     try writeCell(w, s, width, code, color);
     try w.writeAll(" │\n");
 }
 
-fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
+pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     const left: []const u8 = switch (which) {
         .top => "┌",
         .mid => "├",
@@ -250,7 +250,7 @@ fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
 /// Writes `s` fitted to exactly `width` cells, truncating at a code point
 /// boundary with an ellipsis when too long. Escape bytes are never part of
 /// the width: color wraps the fitted bytes only.
-fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+pub fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
     const end, const ellipsis = fit(s, width);
     const use_color = color and code != null;
     if (use_color) try w.print("\x1b[{s}m", .{code.?});
@@ -277,7 +277,7 @@ fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const
 /// Fits `s` into `width` columns, truncating at a code point boundary
 /// with an ellipsis when too long. Unchanged byte-budget truncation:
 /// only the padding in the callers moved from bytes to cells.
-fn fit(s: []const u8, width: usize) struct { usize, bool } {
+pub fn fit(s: []const u8, width: usize) struct { usize, bool } {
     if (s.len <= width) return .{ s.len, false };
     if (width < 4) return .{ 0, true };
     var end: usize = width - 3;
@@ -361,14 +361,14 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
+pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     try escapeInto(w, title);
     try w.writeAll("</title>" ++ page_style ++ "</head><body><main>");
 }
 
-fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
+pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
     for (value) |byte| switch (byte) {
         '&' => try w.writeAll("&amp;"),
         '<' => try w.writeAll("&lt;"),

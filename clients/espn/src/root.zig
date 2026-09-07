@@ -50,6 +50,17 @@ pub fn buildSummaryUrl(
     return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/summary?event={s}", .{ base_url, sport, league, event_id });
 }
 
+/// Pure URL builder for the teams list used to resolve an abbreviation to
+/// an ESPN team id: `{base}/sports/{sport}/{league}/teams`.
+pub fn buildTeamsUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    sport: []const u8,
+    league: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/teams", .{ base_url, sport, league });
+}
+
 /// Portable fetch result. `body` is owned by the caller-provided arena.
 pub const FetchResult = struct {
     status: std.http.Status,
@@ -227,8 +238,20 @@ pub fn buildScheduleUrl(
     return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/teams/{s}/schedule?season={s}", .{ base_url, sport, league, team_id, season });
 }
 
-test "buildScheduleUrl mirrors the team schedule path" {
-    const url = try buildScheduleUrl(
+test "team URL builders mirror the teams and schedule paths" {
+    const teams = try buildTeamsUrl(
+        std.testing.allocator,
+        "https://site.api.espn.com/apis/site/v2",
+        "baseball",
+        "mlb",
+    );
+    defer std.testing.allocator.free(teams);
+    try std.testing.expectEqualStrings(
+        "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams",
+        teams,
+    );
+
+    const schedule = try buildScheduleUrl(
         std.testing.allocator,
         "https://site.api.espn.com/apis/site/v2",
         "baseball",
@@ -236,9 +259,9 @@ test "buildScheduleUrl mirrors the team schedule path" {
         "22",
         "2026",
     );
-    defer std.testing.allocator.free(url);
+    defer std.testing.allocator.free(schedule);
     try std.testing.expectEqualStrings(
         "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/22/schedule?season=2026",
-        url,
+        schedule,
     );
 }
