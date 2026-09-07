@@ -78,6 +78,25 @@ pub fn boardKey(arena: std.mem.Allocator, slug: []const u8, day: []const u8, tag
     return std.fmt.allocPrint(arena, "sprts/v1/board/{s}/{s}/{s}", .{ slug, day, tag });
 }
 
+/// Detail namespace: `sprts/v1/detail/<slug>/<id>/<format>`. Same scheme as
+/// the board: non-format render flags (`?color`/`?width`/`?height`) stay out
+/// of the key and are applied after the fetch.
+pub fn detailKey(arena: std.mem.Allocator, slug: []const u8, id: []const u8, tag: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/detail/{s}/{s}/{s}", .{ slug, id, tag });
+}
+
+/// Fresh detail key: detail key + 30s bucket. A hit in the current bucket
+/// proves the entry is less than 30s old.
+pub fn detailFreshKey(arena: std.mem.Allocator, detail_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/f{d}", .{ detail_key, @divFloor(epoch_s, fresh_ttl_s) });
+}
+
+/// Stale detail key: detail key + 300s bucket. A hit in the current bucket
+/// proves the entry is less than 300s old; served only on upstream failure.
+pub fn detailStaleKey(arena: std.mem.Allocator, detail_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/s{d}", .{ detail_key, @divFloor(epoch_s, stale_ttl_s) });
+}
+
 /// Fresh key: board key + 30s bucket. A hit in the current bucket proves the
 /// entry is less than 30s old.
 pub fn freshKey(arena: std.mem.Allocator, board_key: []const u8, epoch_s: i64) ![]u8 {
@@ -193,4 +212,43 @@ test "upstreamHeaders always carries the ESPN UA and JSON accept" {
         }
     }
     try std.testing.expect(seen_ua and seen_accept);
+}
+
+test "detail keys namespace by league, game id, and format" {
+    const arena = std.testing.allocator;
+    const base = try detailKey(arena, "mlb", "401816828", "json");
+    defer arena.free(base);
+    try std.testing.expectEqualStrings("sprts/v1/detail/mlb/401816828/json", base);
+
+    const other_format = try detailKey(arena, "mlb", "401816828", "text");
+    defer arena.free(other_format);
+    try std.testing.expect(!std.mem.eql(u8, base, other_format));
+
+    const other_game = try detailKey(arena, "mlb", "401816829", "json");
+    defer arena.free(other_game);
+    try std.testing.expect(!std.mem.eql(u8, base, other_game));
+}
+
+test "detail fresh and stale buckets bound entry age" {
+    const arena = std.testing.allocator;
+    const base = try detailKey(arena, "mlb", "401816828", "json");
+    defer arena.free(base);
+
+    const fresh_start = try detailFreshKey(arena, base, 0);
+    defer arena.free(fresh_start);
+    const fresh_end = try detailFreshKey(arena, base, 29);
+    defer arena.free(fresh_end);
+    const fresh_next = try detailFreshKey(arena, base, 30);
+    defer arena.free(fresh_next);
+    try std.testing.expectEqualStrings(fresh_start, fresh_end);
+    try std.testing.expect(!std.mem.eql(u8, fresh_start, fresh_next));
+
+    const stale_start = try detailStaleKey(arena, base, 0);
+    defer arena.free(stale_start);
+    const stale_end = try detailStaleKey(arena, base, 299);
+    defer arena.free(stale_end);
+    const stale_next = try detailStaleKey(arena, base, 300);
+    defer arena.free(stale_next);
+    try std.testing.expectEqualStrings(stale_start, stale_end);
+    try std.testing.expect(!std.mem.eql(u8, stale_start, stale_next));
 }

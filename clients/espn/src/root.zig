@@ -10,6 +10,9 @@ pub const GenericScoreboardResponse = site.GenericScoreboardResponse;
 
 pub const user_agent = "curl/8.17.0 sprts-espn-client/0.1";
 pub const accept_json_value = "application/json";
+// NOTE: every transport must send `user_agent` — ESPN rejects the default
+// agents. `StdTransport` overrides it below; the worker path sends the same
+// value via `edge_cache.upstreamHeaders` (see worker.zig).
 pub const default_headers: []const std.http.Header = &.{.{ .name = "accept", .value = accept_json_value }};
 
 /// Pure URL builder mirroring the scoreboard path used by `getScoreboardRaw`.
@@ -33,6 +36,18 @@ pub fn buildScoreboardUrl(
     try queryInt(&url.writer, &first, "seasontype", season_type);
     try query(&url.writer, &first, "groups", groups);
     return url.toOwnedSlice();
+}
+
+/// Pure URL builder for the per-event summary endpoint, mirroring
+/// `buildScoreboardUrl`. Returns an owned slice allocated with `allocator`.
+pub fn buildSummaryUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    sport: []const u8,
+    league: []const u8,
+    event_id: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/summary?event={s}", .{ base_url, sport, league, event_id });
 }
 
 /// Portable fetch result. `body` is owned by the caller-provided arena.
@@ -153,6 +168,21 @@ test {
     _ = site;
 }
 
+test "buildSummaryUrl mirrors the summary path" {
+    const url = try buildSummaryUrl(
+        std.testing.allocator,
+        "https://site.api.espn.com/apis/site/v2",
+        "baseball",
+        "mlb",
+        "401816828",
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary?event=401816828",
+        url,
+    );
+}
+
 test "buildScoreboardUrl mirrors scoreboard path and query order" {
     const url = try buildScoreboardUrl(
         std.testing.allocator,
@@ -182,4 +212,33 @@ test "buildScoreboardUrl mirrors scoreboard path and query order" {
     );
     defer std.testing.allocator.free(bare);
     try std.testing.expectEqualStrings("https://example.test/sports/football/nfl/scoreboard", bare);
+}
+
+/// Pure URL builder for a team's season schedule, used for series
+/// derivation. Returns an owned slice allocated with `allocator`.
+pub fn buildScheduleUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    sport: []const u8,
+    league: []const u8,
+    team_id: []const u8,
+    season: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/teams/{s}/schedule?season={s}", .{ base_url, sport, league, team_id, season });
+}
+
+test "buildScheduleUrl mirrors the team schedule path" {
+    const url = try buildScheduleUrl(
+        std.testing.allocator,
+        "https://site.api.espn.com/apis/site/v2",
+        "baseball",
+        "mlb",
+        "22",
+        "2026",
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/22/schedule?season=2026",
+        url,
+    );
 }
