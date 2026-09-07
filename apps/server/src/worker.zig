@@ -38,6 +38,7 @@ const espn = @import("espn_client");
 
 const router = @import("router.zig");
 const render = @import("render.zig");
+const detail_view = @import("detail_view.zig");
 const spec = @import("spec.zig");
 const provider = @import("provider.zig");
 const edge = @import("edge_cache.zig");
@@ -138,7 +139,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .not_found => return errorResponse(alloc, "route not found", format, .not_found),
         .scoreboard => |route| return serveBoard(env, alloc, route, format),
         // Streams own these: game detail (wt-detail) and team view (wt-team).
-        .game => return errorResponse(alloc, "game view coming soon", format, .not_found),
+        .game => |route| return serveDetail(env, alloc, route, format),
         .team => return errorResponse(alloc, "team view coming soon", format, .not_found),
     }
 }
@@ -213,6 +214,77 @@ fn serveBoard(
 
     // Store fresh (30s retention) + stale (300s retention) renders.
     // Only successful renders reach this point, so errors are never cached.
+    var for_fresh = resp.clone();
+    cache.put(.{ .url = fresh_key }, &for_fresh);
+    var for_stale = resp.clone();
+    for_stale.setHeader("cache-control", edge.stale_cache_control);
+    for_stale.setHeader("x-sprts-cache", "stale");
+    cache.put(.{ .url = stale_key }, &for_stale);
+    return resp;
+}
+
+/// Game detail (wt-detail): same edge-cache scheme as the board, keyed on
+/// `detail/<slug>/<id>/<format>` (fresh 30s bucket, stale 300s on upstream
+/// error). Unknown game ids are 404; upstream failures are 502; errors are
+/// never cached. Render flags stay out of the key.
+fn serveDetail(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.GameRoute,
+    format: router.Format,
+) !workers.Response {
+    const color = route.color orelse try colorDefault(env);
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+
+    const epoch_s = epochSecondsNow();
+    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const tag = edge.formatTag(format);
+    const detail_key = try edge.detailKey(alloc, slug, route.id, tag);
+    const fresh_key = try edge.detailFreshKey(alloc, detail_key, epoch_s);
+    const stale_key = try edge.detailStaleKey(alloc, detail_key, epoch_s);
+
+    const cache = workers.Cache.default();
+
+    if (cache.match(.{ .url = fresh_key })) |hit| {
+        var resp = hit.clone();
+        resp.setHeader("cache-control", edge.client_cache_control);
+        resp.setHeader("x-sprts-cache", "hit");
+        return resp;
+    }
+
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+
+    const game_detail = adapter.fetchDetail(alloc, league, route.id) catch |err| switch (err) {
+        error.GameNotFound => return errorResponse(alloc, "game not found", format, .not_found),
+        else => {
+            workers.log("upstream ESPN detail fetch failed for {s} {s}", .{ slug, route.id });
+            if (cache.match(.{ .url = stale_key })) |stale| {
+                var resp = stale.clone();
+                resp.setHeader("cache-control", edge.client_cache_control);
+                resp.setHeader("x-sprts-cache", "stale");
+                return resp;
+            }
+            return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+        },
+    };
+    const body = switch (format) {
+        .text => try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
+        .html => try detail_view.detailHtml(alloc, game_detail, route.width, route.height),
+        .json => try detail_view.json(alloc, game_detail),
+    };
+
+    var resp = boardResponse(body, format, "miss");
+
     var for_fresh = resp.clone();
     cache.put(.{ .url = fresh_key }, &for_fresh);
     var for_stale = resp.clone();
