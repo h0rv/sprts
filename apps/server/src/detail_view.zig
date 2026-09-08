@@ -18,33 +18,17 @@ const core = @import("sprts_core");
 const z = @import("zchema");
 const detail = core.detail;
 const router = @import("router.zig");
+const render = @import("render.zig");
 
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
 
 pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
-    // LEFTOVER (wt-detail): strict validation should be `z.serializeAndValidate`
-    // (see `render.json`), but zchema's `cachedCompiled` keys its
-    // compiled-schema cache on a `Holder` struct that ignores the generic
-    // parameter, so the first validated type in the process wins and every
-    // later type validates against the wrong schema. `render.json` validates
-    // Scoreboard first, so a strict call here always fails with "missing
-    // required property 'source'/'games'". Coordinator owns the zchema fix;
-    // this keeps a direct `std.json` round-trip (types + required fields) so a
-    // normalization bug still surfaces in tests, and `json()` will pick up
-    // strict validation for free once the cache is fixed. Validation scratch
-    // lives in a temporary arena so `std.testing.allocator` tests don't leak.
-    {
-        var tmp = std.heap.ArenaAllocator.init(allocator);
-        defer tmp.deinit();
-        const raw = try std.json.Stringify.valueAlloc(tmp.allocator(), game, .{});
-        _ = try std.json.parseFromSliceLeaky(detail.GameDetail, tmp.allocator(), raw, .{});
-    }
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try std.json.Stringify.value(game, .{ .whitespace = .indent_2 }, &out.writer);
-    try out.writer.writeByte('\n');
-    return out.toOwnedSlice();
+    // Validated through the shared `render.validatedJson` gate — see it
+    // for why strict `z.serializeAndValidate` is unusable process-wide
+    // (zchema's `cachedCompiled` cross-type cache bug, coordinator-owned
+    // upstream fix). Same wire format as before, field for field.
+    return render.validatedJson(detail.GameDetail, allocator, game);
 }
 
 /// `width` is total terminal columns; the borders take 2. Never shrinks
@@ -488,12 +472,9 @@ test "detail text truncates unicode and long names without splitting" {
 }
 
 test "detail json validates and carries the schema marker" {
-    // LEFTOVER (wt-detail): strict validation should be
-    // `z.serializeAndValidate` (see `json()` above), blocked on the zchema
-    // `cachedCompiled` cross-type cache bug described there. This test
-    // round-trips through the std.json parser (types + required fields
-    // enforced) and asserts the schema marker; `json()` picks up strict
-    // validation for free once the cache is fixed.
+    // `json()` validates through the shared `render.validatedJson` gate
+    // (round-trip: types + required fields enforced). This test asserts
+    // the schema marker plus a full parse-back of the wire output.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

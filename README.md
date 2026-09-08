@@ -56,6 +56,10 @@ Cloudflare Containers require a Workers Paid plan on the target account.
 HTML page with clickable links to browsers. Use the `date=YYYY-MM-DD`
 query parameter to select a date. The `/api/v1/{league}` route always
 returns JSON, and `/api/v1/leagues` lists the supported league slugs.
+`/{league}/{id}` (all digits) is one game with linescore and scoring
+plays, and `/{league}/{abbr}` is one team's last result and upcoming
+schedule; both serve JSON under `/api/v1/` too. The machine-readable
+spec is generated from the server source and served at `/openapi.json`.
 
 Use `?format=text` or `?format=html` to force a format. The response
 also honors `Accept: application/json` for scripts. ANSI color is on by
@@ -66,7 +70,8 @@ default for text output. Use `?color=0` to turn it off.
 - `apps/server` contains the HTTP server and ESPN adapter.
 - `packages/core` contains provider independent sports types.
 - `clients/espn` contains the generated and independently installable client.
-- `openapi/sprts-v1.json` describes the public sprts API.
+- The public API spec is generated from `apps/server/src/spec.zig`
+  (zchema is the single source of truth) and served at `/openapi.json`.
 
 Each package has its own `build.zig` and `build.zig.zon`. You can build and test
 it without the other app code. Run `mise run check` at the repository root to

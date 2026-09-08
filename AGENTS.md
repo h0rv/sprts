@@ -15,7 +15,7 @@ Zig 0.16.0 monorepo (`mise.toml` pins `zig 0.16.0`, `node 24.15.0`, `openapi2zig
 - `apps/server/src/main.zig` — native entrypoint (`std.http.Server`, `std.Io`, threaded accept loop, per-request arena). `root.zig` re-exports `provider` / `render` / `router` / `spec`.
 - `apps/server/src/worker.zig` — stub WASM entry (`zig build wasm` via `workers-zig`); routing/fetch/render must reuse the native modules, not fork them.
 - `packages/core` — provider-neutral `domain` / `leagues` / `date` types. `clients/espn` — generated ESPN client (`src/generated.zig`). Both are path dependencies with their own `build.zig`/`build.zig.zon` and are independently installable.
-- `cloudflare/index.ts` — `SprtsContainer` (port 8080, `/healthz` ping) forwarding to the Docker image. `openapi/sprts-v1.json` is the public API served at `/openapi.json`.
+- `cloudflare/index.ts` — `SprtsContainer` (port 8080, `/healthz` ping) forwarding to the Docker image. The public API spec is generated from `apps/server/src/spec.zig` via zchema (single source of truth) and served at `/openapi.json`; there is no checked-in spec file.
 
 ## Gotchas
 

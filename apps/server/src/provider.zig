@@ -14,6 +14,11 @@ pub const EspnAdapter = struct {
     base_url: []const u8 = "https://site.api.espn.com/apis/site/v2",
     transport: ?espn.HttpTransport = null,
     clock: ClockFn = realClock,
+    /// Upstream deadline in milliseconds for the built-in `StdTransport`
+    /// (a hung ESPN fails with `error.Timeout` into the stale path / 502
+    /// instead of hanging the connection). Injected `transport` fakes
+    /// ignore it. Zero disables the watchdog.
+    upstream_timeout_ms: u64 = 5000,
 
     pub fn today(self: EspnAdapter, arena: std.mem.Allocator) ![]u8 {
         return core.date.todayFromEpoch(arena, self.clock(self.io));
@@ -30,7 +35,7 @@ pub const EspnAdapter = struct {
             status = result.status;
             body = result.body;
         } else {
-            var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io };
+            var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io, .timeout_ms = self.upstream_timeout_ms };
             const result = try std_transport.fetch(arena, url, espn.default_headers);
             status = result.status;
             body = result.body;
@@ -45,7 +50,61 @@ pub const EspnAdapter = struct {
     pub fn fetchDetail(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
         return detailFetch(self, arena, league, game_id);
     }
+
+    /// Fetch every league's board for one day, one thread per league.
+    /// Threads share only self (the allocator must be thread-safe; the
+    /// GPA is) and write only their own slot. On targets without threads
+    /// each fetch runs inline. Board memory lives in per-league stores;
+    /// call releaseAll once the rendered page no longer needs the boards.
+    pub fn fetchAll(self: EspnAdapter, arena: std.mem.Allocator, day: []const u8) ![]LeagueResult {
+        const results = try arena.alloc(LeagueResult, core.leagues.all.len);
+        const slots = try arena.alloc(?std.Thread, core.leagues.all.len);
+        @memset(slots, null);
+        for (&core.leagues.all, 0..) |*league, i| {
+            results[i] = .{ .league = league };
+            const store = try arena.create(std.heap.ArenaAllocator);
+            store.* = std.heap.ArenaAllocator.init(self.allocator);
+            results[i].store = store;
+            const args = try arena.create(FetchArgs);
+            args.* = .{ .adapter = self, .league = league, .day = day, .slot = &results[i] };
+            if (comptime builtin.single_threaded) {
+                fetchOne(args);
+            } else {
+                slots[i] = std.Thread.spawn(.{}, fetchOne, .{args}) catch null;
+                if (slots[i] == null) fetchOne(args);
+            }
+        }
+        for (slots) |maybe| if (maybe) |t| t.join();
+        return results;
+    }
+
+    pub fn releaseAll(results: []LeagueResult) void {
+        for (results) |result| if (result.store) |store| store.deinit();
+    }
 };
+
+/// One league's board for the home page. A null board means the fetch
+/// failed; the league renders as a plain link, so one ESPN outage
+/// never fails the page.
+pub const LeagueResult = struct {
+    league: *const core.leagues.League,
+    board: ?core.domain.Scoreboard = null,
+    store: ?*std.heap.ArenaAllocator = null,
+};
+
+const builtin = @import("builtin");
+
+const FetchArgs = struct {
+    adapter: EspnAdapter,
+    league: *const core.leagues.League,
+    day: []const u8,
+    slot: *LeagueResult,
+};
+
+fn fetchOne(args: *const FetchArgs) void {
+    const store = args.slot.store orelse return;
+    args.slot.board = args.adapter.fetch(store.allocator(), args.league, args.day) catch null;
+}
 
 const Endpoint = struct { sport: []const u8, league: []const u8 };
 const endpoints = [_]struct { slug: []const u8, endpoint: Endpoint }{
@@ -300,6 +359,78 @@ test "EspnAdapter accepts injected transport and clock" {
     );
 }
 
+/// Shared-nothing fake: safe to call from fetchAll worker threads.
+const StaticTransport = struct {
+    body: []const u8,
+
+    fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
+        _ = url;
+        _ = extra_headers;
+        const self: *StaticTransport = @ptrCast(@alignCast(ptr));
+        return .{ .status = .ok, .body = try arena.dupe(u8, self.body) };
+    }
+
+    fn asTransport(self: *StaticTransport) espn.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+const FailingTransport = struct {
+    fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
+        _ = ptr;
+        _ = arena;
+        _ = url;
+        _ = extra_headers;
+        return error.Boom;
+    }
+
+    fn asTransport(self: *FailingTransport) espn.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+test "fetchAll resolves every league in one call" {
+    var fake = StaticTransport{ .body = "{\"events\":[]}" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = EspnAdapter{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+    const results = try adapter.fetchAll(arena, "2026-09-06");
+    defer EspnAdapter.releaseAll(results);
+    try std.testing.expectEqual(core.leagues.all.len, results.len);
+    for (results, 0..) |result, i| {
+        try std.testing.expectEqualStrings(core.leagues.all[i].slug, result.league.slug);
+        try std.testing.expect(result.board != null);
+        try std.testing.expectEqual(@as(usize, 0), result.board.?.games.len);
+    }
+}
+
+test "fetchAll degrades to null boards instead of failing" {
+    var fake = FailingTransport{};
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = EspnAdapter{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+    const results = try adapter.fetchAll(arena, "2026-09-06");
+    defer EspnAdapter.releaseAll(results);
+    try std.testing.expectEqual(core.leagues.all.len, results.len);
+    for (results) |result| try std.testing.expect(result.board == null);
+}
+
 // --- Game detail (wt-detail). Appended; existing scoreboard code above is untouched. ---
 //
 // fetchDetail mirrors the scoreboard path: fetch the per-event summary,
@@ -549,7 +680,7 @@ fn adapterFetchUrl(self: EspnAdapter, arena: std.mem.Allocator, url: []const u8)
         status = result.status;
         body = result.body;
     } else {
-        var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io };
+        var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io, .timeout_ms = self.upstream_timeout_ms };
         const result = try std_transport.fetch(arena, url, espn.default_headers);
         status = result.status;
         body = result.body;

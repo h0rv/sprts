@@ -5,26 +5,48 @@ const domain = core.domain;
 const leagues = core.leagues;
 const dates = core.date;
 const router = @import("router.zig");
+const provider = @import("provider.zig");
 
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
 
-pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
-    // Validate against the schema derived from the domain types before
-    // rendering. A normalization bug becomes a 502 upstream error instead of
-    // silently shipping invalid JSON. Validation scratch lives in a temporary
-    // arena so `std.testing.allocator` tests don't leak.
+/// Shared JSON response gate for every JSON renderer in this binary
+/// (`render.json`, `render.leaguesJson`, `detail_view.json`,
+/// `team_view.renderJson`).
+///
+/// Strict `z.serializeAndValidate` cannot be used here: zchema's
+/// `cachedCompiled` keys its compiled-schema cache on a `Holder` struct
+/// that ignores the generic parameter, so the first type validated in a
+/// process wins and every later type validates against the wrong schema
+/// (verified: validating `Scoreboard` first makes a strict `GameDetail`
+/// check fail with `ResponseValidationFailed`). zchema is an external
+/// dependency (root `build.zig.zon`), not vendored, so the cache key
+/// cannot be fixed in place; the coordinator owns the upstream fix.
+///
+/// Until then all renderers validate the same weaker way: serialize with
+/// `std.json` and parse back into `T` in scratch memory. Zig types plus
+/// required fields are still enforced, so a normalization bug still
+/// surfaces instead of silently shipping invalid JSON; JSON Schema
+/// constraints (`additionalProperties`, `format`) are not. Validation
+/// scratch lives in a temporary arena so `std.testing.allocator` tests
+/// don't leak. Field names on the wire are untouched: rendering changes
+/// never alter JSON field names.
+pub fn validatedJson(comptime T: type, allocator: std.mem.Allocator, value: T) ![]u8 {
     {
         var tmp = std.heap.ArenaAllocator.init(allocator);
         defer tmp.deinit();
-        const validation_json = try z.serializeAndValidate(domain.Scoreboard, tmp.allocator(), board, true);
-        _ = validation_json;
+        const raw = try std.json.Stringify.valueAlloc(tmp.allocator(), value, .{});
+        _ = try std.json.parseFromSliceLeaky(T, tmp.allocator(), raw, .{});
     }
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try std.json.Stringify.value(board, .{ .whitespace = .indent_2 }, &out.writer);
+    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
     return out.toOwnedSlice();
+}
+
+pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
+    return validatedJson(domain.Scoreboard, allocator, board);
 }
 
 /// `width` is total terminal columns; the borders take 2. Never shrinks
@@ -313,6 +335,254 @@ pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     return out.toOwnedSlice();
 }
 
+pub const default_host = "localhost:8080";
+pub const repo_url = "https://github.com/h0rv/sprts";
+
+/// Host text safe to echo back to clients: hostname characters only,
+/// capped in length. Anything else falls back to the local default so a
+/// hostile Host header cannot bloat or break the page.
+pub fn sanitizeHost(value: ?[]const u8) []const u8 {
+    const v = value orelse return default_host;
+    if (v.len == 0 or v.len > 64) return default_host;
+    for (v) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '-', ':' => {},
+        else => return default_host,
+    };
+    return v;
+}
+
+/// Live home page: leagues with live games first, then the rest of today
+/// as compact one-liners, then idle leagues as links. Leagues whose fetch
+/// failed render as plain links, so one ESPN outage never fails the page.
+pub fn homeLive(
+    allocator: std.mem.Allocator,
+    color: bool,
+    host: []const u8,
+    boards: []const provider.LeagueResult,
+    day: []const u8,
+    quiet: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    if (!quiet) {
+        const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
+        defer allocator.free(heading);
+        try colorize(w, "2", heading, color);
+        try w.writeByte('\n');
+    }
+    try writeRule(w, .top, default_inner_width);
+    try homeSections(allocator, w, boards, color, false, day);
+    try writeRule(w, .bottom, default_inner_width);
+    if (!quiet) try homeFooter(w, host, color);
+    return out.toOwnedSlice();
+}
+
+/// Home one-line (`/?0`): every game today is ONE line, no box, no
+/// header/footer — same per-game shape as `scoreOneLine`, across leagues.
+/// Idle leagues (no board or no games) emit nothing; with no games at all
+/// the body is a single `No games scheduled.` line.
+pub fn homeOneLine(
+    allocator: std.mem.Allocator,
+    boards: []const provider.LeagueResult,
+    color: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var any = false;
+    for (boards) |result| {
+        const board = result.board orelse continue;
+        for (board.games) |game| {
+            try writeBoardGameOneLine(&out.writer, result.league.slug, board.date, game, color);
+            any = true;
+        }
+    }
+    if (!any) try out.writer.writeAll("No games scheduled.\n");
+    return out.toOwnedSlice();
+}
+
+/// Compact one-liner per game: `MLB  NYY 0 @ BOS 3 ✓  Top 7th`.
+/// Non-duels fall back to the game name. Returns null for nothing to show.
+fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: domain.Game) !?[]u8 {
+    if (game.participants.len == 2) {
+        const first = game.participants[0];
+        const second = game.participants[1];
+        const away, const home_team = if (std.mem.eql(u8, second.home_away orelse "", "home"))
+            .{ first, second }
+        else if (std.mem.eql(u8, first.home_away orelse "", "home"))
+            .{ second, first }
+        else
+            .{ first, second };
+        if (away.score.len > 0 or home_team.score.len > 0) {
+            return try std.fmt.allocPrint(allocator, "{s}  {s} {s} @ {s} {s}{s}  {s}", .{
+                league.slug,
+                away.abbreviation,
+                away.score,
+                home_team.abbreviation,
+                home_team.score,
+                if (away.winner) " ✓" else if (home_team.winner) " ✓" else "",
+                game.status,
+            });
+        }
+        return try std.fmt.allocPrint(allocator, "{s}  {s} @ {s}  {s}", .{
+            league.slug,
+            away.abbreviation,
+            home_team.abbreviation,
+            game.status,
+        });
+    }
+    if (game.participants.len == 0 and game.name.len == 0) return null;
+    return try std.fmt.allocPrint(allocator, "{s}  {s}  {s}", .{ league.slug, game.name, game.status });
+}
+
+fn gameIsLive(game: domain.Game) bool {
+    return std.mem.eql(u8, game.state, "in");
+}
+
+/// Live games first, then the rest of today, then idle leagues as links.
+/// Leagues with no board (fetch failed) count as idle: the page never
+/// fails because of one league.
+fn homeSections(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    boards: []const provider.LeagueResult,
+    color: bool,
+    comptime html: bool,
+    day: []const u8,
+) !void {
+    var live = false;
+    var today = false;
+    for (boards) |result| {
+        const board = result.board orelse continue;
+        for (board.games) |game| {
+            if (gameIsLive(game)) {
+                if (!live) {
+                    live = true;
+                    try writeRule(w, .mid, default_inner_width);
+                    try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color and !html);
+                }
+                try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+            }
+        }
+    }
+    for (boards) |result| {
+        const board = result.board orelse continue;
+        var shown = false;
+        for (board.games) |game| {
+            if (gameIsLive(game)) continue;
+            if (!shown) {
+                if (!today) {
+                    today = true;
+                    try writeRule(w, .mid, default_inner_width);
+                    try writeRow(w, "TODAY", default_inner_width - 2, "2", color and !html);
+                }
+                shown = true;
+            }
+            try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+        }
+    }
+    try writeRule(w, .mid, default_inner_width);
+    try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color and !html);
+    for (boards) |result| {
+        const board = result.board;
+        if (board != null and board.?.games.len > 0) continue;
+        try w.writeAll("│ ");
+        if (html) try w.print("<a href=\"/{s}\">", .{result.league.slug});
+        try writeCell(w, result.league.slug, 13, null, false);
+        try w.writeByte(' ');
+        try writeCell(w, result.league.name, 34, null, false);
+        if (html) try w.writeAll("</a>");
+        try w.writeAll(" │\n");
+    }
+}
+
+fn homeGameLine(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    league: *const leagues.League,
+    game: domain.Game,
+    day: []const u8,
+    color: bool,
+    html: bool,
+) !void {
+    const line = try gameLine(allocator, league, game) orelse return;
+    defer allocator.free(line);
+    try w.writeAll("│ ");
+    if (html) try w.print("<a href=\"/{s}?date={s}\">", .{ league.slug, day });
+    try writeCell(w, line, 48, statusColor(game.state), color);
+    if (html) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+fn homeFooter(w: *std.Io.Writer, host: []const u8, color: bool) !void {
+    try colorize(w, "2", "Try: curl ", color);
+    try colorize(w, "2", host, color);
+    try colorize(w, "2", "/mlb\n", color);
+    try colorize(w, "2", "API: ", color);
+    try colorize(w, "2", host, color);
+    try colorize(w, "2", "/api/v1/leagues  Spec: ", color);
+    try colorize(w, "2", host, color);
+    try colorize(w, "2", "/openapi.json\n", color);
+    try colorize(w, "2", "Code: " ++ repo_url ++ "\n", color);
+}
+
+fn writeShortDate(w: *std.Io.Writer, date: []const u8) !void {
+    if (date.len >= 10 and date[4] == '-' and date[7] == '-') {
+        const m = date[5..7];
+        const d = date[8..10];
+        const mm = if (m[0] == '0') m[1..] else m;
+        const dd = if (d[0] == '0') d[1..] else d;
+        try w.print("{s}/{s}", .{ mm, dd });
+    } else {
+        try w.writeAll(date);
+    }
+}
+
+fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date: []const u8, game: domain.Game, color: bool) !void {
+    const code: ?[]const u8 = if (color) statusColor(game.state) else null;
+    if (code) |c| try w.print("\x1b[{s}m", .{c});
+    try w.writeAll(league_slug);
+    try w.writeByte(' ');
+    try writeShortDate(w, board_date);
+    try w.writeByte(' ');
+    try w.writeAll(game.status);
+    if (game.participants.len == 2) {
+        const first = game.participants[0];
+        const second = game.participants[1];
+        const away, const home_team = if (std.mem.eql(u8, second.home_away orelse "", "home"))
+            .{ first, second }
+        else if (std.mem.eql(u8, first.home_away orelse "", "home"))
+            .{ second, first }
+        else
+            .{ first, second };
+        if (away.score.len > 0 or home_team.score.len > 0) {
+            try w.print(" {s} {s} @ {s} {s}", .{
+                away.abbreviation, away.score, home_team.abbreviation, home_team.score,
+            });
+            if (away.winner or home_team.winner) try w.writeAll(" ✓");
+        } else {
+            try w.print(" {s} @ {s}", .{ away.abbreviation, home_team.abbreviation });
+        }
+    } else if (game.name.len > 0) {
+        try w.writeByte(' ');
+        try w.writeAll(game.name);
+        var won = false;
+        for (game.participants) |p| if (p.winner) {
+            won = true;
+            break;
+        };
+        if (won) try w.writeAll(" ✓");
+    } else if (game.participants.len > 0) {
+        for (game.participants, 0..) |p, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeByte(' ');
+            try w.writeAll(p.abbreviation);
+        }
+    }
+    if (code) |_| try w.writeAll("\x1b[0m");
+    try w.writeByte('\n');
+}
+
 /// Minimal browser page: the same table as text, never ANSI, with real
 /// links. Browsers cannot use terminal escapes, so HTML output is always
 /// uncolored and the text renderer stays the single source of layout.
@@ -361,6 +631,42 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Live HTML home: same sections as `homeLive`, never ANSI, with links.
+/// Game lines link to their league page; the nav mirrors `homeHtml`.
+pub fn homeHtmlLive(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    boards: []const provider.LeagueResult,
+    day: []const u8,
+    quiet: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
+    defer allocator.free(heading);
+    try pageHead(w, heading);
+    try w.writeAll("<pre>");
+    try writeRule(w, .top, default_inner_width);
+    try homeSections(allocator, w, boards, false, true, day);
+    try writeRule(w, .bottom, default_inner_width);
+    if (!quiet) {
+        try w.writeAll("Try: curl ");
+        try escapeInto(w, host);
+        try w.writeAll("/mlb\nAPI: ");
+        try escapeInto(w, host);
+        try w.writeAll("/api/v1/leagues  Spec: ");
+        try escapeInto(w, host);
+        try w.writeAll("/openapi.json\nCode: " ++ repo_url ++ "\n");
+    }
+    try w.writeAll("</pre>");
+    if (!quiet) {
+        try w.writeAll("<nav><a href=\"/api/v1/leagues\">json</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a></nav>");
+    }
+    try w.writeAll("</main></body></html>");
+    return out.toOwnedSlice();
+}
+
 pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
@@ -384,17 +690,7 @@ const page_style =
 ;
 
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
-    const list = leagues.LeagueList{ .leagues = &leagues.all };
-    {
-        var tmp = std.heap.ArenaAllocator.init(allocator);
-        defer tmp.deinit();
-        _ = try z.serializeAndValidate(leagues.LeagueList, tmp.allocator(), list, true);
-    }
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try std.json.Stringify.value(list, .{ .whitespace = .indent_2 }, &out.writer);
-    try out.writer.writeByte('\n');
-    return out.toOwnedSlice();
+    return validatedJson(leagues.LeagueList, allocator, .{ .leagues = &leagues.all });
 }
 
 pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: router.Format) ![]u8 {
@@ -592,9 +888,85 @@ fn displayWidth(s: []const u8) usize {
 }
 
 test "home table rows align with the frame" {
-    const output = try home(std.testing.allocator, false);
+    var results: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(output);
     try expectAlignedTable(output);
+}
+
+test "home groups live games, then today, then idle leagues" {
+    const live_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "3", .winner = true, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const today_board: domain.Scoreboard = .{
+        .league = "nba",
+        .league_name = "NBA",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "2",
+                .name = "Third at Fourth",
+                .starts_at = "2026-09-06T19:00Z",
+                .state = "pre",
+                .status = "7:05 PM ET",
+                .participants = &.{
+                    .{ .id = "c", .name = "Third", .abbreviation = "TRD", .score = "", .winner = false },
+                    .{ .id = "d", .name = "Fourth", .abbreviation = "FRT", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    const results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = live_board },
+        .{ .league = core.leagues.find("nba").?, .board = today_board },
+        .{ .league = core.leagues.find("nfl").? },
+    };
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
+    defer std.testing.allocator.free(output);
+    const live_at = std.mem.indexOf(u8, output, "LIVE NOW").?;
+    const today_at = std.mem.indexOf(u8, output, "TODAY").?;
+    const leagues_at = std.mem.indexOf(u8, output, "ALL LEAGUES").?;
+    try std.testing.expect(live_at < today_at);
+    try std.testing.expect(today_at < leagues_at);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mlb  AWY 0 @ HME 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nba  TRD @ FRT  7:05 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nfl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "example.test/mlb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "example.test/api/v1/leagues") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, repo_url) != null);
+    try expectAlignedTable(output);
+
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "github") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+
+test "sanitizeHost falls back on hostile input" {
+    try std.testing.expectEqualStrings("localhost:8080", sanitizeHost(null));
+    try std.testing.expectEqualStrings("sprts.horv.co", sanitizeHost("sprts.horv.co"));
+    try std.testing.expectEqualStrings("localhost:8080", sanitizeHost("evil\"><script>"));
+    try std.testing.expectEqualStrings("localhost:8080", sanitizeHost(""));
 }
 
 test "scoreboard table rows align with the frame" {

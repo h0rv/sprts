@@ -69,4 +69,6 @@ switch.
 - Table borders are present and rows share one display width.
 - ANSI is present by default and absent with `?color=0`.
 - HTML pages carry links and zero escape bytes.
-- JSON fields validate against `openapi/sprts-v1.json`.
+- JSON outputs validate through the shared `render.validatedJson` gate,
+  and the served `/openapi.json` (generated from `spec.zig` via zchema)
+  covers every `/api/v1/` JSON route.

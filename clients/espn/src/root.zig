@@ -90,11 +90,60 @@ pub const HttpTransport = struct {
 
 /// Non-wasm transport backed by the existing `std.http.Client` path.
 /// Keeps the curl UA workaround plus `accept: application/json`.
+///
+/// `timeout_ms` bounds every fetch: the request runs on a concurrent Io
+/// task while the caller waits on an event with the deadline. A hung ESPN
+/// fails with `error.Timeout` (callers map that into stale/502) instead of
+/// hanging the connection. Zero disables the watchdog (direct fetch); when
+/// the Io backend offers no concurrency (single-threaded tests) the fetch
+/// also runs direct.
 pub const StdTransport = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    timeout_ms: u64 = 5000,
 
     pub fn fetch(
+        self: StdTransport,
+        arena: std.mem.Allocator,
+        url: []const u8,
+        extra_headers: []const std.http.Header,
+    ) !FetchResult {
+        if (self.timeout_ms == 0) return fetchDirect(self, arena, url, extra_headers);
+        var done: std.Io.Event = .unset;
+        var future = self.io.concurrent(fetchTask, .{ self, arena, url, extra_headers, &done }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return fetchDirect(self, arena, url, extra_headers),
+        };
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(@as(i64, @intCast(@min(self.timeout_ms, std.math.maxInt(i64))))),
+            .clock = .awake,
+        } };
+        done.waitTimeout(self.io, timeout) catch |err| switch (err) {
+            error.Canceled => {
+                _ = future.cancel(self.io) catch null;
+                return error.Canceled;
+            },
+            error.Timeout => {
+                // Still running past the deadline: ask the worker to stop
+                // (this interrupts its pending socket op) and fail fast. A
+                // worker that finished in the race window serves its result.
+                if (future.cancel(self.io)) |ok| return ok else |_| return error.Timeout;
+            },
+        };
+        return future.await(self.io);
+    }
+
+    fn fetchTask(
+        task_self: StdTransport,
+        task_arena: std.mem.Allocator,
+        task_url: []const u8,
+        task_headers: []const std.http.Header,
+        task_done: *std.Io.Event,
+    ) anyerror!FetchResult {
+        defer task_done.set(task_self.io);
+        return fetchDirect(task_self, task_arena, task_url, task_headers);
+    }
+
+    fn fetchDirect(
         self: StdTransport,
         arena: std.mem.Allocator,
         url: []const u8,
@@ -264,4 +313,62 @@ test "team URL builders mirror the teams and schedule paths" {
         "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/teams/22/schedule?season=2026",
         schedule,
     );
+}
+
+const builtin_timeout_test = @import("builtin");
+
+/// Test upstream: accepts one connection, stalls, then answers `{}`.
+/// Runs as an Io task (proper task context for the stall sleep). Errors are
+/// swallowed: a client that timed out is gone by answer time.
+fn stallThenAnswer(listener_ptr: *std.Io.net.Server, io: std.Io, delay_ms: i64) !void {
+    var stream = listener_ptr.accept(io) catch return;
+    defer stream.close(io);
+    const delay: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(delay_ms), .clock = .awake };
+    delay.sleep(io) catch return;
+    var buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &buf);
+    writer.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}") catch return;
+    writer.interface.flush() catch return;
+}
+
+fn timeoutTestUrl(arena: std.mem.Allocator, port: u16) ![]u8 {
+    return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/sports/baseball/mlb/scoreboard?dates=20260906", .{port});
+}
+
+test "StdTransport fails fast with error.Timeout on a hung upstream" {
+    if (builtin_timeout_test.single_threaded) return;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var server = try io.concurrent(stallThenAnswer, .{ &listener, io, 2000 });
+    defer server.await(io) catch {};
+    var transport = StdTransport{ .allocator = std.testing.allocator, .io = io, .timeout_ms = 100 };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = try timeoutTestUrl(arena, listener.socket.address.getPort());
+    try std.testing.expectError(error.Timeout, transport.fetch(arena, url, &.{}));
+}
+
+test "StdTransport serves a fast upstream inside the deadline" {
+    if (builtin_timeout_test.single_threaded) return;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var server = try io.concurrent(stallThenAnswer, .{ &listener, io, 0 });
+    defer server.await(io) catch {};
+    var transport = StdTransport{ .allocator = std.testing.allocator, .io = io, .timeout_ms = 5000 };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = try timeoutTestUrl(arena, listener.socket.address.getPort());
+    const result = try transport.fetch(arena, url, &.{});
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expectEqualStrings("{}", result.body);
 }

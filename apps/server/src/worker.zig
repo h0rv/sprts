@@ -98,6 +98,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
     // `![]const u8` error union where `!?[]const u8` is declared), so scan
     // the headers() entries instead.
     const accept = (try incomingHeader(request, "accept")) orelse "";
+    const host = render.sanitizeHost(try incomingHeader(request, "host"));
 
     const method = request.method();
     if (method != .GET and method != .HEAD) {
@@ -124,10 +125,26 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             const body = try spec.openApiJson(alloc);
             return staticResponse(body, contentType(.json), null);
         },
-        .home => |color| {
+        .home => |home_route| {
+            var transport_state = WorkerTransport{};
+            const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+            const adapter = provider.EspnAdapter{
+                .allocator = alloc,
+                .io = workers.io(),
+                .base_url = base_url,
+                .transport = transport_state.asTransport(),
+                .clock = workerClock,
+            };
+            const day = try edge.resolveDay(alloc, null, epochSecondsNow());
+            const boards = try adapter.fetchAll(alloc, day);
+            defer provider.EspnAdapter.releaseAll(boards);
+            const color = home_route.color orelse try colorDefault(env);
             const body = switch (format) {
-                .text => try render.home(alloc, color orelse try colorDefault(env)),
-                .html => try render.homeHtml(alloc),
+                .text => if (home_route.oneline)
+                    try render.homeOneLine(alloc, boards, color)
+                else
+                    try render.homeLive(alloc, color, host, boards, day, home_route.quiet),
+                .html => try render.homeHtmlLive(alloc, host, boards, day, home_route.quiet),
                 .json => try render.leaguesJson(alloc),
             };
             return staticResponse(body, contentType(format), null);

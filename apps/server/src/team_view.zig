@@ -114,21 +114,13 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
     return out.toOwnedSlice();
 }
 
-/// JSON view. Ships WITHOUT the zchema pre-validation gate that
-/// `render.json` uses: `z.serializeAndValidate` is broken process-wide in
-/// this binary — even a trivial local struct fails validation, and
-/// `schedule.TeamView` instances fail with *Scoreboard's* required /
-/// unknown-property errors (a Scoreboard instance passes as TeamView).
-/// `z.schemaText(TeamView)` emits the correct schema, so the defect is in
-/// the zchema/jsonschema validation path (coordinator-owned), not in these
-/// types. The test below asserts the wire shape directly. Re-enable the
-/// gate once the validator is fixed.
+/// JSON view. Validated through the shared `render.validatedJson` gate —
+/// see it for why strict `z.serializeAndValidate` is unusable process-wide
+/// (zchema's `cachedCompiled` cross-type cache bug, coordinator-owned
+/// upstream fix in the external zchema dependency). Same wire format as
+/// before, field for field.
 pub fn renderJson(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try std.json.Stringify.value(view, .{ .whitespace = .indent_2 }, &out.writer);
-    try out.writer.writeByte('\n');
-    return out.toOwnedSlice();
+    return render.validatedJson(schedule.TeamView, allocator, view);
 }
 
 fn testView() schedule.TeamView {
@@ -251,6 +243,13 @@ test "team JSON carries the schema marker and validates" {
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"abbrev\": \"PHI\"") != null);
+    // Full parse-back: `renderJson` validates through the shared
+    // `render.validatedJson` gate, so the wire output must read back.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(schedule.TeamView, arena_state.allocator(), output, .{});
+    try std.testing.expectEqualStrings("PHI", parsed.team.abbrev);
+    try std.testing.expectEqual(@as(usize, 2), parsed.next.len);
     // Empty view validates too.
     const empty: schedule.TeamView = .{
         .league = "mlb",

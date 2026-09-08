@@ -9,6 +9,8 @@ pub const ScoreboardRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    quiet: bool = false,
+    oneline: bool = false,
 };
 
 pub const GameRoute = struct {
@@ -17,6 +19,8 @@ pub const GameRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    quiet: bool = false,
+    oneline: bool = false,
 };
 
 pub const TeamRoute = struct {
@@ -25,10 +29,18 @@ pub const TeamRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    quiet: bool = false,
+    oneline: bool = false,
+};
+
+pub const HomeRoute = struct {
+    color: ?bool,
+    quiet: bool = false,
+    oneline: bool = false,
 };
 
 pub const Route = union(enum) {
-    home: ?bool,
+    home: HomeRoute,
     leagues,
     scoreboard: ScoreboardRoute,
     game: GameRoute,
@@ -43,9 +55,13 @@ pub fn parse(target: []const u8) Route {
     const query_at = std.mem.indexOfScalar(u8, target, '?');
     const path = target[0 .. query_at orelse target.len];
     const query = if (query_at) |at| target[at + 1 ..] else "";
-    const color = parseColor(queryValue(query, "color"));
+    const display = parseDisplay(query);
 
-    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = color };
+    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = .{
+        .color = display.color,
+        .quiet = display.quiet,
+        .oneline = display.oneline,
+    } };
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
@@ -65,24 +81,30 @@ pub fn parse(target: []const u8) Route {
         const segment = slug[slash + 1 ..];
         if (league.len == 0 or segment.len == 0 or
             std.mem.indexOfScalar(u8, segment, '/') != null) return .not_found;
-        const display = .{
-            .color = color,
+        const sized = .{
+            .color = display.color,
             .width = queryUint(queryValue(query, "width")),
             .height = queryUint(queryValue(query, "height")),
+            .quiet = display.quiet,
+            .oneline = display.oneline,
         };
         if (isAllDigits(segment)) return .{ .game = .{
             .league = league,
             .id = segment,
-            .color = display.color,
-            .width = display.width,
-            .height = display.height,
+            .color = sized.color,
+            .width = sized.width,
+            .height = sized.height,
+            .quiet = sized.quiet,
+            .oneline = sized.oneline,
         } };
         return .{ .team = .{
             .league = league,
             .abbr = segment,
-            .color = display.color,
-            .width = display.width,
-            .height = display.height,
+            .color = sized.color,
+            .width = sized.width,
+            .height = sized.height,
+            .quiet = sized.quiet,
+            .oneline = sized.oneline,
         } };
     }
 
@@ -91,9 +113,11 @@ pub fn parse(target: []const u8) Route {
     return .{ .scoreboard = .{
         .league = slug,
         .date = day,
-        .color = color,
+        .color = display.color,
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
+        .quiet = display.quiet,
+        .oneline = display.oneline,
     } };
 }
 
@@ -140,6 +164,80 @@ fn parseColor(value: ?[]const u8) ?bool {
     if (v.len == 1 and v[0] == '0') return false;
     if (v.len == 1 and v[0] == '1') return true;
     return null;
+}
+
+fn parseFlagBool(value: ?[]const u8) ?bool {
+    const v = value orelse return null;
+    if (v.len == 1 and v[0] == '0') return false;
+    if (v.len == 1 and v[0] == '1') return true;
+    return null;
+}
+
+const DisplayFlags = struct {
+    color: ?bool,
+    quiet: bool,
+    oneline: bool,
+};
+
+/// Single-letter display aliases, wttr.in style. `?T` is `?color=0`,
+/// `?A` is `?color=1`, `?q` is quiet (no header/footer), `?0` is one-line.
+/// Both combined (`?0q`, `?0pq` with unknown letters ignored) and
+/// `&`-separated (`?0&q`) spellings work on every human route.
+/// Precedence: long flags win over aliases (`?color=1&T` is color on);
+/// among aliases the later letter wins (`?T&A` is color on).
+fn parseDisplay(query: []const u8) DisplayFlags {
+    const long_color = parseColor(queryValue(query, "color"));
+    const long_quiet = parseFlagBool(queryValue(query, "quiet"));
+    const long_oneline = parseFlagBool(queryValue(query, "oneline")) orelse
+        parseFlagBool(queryValue(query, "one-line"));
+    var alias_color: ?bool = null;
+    var alias_quiet = false;
+    var alias_oneline = false;
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        if (field.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, field, '=');
+        const name = if (equals) |e| field[0..e] else field;
+        const value: ?[]const u8 = if (equals) |e| field[e + 1 ..] else null;
+        if (equals == null) {
+            if (std.mem.eql(u8, name, "quiet")) {
+                alias_quiet = true;
+                continue;
+            }
+            if (std.mem.eql(u8, name, "oneline") or std.mem.eql(u8, name, "one-line")) {
+                alias_oneline = true;
+                continue;
+            }
+            for (name) |c| switch (c) {
+                'T' => alias_color = false,
+                'A' => alias_color = true,
+                'q' => alias_quiet = true,
+                '0' => alias_oneline = true,
+                else => {},
+            };
+        } else if (name.len == 1) {
+            switch (name[0]) {
+                'T' => alias_color = false,
+                'A' => alias_color = true,
+                'q' => {
+                    if (value) |v| {
+                        if (v.len == 1 and v[0] == '0') alias_quiet = false else alias_quiet = true;
+                    } else alias_quiet = true;
+                },
+                '0' => {
+                    if (value) |v| {
+                        if (v.len == 1 and v[0] == '0') alias_oneline = false else alias_oneline = true;
+                    } else alias_oneline = true;
+                },
+                else => {},
+            }
+        }
+    }
+    return .{
+        .color = if (long_color) |c| c else alias_color,
+        .quiet = if (long_quiet) |q| q else alias_quiet,
+        .oneline = if (long_oneline) |o| o else alias_oneline,
+    };
 }
 
 /// Strict positive integer for display params: all digits, fits u16,
@@ -191,7 +289,7 @@ test "color flag parsing is exact" {
     try std.testing.expect(parse("/mlb?color=0").scoreboard.color.? == false);
     try std.testing.expect(parse("/mlb?color=1").scoreboard.color.? == true);
     try std.testing.expect(parse("/mlb?color=off").scoreboard.color == null);
-    try std.testing.expect(parse("/?color=0").home.? == false);
+    try std.testing.expect(parse("/?color=0").home.color.? == false);
 }
 
 test "display params parse strict" {
@@ -209,6 +307,55 @@ test "bad dates and unknown shapes still route" {
     try std.testing.expect(parse("/mlb?date=tomorrow") == .bad_date);
     try std.testing.expect(parse("/mlb/a/b") == .not_found);
     try std.testing.expect(parse("/api/v1/mlb?date=tomorrow") == .bad_date);
+}
+
+test "single-letter aliases combine and separate" {
+    // Combined wttr.in style.
+    const combined = parse("/mlb?0q").scoreboard;
+    try std.testing.expect(combined.oneline);
+    try std.testing.expect(combined.quiet);
+    try std.testing.expect(combined.color == null);
+    // Unknown letters are ignored, so ?0pq behaves like ?0q.
+    const wttr = parse("/mlb?0pq").scoreboard;
+    try std.testing.expect(wttr.oneline);
+    try std.testing.expect(wttr.quiet);
+    // &-separated spells the same flags.
+    const separate = parse("/mlb?0&q").scoreboard;
+    try std.testing.expect(separate.oneline);
+    try std.testing.expect(separate.quiet);
+    // Mixed combined + separate + long width composes.
+    const mixed = parse("/mlb?0&q&width=80").scoreboard;
+    try std.testing.expect(mixed.oneline);
+    try std.testing.expect(mixed.quiet);
+    try std.testing.expect(mixed.width.? == 80);
+    // Aliases ride on every route shape.
+    try std.testing.expect(parse("/?0q").home.oneline);
+    try std.testing.expect(parse("/?0q").home.quiet);
+    try std.testing.expect(parse("/mlb/401816828?0").game.oneline);
+    try std.testing.expect(parse("/mlb/phi?q").team.quiet);
+}
+
+test "long flags win over aliases, later alias wins" {
+    try std.testing.expect(parse("/mlb?T").scoreboard.color.? == false);
+    try std.testing.expect(parse("/mlb?A").scoreboard.color.? == true);
+    // Long ?color wins over either alias, whichever order they appear in.
+    try std.testing.expect(parse("/mlb?color=1&T").scoreboard.color.? == true);
+    try std.testing.expect(parse("/mlb?T&color=1").scoreboard.color.? == true);
+    try std.testing.expect(parse("/mlb?color=0&A").scoreboard.color.? == false);
+    try std.testing.expect(parse("/mlb?A&color=0").scoreboard.color.? == false);
+    // Invalid long is ignored, so the alias still applies.
+    try std.testing.expect(parse("/mlb?color=off&T").scoreboard.color.? == false);
+    // Among aliases alone, the later letter wins.
+    try std.testing.expect(parse("/mlb?T&A").scoreboard.color.? == true);
+    try std.testing.expect(parse("/mlb?A&T").scoreboard.color.? == false);
+    try std.testing.expect(parse("/mlb?TA").scoreboard.color.? == true);
+    try std.testing.expect(parse("/mlb?AT").scoreboard.color.? == false);
+    // Long quiet/oneline win over ?q/?0 the same way.
+    try std.testing.expect(parse("/mlb?q&quiet=0").scoreboard.quiet == false);
+    try std.testing.expect(parse("/mlb?quiet=0&q").scoreboard.quiet == false);
+    try std.testing.expect(parse("/mlb?0&oneline=0").scoreboard.oneline == false);
+    try std.testing.expect(parse("/mlb?quiet=1").scoreboard.quiet);
+    try std.testing.expect(parse("/mlb?oneline=1").scoreboard.oneline);
 }
 
 test "second segment splits game ids from team abbrevs" {
