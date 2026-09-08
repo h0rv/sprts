@@ -98,6 +98,18 @@ pub fn labelFor(arena: std.mem.Allocator, day: []const u8, zone: Zone) ![]u8 {
     };
 }
 
+/// Short zone tag for headings (`ET`, `UTC`, `UTC-5`, `UTC+5:30`).
+/// Backs the `M/D ZONE` display in `labelFor` and the scoreboard/home
+/// headings that append the zone so output never silently disagrees
+/// with ESPN by a day.
+pub fn zoneTag(arena: std.mem.Allocator, zone: Zone) ![]u8 {
+    return switch (zone) {
+        .et => arena.dupe(u8, "ET"),
+        .utc => arena.dupe(u8, "UTC"),
+        .fixed => |offset| fixedTag(arena, offset),
+    };
+}
+
 fn fixedTag(arena: std.mem.Allocator, offset_minutes: i16) ![]u8 {
     if (offset_minutes == 0) return arena.dupe(u8, "UTC");
     const sign: u8 = if (offset_minutes < 0) '-' else '+';
@@ -231,6 +243,22 @@ test "resolveDay passes ?date through, derives ET by default" {
     const fixed = try resolveDay(arena, null, 1788739200, .{ .fixed = -300 });
     defer arena.free(fixed);
     try std.testing.expectEqualStrings("2026-09-06", fixed);
+}
+
+test "zoneTag names ET/UTC/fixed offsets" {
+    const arena = std.testing.allocator;
+    const et = try zoneTag(arena, .et);
+    defer arena.free(et);
+    try std.testing.expectEqualStrings("ET", et);
+    const utc = try zoneTag(arena, .utc);
+    defer arena.free(utc);
+    try std.testing.expectEqualStrings("UTC", utc);
+    const fixed = try zoneTag(arena, .{ .fixed = -300 });
+    defer arena.free(fixed);
+    try std.testing.expectEqualStrings("UTC-5", fixed);
+    const half = try zoneTag(arena, .{ .fixed = 330 });
+    defer arena.free(half);
+    try std.testing.expectEqualStrings("UTC+5:30", half);
 }
 
 test "labelFor names the zone" {

@@ -7,6 +7,7 @@ const dates = core.date;
 const router = @import("router.zig");
 const provider = @import("provider.zig");
 const table = @import("table.zig");
+const tz = @import("tz.zig");
 
 /// Box-table surface, re-exported from the shared `table` module so views
 /// that reached these through `render` (e.g. `team_view`) keep compiling
@@ -68,7 +69,10 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
 /// below the classic 52-wide box, so team art and the fixed participant
 /// cells always fit — extra room stretches the flexible rows and names.
 /// `height` caps the games listed (`+N more` trailer); null/0 = all.
-pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16) ![]u8 {
+/// The heading names its zone (`MLB  2026-09-06 ET`) so output never
+/// silently disagrees with ESPN by a day; explicit `?date` boards carry
+/// the request zone the same way.
+pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     const shown: usize = @min(height orelse board.games.len, board.games.len);
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -76,7 +80,9 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
     const w = &out.writer;
     const t = Table{ .writer = w, .inner = inner, .color = color };
     try t.rule(.top);
-    const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
+    const tag = try tz.zoneTag(allocator, zone);
+    defer allocator.free(tag);
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ board.league_name, board.date, tag });
     defer allocator.free(heading);
     try t.row(heading, "2");
     if (board.games.len == 0) {
@@ -97,7 +103,7 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
         // the status row into a real link instead (see scoreHtml).
         {
             const game_link = try std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{
-                board.league, game.id, board.league,
+                board.league,                                                             game.id, board.league,
                 if (game.participants.len > 0) game.participants[0].abbreviation else "",
             });
             defer allocator.free(game_link);
@@ -122,6 +128,12 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
         next,
     });
     return out.toOwnedSlice();
+}
+
+/// ET-default wrapper: no `?tz=` means the Eastern day, so existing
+/// callers (and the digest sections they compose) keep rendering.
+pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16) ![]u8 {
+    return textWithZone(allocator, board, color, width, height, .et);
 }
 
 fn statusColor(state: []const u8) ?[]const u8 {
@@ -177,19 +189,24 @@ pub fn sanitizeHost(value: ?[]const u8) []const u8 {
 /// Live home page: leagues with live games first, then the rest of today
 /// as compact one-liners, then idle leagues as links. Leagues whose fetch
 /// failed render as plain links, so one ESPN outage never fails the page.
-pub fn homeLive(
+/// The heading names its zone (`sprts  2026-09-06 ET`); section rows keep
+/// the shared `homeSections` layout untouched (the HTML home owns it too).
+pub fn homeLiveWithZone(
     allocator: std.mem.Allocator,
     color: bool,
     host: []const u8,
     boards: []const provider.LeagueResult,
     day: []const u8,
     quiet: bool,
+    zone: tz.Zone,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     if (!quiet) {
-        const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
+        const tag = try tz.zoneTag(allocator, zone);
+        defer allocator.free(tag);
+        const heading = try std.fmt.allocPrint(allocator, "sprts  {s} {s}", .{ day, tag });
         defer allocator.free(heading);
         try colorize(w, "2", heading, color);
         try w.writeByte('\n');
@@ -201,27 +218,52 @@ pub fn homeLive(
     return out.toOwnedSlice();
 }
 
+/// ET-default wrapper for `homeLiveWithZone`.
+pub fn homeLive(
+    allocator: std.mem.Allocator,
+    color: bool,
+    host: []const u8,
+    boards: []const provider.LeagueResult,
+    day: []const u8,
+    quiet: bool,
+) ![]u8 {
+    return homeLiveWithZone(allocator, color, host, boards, day, quiet, .et);
+}
+
 /// Home one-line (`/?0`): every game today is ONE line, no box, no
 /// header/footer — same per-game shape as `scoreOneLine`, across leagues.
 /// Idle leagues (no board or no games) emit nothing; with no games at all
 /// the body is a single `No games scheduled.` line.
-pub fn homeOneLine(
+/// Each line carries the zone (`mlb 9/6 ET ...`) via `tz.labelFor`'s zone.
+pub fn homeOneLineWithZone(
     allocator: std.mem.Allocator,
     boards: []const provider.LeagueResult,
     color: bool,
+    zone: tz.Zone,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     var any = false;
+    const tag = try tz.zoneTag(allocator, zone);
+    defer allocator.free(tag);
     for (boards) |result| {
         const board = result.board orelse continue;
         for (board.games) |game| {
-            try writeBoardGameOneLine(&out.writer, result.league.slug, board.date, game, color);
+            try writeBoardGameOneLine(&out.writer, result.league.slug, board.date, game, color, tag);
             any = true;
         }
     }
     if (!any) try out.writer.writeAll("No games scheduled.\n");
     return out.toOwnedSlice();
+}
+
+/// ET-default wrapper for `homeOneLineWithZone`.
+pub fn homeOneLine(
+    allocator: std.mem.Allocator,
+    boards: []const provider.LeagueResult,
+    color: bool,
+) ![]u8 {
+    return homeOneLineWithZone(allocator, boards, color, .et);
 }
 
 /// Compact one-liner per game: `MLB  NYY 0 @ BOS 3 ✓  Top 7th`.
@@ -482,7 +524,6 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
     if (css != null) try w.writeAll("</span>");
 }
 
-
 fn homeFooter(w: *std.Io.Writer, host: []const u8, color: bool) !void {
     try colorize(w, "2", "Try: curl ", color);
     try colorize(w, "2", host, color);
@@ -507,12 +548,14 @@ fn writeShortDate(w: *std.Io.Writer, date: []const u8) !void {
     }
 }
 
-fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date: []const u8, game: domain.Game, color: bool) !void {
+fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date: []const u8, game: domain.Game, color: bool, zone_tag: []const u8) !void {
     const code: ?[]const u8 = if (color) statusColor(game.state) else null;
     if (code) |c| try w.print("\x1b[{s}m", .{c});
     try w.writeAll(league_slug);
     try w.writeByte(' ');
     try writeShortDate(w, board_date);
+    try w.writeByte(' ');
+    try w.writeAll(zone_tag);
     try w.writeByte(' ');
     try w.writeAll(game.status);
     if (game.participants.len == 2) {
@@ -555,8 +598,10 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
 /// Minimal browser page: the same table as text, never ANSI, with real
 /// links. Browsers cannot use terminal escapes, so HTML output is always
 /// uncolored and the text renderer stays the single source of layout.
-pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16) ![]u8 {
-    const body = try text(allocator, board, false, width, height);
+/// The title and the table heading both name the zone
+/// (`MLB scores 2026-09-06 ET`); the date nav stays date-only.
+pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+    const body = try textWithZone(allocator, board, false, width, height, zone);
     defer allocator.free(body);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
@@ -565,7 +610,9 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    const title = try std.fmt.allocPrint(allocator, "{s} scores", .{board.league_name});
+    const tag = try tz.zoneTag(allocator, zone);
+    defer allocator.free(tag);
+    const title = try std.fmt.allocPrint(allocator, "{s} scores {s} {s}", .{ board.league_name, board.date, tag });
     defer allocator.free(title);
     try pageHead(w, title);
     try w.writeAll("<pre>");
@@ -578,6 +625,11 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
     try w.print("<a href=\"/api/v1/{s}?date={s}\">json</a>", .{ board.league, board.date });
     try w.writeAll("</nav></main></body></html>");
     return out.toOwnedSlice();
+}
+
+/// ET-default wrapper for `scoreHtmlWithZone`.
+pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16) ![]u8 {
+    return scoreHtmlWithZone(allocator, board, width, height, .et);
 }
 
 /// Post-pass linkifier for `scoreHtml`: re-emits the plain-text table
@@ -1329,7 +1381,6 @@ test "scoreboard table rows align with the frame" {
     try expectAlignedTable(output);
 }
 
-
 test "text renderer prints both marks side by side" {
     const home_mark = core.art.teamArt("mlb", "PHI", .xs).?;
     const home_first = home_mark[0..std.mem.indexOfScalar(u8, home_mark, '\n').?];
@@ -1617,4 +1668,94 @@ test "text renderer caps games with height and counts the rest" {
     const all = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(all);
     try std.testing.expect(std.mem.indexOf(u8, all, "more") == null);
+}
+
+test "scoreboard text heading names the zone" {
+    const board = testBoard();
+    const et = try textWithZone(std.testing.allocator, board, false, null, null, .et);
+    defer std.testing.allocator.free(et);
+    try std.testing.expect(std.mem.indexOf(u8, et, "MLB  2026-09-06 ET") != null);
+    try expectAlignedTable(et);
+
+    const utc = try textWithZone(std.testing.allocator, board, false, null, null, .utc);
+    defer std.testing.allocator.free(utc);
+    try std.testing.expect(std.mem.indexOf(u8, utc, "MLB  2026-09-06 UTC") != null);
+
+    const fixed = try textWithZone(std.testing.allocator, board, false, null, null, .{ .fixed = -300 });
+    defer std.testing.allocator.free(fixed);
+    try std.testing.expect(std.mem.indexOf(u8, fixed, "MLB  2026-09-06 UTC-5") != null);
+
+    // ET-default wrapper keeps the label so unwired callers never go bare.
+    const plain = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "MLB  2026-09-06 ET") != null);
+}
+
+test "scoreHtml title and heading name the zone" {
+    const board = testBoard();
+    const page = try scoreHtmlWithZone(std.testing.allocator, board, null, null, .et);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "MLB scores 2026-09-06 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "MLB  2026-09-06 ET") != null);
+
+    const utc_page = try scoreHtmlWithZone(std.testing.allocator, board, null, null, .utc);
+    defer std.testing.allocator.free(utc_page);
+    try std.testing.expect(std.mem.indexOf(u8, utc_page, "MLB scores 2026-09-06 UTC") != null);
+}
+
+test "home text heading and one-lines name the zone" {
+    var results: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
+    const live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, .et);
+    defer std.testing.allocator.free(live);
+    try std.testing.expect(std.mem.indexOf(u8, live, "sprts  2026-09-06 ET") != null);
+
+    const utc_live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-07", false, .utc);
+    defer std.testing.allocator.free(utc_live);
+    try std.testing.expect(std.mem.indexOf(u8, utc_live, "sprts  2026-09-07 UTC") != null);
+
+    const board = testBoard();
+    const mlb = core.leagues.find("mlb").?;
+    const one_sections = [_]provider.LeagueResult{.{ .league = mlb, .board = board }};
+    const lines = try homeOneLineWithZone(std.testing.allocator, &one_sections, false, .et);
+    defer std.testing.allocator.free(lines);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 9/6 ET") != null);
+    const utc_lines = try homeOneLineWithZone(std.testing.allocator, &one_sections, false, .utc);
+    defer std.testing.allocator.free(utc_lines);
+    try std.testing.expect(std.mem.indexOf(u8, utc_lines, "mlb 9/6 UTC") != null);
+}
+
+test "?tz= wiring flips day and label, invalid is ignored" {
+    const arena = std.testing.allocator;
+    // 2026-09-07T00:00Z: still Sep 6 in ET, already Sep 7 in UTC.
+    const epoch: i64 = 1788739200;
+    const et_zone = tz.zoneFromTarget("/mlb");
+    try std.testing.expect(et_zone == .et);
+    const et_day = try tz.resolveDay(arena, null, epoch, et_zone);
+    defer arena.free(et_day);
+    try std.testing.expectEqualStrings("2026-09-06", et_day);
+    const et_label = try tz.labelFor(arena, et_day, et_zone);
+    defer arena.free(et_label);
+    try std.testing.expectEqualStrings("9/6 ET", et_label);
+
+    const utc_zone = tz.zoneFromTarget("/mlb?tz=utc");
+    try std.testing.expect(utc_zone == .utc);
+    const utc_day = try tz.resolveDay(arena, null, epoch, utc_zone);
+    defer arena.free(utc_day);
+    try std.testing.expectEqualStrings("2026-09-07", utc_day);
+    const utc_label = try tz.labelFor(arena, utc_day, utc_zone);
+    defer arena.free(utc_label);
+    try std.testing.expectEqualStrings("9/7 UTC", utc_label);
+
+    // Invalid ?tz= is ignored: ET default stands for both day and label.
+    const bogus_zone = tz.zoneFromTarget("/mlb?tz=bogus");
+    try std.testing.expect(bogus_zone == .et);
+    const bogus_day = try tz.resolveDay(arena, null, epoch, bogus_zone);
+    defer arena.free(bogus_day);
+    try std.testing.expectEqualStrings("2026-09-06", bogus_day);
+
+    // Explicit ?date wins verbatim in every zone.
+    const explicit = try tz.resolveDay(arena, "2026-01-01", epoch, .utc);
+    defer arena.free(explicit);
+    try std.testing.expectEqualStrings("2026-01-01", explicit);
 }
