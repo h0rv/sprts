@@ -33,7 +33,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
             if (line.len == 0) continue;
             try table.writeArtRow(w, line, inner);
         }
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
     }
     {
         // one-line: header gains the zone label via `tz.labelFor` (ET default;
@@ -58,14 +58,14 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         try table.writeRow(w, standing, inner - 2, "2", color);
     }
     if (view.live) |live| {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "LIVE NOW", inner - 2, "1;31", color);
         const live_line = try gameLine(allocator, live);
         defer allocator.free(live_line);
         try table.writeRow(w, live_line, inner - 2, "1;31", color);
     }
     if (view.last.len > 0) {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "Last 5:", inner - 2, null, color);
         for (view.last) |game| {
             const line = try gameLineFull(allocator, view.league, game);
@@ -74,7 +74,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         }
     }
     if (upcoming.len > 0) {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "Next 5:", inner - 2, null, color);
         for (upcoming) |game| {
             const next_line = try gameLineFull(allocator, view.league, game);
@@ -89,11 +89,11 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         if (upcoming.len < view.next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
             defer allocator.free(more);
-            try table.writeRule(w, .mid, inner);
+            try table.spacerRow(w, inner);
             try table.writeRow(w, more, inner - 2, "2", color);
         }
     } else if (view.last.len == 0 and view.live == null) {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "No games scheduled.", inner - 2, null, color);
     }
     // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
@@ -101,7 +101,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
     // trailer, mirroring the Next tail. Earlier continues Last newest-first;
     // Later continues Next chronological, with probable starters like Next.
     if (view.extra_past.len > 0) {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "Earlier:", inner - 2, null, color);
         const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
         for (shown_past) |game| {
@@ -116,7 +116,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         }
     }
     if (view.extra_next.len > 0) {
-        try table.writeRule(w, .mid, inner);
+        try table.spacerRow(w, inner);
         try table.writeRow(w, "Later:", inner - 2, null, color);
         const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
         for (shown_next) |game| {
@@ -190,7 +190,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
             if (line.len == 0) continue;
             try render.writeArtRow(w, line, inner);
         }
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
     }
     {
         // one-line: header gains the zone label via `tz.labelFor` (ET default; see renderText).
@@ -214,17 +214,17 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         try writeHtmlCell(allocator, standing, "dim", inner, w);
     }
     if (view.live) |live| {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "LIVE NOW", "live", inner, w);
         try teamGameHtml(allocator, w, league_slug, live, "live", inner);
     }
     if (view.last.len > 0) {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "Last 5:", null, inner, w);
         for (view.last) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
     }
     if (upcoming.len > 0) {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "Next 5:", null, inner, w);
         for (upcoming) |game| {
             try teamGameHtml(allocator, w, league_slug, game, null, inner);
@@ -237,17 +237,17 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         if (upcoming.len < view.next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
             defer allocator.free(more);
-            try render.writeRule(w, .mid, inner);
+            try htmlSpacer(w, inner);
             try writeHtmlCell(allocator, more, "dim", inner, w);
         }
     } else if (view.last.len == 0 and view.live == null) {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "No games scheduled.", null, inner, w);
     }
     // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
     // absent). Same caps and trailers as text; rows link to game views.
     if (view.extra_past.len > 0) {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "Earlier:", null, inner, w);
         const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
         for (shown_past) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
@@ -258,7 +258,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         }
     }
     if (view.extra_next.len > 0) {
-        try render.writeRule(w, .mid, inner);
+        try htmlSpacer(w, inner);
         try writeHtmlCell(allocator, "Later:", null, inner, w);
         const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
         for (shown_next) |game| {
@@ -306,6 +306,15 @@ fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const
     try render.escapeInto(w, padded);
     if (css != null) try w.writeAll("</span>");
     if (game.id.len > 0) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// Blank spacer row for the HTML team view: borders with nothing
+/// between, matching the text view's `table.spacerRow` rhythm.
+fn htmlSpacer(w: *std.Io.Writer, inner: usize) !void {
+    try w.writeAll("│ ");
+    var i: usize = 0;
+    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
 }
 
@@ -453,6 +462,8 @@ test "team HTML links and never carries ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "Next 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/PHI\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Sections breathe through blank spacer rows, never mid rules.
+    try std.testing.expect(std.mem.indexOf(u8, page, "├") == null);
 
     const err = try @import("render.zig").errorBody(std.testing.allocator, "unknown team; see /api/v1/leagues", .html);
     defer std.testing.allocator.free(err);

@@ -233,6 +233,17 @@ pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     try w.writeAll(right);
 }
 
+/// A blank spacer row: `│` borders with nothing between, so sections
+/// breathe without breaking the table frame. The home page separates
+/// sections with spacers instead of mid rules; other views keep their
+/// own rule rhythm. Shared here so every view breathes the same way.
+pub fn spacerRow(w: *std.Io.Writer, inner: usize) !void {
+    try w.writeAll("│ ");
+    var i: usize = 0;
+    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(" │\n");
+}
+
 pub const Table = struct {
     writer: *std.Io.Writer,
     inner: usize,
@@ -292,7 +303,6 @@ pub const Table = struct {
 /// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
 /// byte-based slicing would split glyphs and break the rules. Pads by
 /// visible cells; the tool guarantees single-cell glyphs.
-
 /// RGB for an xterm-256 index: indices 16-231 are the 6x6x6 cube over
 /// (0,95,135,175,215,255), 232-255 the grayscale ramp. Indices 0-15 are
 /// terminal-themed; marks never use them, and they read as dark here so

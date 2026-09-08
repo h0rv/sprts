@@ -165,6 +165,12 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         defer allocator.free(row);
         try htmlRow(allocator, row, if (entry.winner) "win" else null, inner, w, href);
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.venue) |venue| {
         if (game.attendance) |crowd| {
             const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
@@ -178,17 +184,35 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         defer allocator.free(line);
         try htmlRow(allocator, line, null, inner, w, null);
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (maxPeriod(game) > 0) {
         const line = try lineScoreLine(allocator, game, inner);
         defer allocator.free(line);
         try htmlRow(allocator, line, null, inner, w, null);
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.situation) |situation| {
         const chip = try situationText(allocator, situation);
         defer allocator.free(chip);
         try htmlRow(allocator, chip, "live", inner, w, null);
         if (situation.last_play) |last| try htmlRow(allocator, last, null, inner, w, null);
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.decisions.len > 0 or hasProbables(game)) {
         for (game.decisions) |decision| {
             const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ decision.outcome, decision.name });
@@ -203,6 +227,12 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
             }
         }
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.scoring_plays.len > 0) {
         try htmlRow(allocator, "Scoring plays", "dim", inner, w, null);
         const limit: usize = @min(height orelse 5, game.scoring_plays.len);
@@ -218,17 +248,35 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
             try htmlRow(allocator, more, "dim", inner, w, null);
         }
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.leaders.len > 0) {
         try htmlRow(allocator, "Leaders", "dim", inner, w, null);
         for (game.leaders[0..@min(game.leaders.len, 8)]) |leader| {
             try htmlRow(allocator, leader, null, inner, w, null);
         }
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     if (game.series) |series| {
         const series_line = try std.fmt.allocPrint(allocator, "Series: {s}", .{series});
         defer allocator.free(series_line);
         try htmlRow(allocator, series_line, null, inner, w, null);
     }
+    try w.writeAll("│ ");
+    {
+        var i: usize = 0;
+        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    }
+    try w.writeAll(" │\n");
     // depth: box-score team totals (optional; skipped when absent).
     if (game.team_stats.len > 0) {
         try htmlRow(allocator, "Team stats", "dim", inner, w, null);
@@ -481,7 +529,7 @@ fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:12px;white-space:pre-wrap;word-wrap:break-word}}</style>
+    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
 ;
 
 fn testDetail() detail.GameDetail {
@@ -639,6 +687,8 @@ test "detail html wraps in pre and links back" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/ATL\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<span") != null);
+    // Sections breathe through blank spacer rows, never mid rules.
+    try std.testing.expect(std.mem.indexOf(u8, page, "├") == null);
 }
 
 test "detail error bodies reuse the shared error renderer" {

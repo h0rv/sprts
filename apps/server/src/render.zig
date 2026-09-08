@@ -369,8 +369,10 @@ fn gameIsLive(game: domain.Game) bool {
 /// Live games first, then one section per league with games today
 /// (league header links to the league page in HTML), then idle leagues
 /// as links. Leagues with no board (fetch failed) count as idle: the
-/// page never fails because of one league. A blank spacer row separates
-/// each section so dense days stay scannable.
+/// page never fails because of one league. Rules are sparing: the frame
+/// opens once at the top and closes once at the bottom; sections breathe
+/// through blank spacer rows, never mid rules — the grid stays quiet
+/// even on dense days.
 fn homeSections(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -379,6 +381,7 @@ fn homeSections(
     comptime html: bool,
     day: []const u8,
 ) !void {
+    var separated = false;
     var live = false;
     for (boards) |result| {
         const board = result.board orelse continue;
@@ -386,7 +389,6 @@ fn homeSections(
             if (gameIsLive(game)) {
                 if (!live) {
                     live = true;
-                    try writeRule(w, .mid, default_inner_width);
                     if (html) {
                         try writeHtmlRow(allocator, "LIVE NOW", "live", default_inner_width, w, null);
                     } else {
@@ -397,7 +399,7 @@ fn homeSections(
             }
         }
     }
-    var first_section = true;
+    if (live) separated = true;
     for (boards) |result| {
         const board = result.board orelse continue;
         var has_today = false;
@@ -408,8 +410,7 @@ fn homeSections(
             }
         }
         if (!has_today) continue;
-        if (!first_section) try spacerRow(w);
-        try writeRule(w, .mid, default_inner_width);
+        if (separated) try table.spacerRow(w, default_inner_width);
         // League header: name plus M/D date (year is implicit in the
         // page heading). Whole line links to the league page in HTML.
         const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, shortDate(day) });
@@ -425,18 +426,21 @@ fn homeSections(
             if (gameIsLive(game)) continue;
             try homeGameLine(allocator, w, result.league, game, color and !html, html);
         }
-        first_section = false;
+        separated = true;
     }
-    if (!first_section) try spacerRow(w);
-    try writeRule(w, .mid, default_inner_width);
-    if (html) {
-        try writeHtmlRow(allocator, "ALL LEAGUES", "dim", default_inner_width, w, null);
-    } else {
-        try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color);
-    }
+    var idle_first = true;
     for (boards) |result| {
         const board = result.board;
         if (board != null and board.?.games.len > 0) continue;
+        if (idle_first) {
+            idle_first = false;
+            if (separated) try table.spacerRow(w, default_inner_width);
+            if (html) {
+                try writeHtmlRow(allocator, "ALL LEAGUES", "dim", default_inner_width, w, null);
+            } else {
+                try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color);
+            }
+        }
         try w.writeAll("│ ");
         if (html) {
             const href = try homeLeagueHref(allocator, result.league.slug, day);
@@ -451,16 +455,6 @@ fn homeSections(
         if (html) try w.writeAll("</a>");
         try w.writeAll(" │\n");
     }
-}
-
-/// A blank spacer row: `│` borders with nothing between, so sections
-/// breathe without breaking the table frame. Callers place one between
-/// sections, never after the last line before a rule.
-fn spacerRow(w: *std.Io.Writer) !void {
-    try w.writeAll("│ ");
-    var i: usize = 0;
-    while (i < default_inner_width - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(" │\n");
 }
 
 /// Padded + escaped cell with optional color span, without borders or
@@ -1000,7 +994,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:12px;white-space:pre-wrap;word-wrap:break-word}}</style>
+    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
 ;
 
 /// CSS class matching the ANSI role for a game state: live games glow
@@ -1287,17 +1281,17 @@ test "scoreHtml narrow width keeps links and layout" {
     try expectVisiblePreText(page, board, 40, 2);
 }
 
-test "page style is plaintext: no buttons, desktop pre, mobile wrap" {
+test "page style is plaintext: no buttons, pre always scrolls" {
     try std.testing.expect(std.mem.indexOf(u8, page_style, "width=device-width") == null); // head, not style
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "@media(max-width:480px)") != null);
     // Plaintext nav: bare inline links, never button chrome.
     try std.testing.expect(std.mem.indexOf(u8, page_style, "min-height:44px") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "border:1px") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "border-radius") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "white-space:pre-wrap") != null);
-    // Desktop default keeps the table aligned: no wrap outside the query.
-    const media_at = std.mem.indexOf(u8, page_style, "@media").?;
-    try std.testing.expect(std.mem.indexOf(u8, page_style[0..media_at], "white-space:pre;") != null);
+    // The box must never wrap: pre scrolls horizontally at every width
+    // (no pre-wrap anywhere), so frame lines cannot break on mobile.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre-wrap") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "white-space:pre;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "overflow-x:auto") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "background:#10140f") != null);
 }
 
@@ -1319,6 +1313,33 @@ fn expectAlignedTable(output: []const u8) !void {
         } else {
             width = w;
         }
+        count += 1;
+    }
+    try std.testing.expect(count > 0);
+}
+
+/// Mid rules (`├`) in a rendered home page. The home frame is quiet by
+/// design: exactly 2 (LIVE block close, frame close). A per-game or
+/// per-league rule would push this past 2 and fail the caller.
+fn countRules(output: []const u8) usize {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "├")) n += 1;
+    }
+    return n;
+}
+
+/// Every rendered line fits its frame: no row may exceed the frame
+/// width, or it wraps on narrow screens and the box "breaks". Frame
+/// lines start with a 3-byte box glyph; hint/nav lines outside the
+/// table are skipped. Callers pass the expected frame width.
+fn expectNoBrokenLines(output: []const u8, frame_width: usize) !void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] != 0xE2) continue;
+        try std.testing.expect(displayWidth(line) <= frame_width);
         count += 1;
     }
     try std.testing.expect(count > 0);
@@ -1352,6 +1373,8 @@ test "home table rows align with the frame" {
     const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(output);
     try expectAlignedTable(output);
+    try expectNoBrokenLines(output, 52);
+    try std.testing.expect(countRules(output) == 0);
 }
 
 test "home groups live games, then today, then idle leagues" {
@@ -1466,8 +1489,15 @@ test "home groups live games, then today, then idle leagues" {
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, repo_url) != null);
     try expectAlignedTable(output);
-    // Whitespace: a blank spacer row separates each section.
+    // Whitespace: a blank spacer row separates each section, and zero
+    // mid rules exist — sections breathe through spacers, never grid.
+    // The frame opens once (top) and closes once (bottom), so dense
+    // days stay quiet instead of rendering a rule per section.
     try std.testing.expect(std.mem.indexOf(u8, output, "│                                                  │\n") != null);
+    try std.testing.expect(countRules(output) == 0);
+    // No line exceeds the 52-column frame, so nothing wraps and the box
+    // cannot "break" on narrow screens.
+    try expectNoBrokenLines(output, 52);
 
     const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(page);
