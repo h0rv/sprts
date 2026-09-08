@@ -128,6 +128,10 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             const body = try spec.openApiJson(alloc);
             return staticResponse(body, contentType(.json), null);
         },
+        .docs => {
+            const body = try spec.docsHtml(alloc);
+            return staticResponse(body, contentType(.html), null);
+        },
         .home => |home_route| {
             var transport_state = WorkerTransport{};
             const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;

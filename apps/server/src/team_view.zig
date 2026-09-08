@@ -96,12 +96,19 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
 /// no opponent, so they get `"<date> <vs/at OPP> <result>"`; upcoming
 /// results already read `"vs OPP 7:05 PM"`, so they get `"<date> <result>"`.
 fn gameLine(allocator: std.mem.Allocator, game: schedule.GameRef) ![]u8 {
-    const date = game.date[0..@min(game.date.len, 10)];
+    const date = shortDate(game.date[0..@min(game.date.len, 10)]);
     if (std.mem.eql(u8, game.state, "pre")) {
         return std.fmt.allocPrint(allocator, "{s} {s}", .{ date, game.result });
     }
     const versus = if (std.mem.eql(u8, game.home_away, "away")) "at" else "vs";
     return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ date, versus, game.opponent_abbrev, game.result });
+}
+
+/// Short date: `2026-09-08` becomes `09-08`. Matches render.zig's
+/// home headers; the year is implicit in the page context.
+fn shortDate(day: []const u8) []const u8 {
+    if (day.len >= 10 and day[4] == '-' and day[7] == '-') return day[5..10];
+    return day;
 }
 
 /// Schedule line with a game pointer for linking: the base `gameLine`
@@ -326,7 +333,8 @@ test "team text honors height and colors live rows" {
     const capped = try renderText(std.testing.allocator, testView(), false, null, 1);
     defer std.testing.allocator.free(capped);
     try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "2026-09-08") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "09-08") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "09-07") != null);
 
     const colored = try renderText(std.testing.allocator, testView(), true, null, null);
     defer std.testing.allocator.free(colored);

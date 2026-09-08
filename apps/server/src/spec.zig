@@ -140,6 +140,15 @@ pub fn openApiJson(allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
+/// API reference page (Scalar UI via zchema's docs module, spec served
+/// from `/openapi.json`). Linked from every page footer as `docs`.
+pub fn docsHtml(allocator: std.mem.Allocator) ![]u8 {
+    return z.docsHtml(allocator, .{
+        .title = "sprts API",
+        .spec_url = "/openapi.json",
+    });
+}
+
 const std = @import("std");
 const router = @import("router.zig");
 const render = @import("render.zig");
@@ -159,6 +168,14 @@ test "spec emits all five JSON operations" {
     for ([_][]const u8{ "\"date\"", "\"leagues\"", "\"schema_version\"" }) |field| {
         try std.testing.expect(std.mem.indexOf(u8, doc, field) != null);
     }
+}
+
+test "docs page serves the Scalar UI pointed at the spec" {
+    const page = try docsHtml(std.testing.allocator);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "/openapi.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "text/html") == null); // body, not headers
+    try std.testing.expect(std.mem.indexOf(u8, page, "<html") != null);
 }
 
 test "served openapi.json parses and covers every JSON route" {

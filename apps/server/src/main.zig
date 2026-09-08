@@ -108,6 +108,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             try respond(request, try server_app.spec.openApiJson(arena), .json, .ok, commonHeaders());
         },
+        .docs => {
+            status = .ok;
+            try respond(request, try server_app.spec.docsHtml(arena), .html, .ok, commonHeaders());
+        },
         .home => |home_route| {
             status = .ok;
             const day = try core.date.today(arena, io);
@@ -413,6 +417,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
     return switch (route) {
         .health => arena.dupe(u8, "health"),
         .openapi => arena.dupe(u8, "openapi"),
+        .docs => arena.dupe(u8, "docs"),
         .home => arena.dupe(u8, "home"),
         .leagues => arena.dupe(u8, "leagues"),
         .bad_date => arena.dupe(u8, "bad_date"),

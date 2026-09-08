@@ -82,6 +82,7 @@ pub const Route = union(enum) {
     standings: StandingsRoute,
     help: HelpRoute,
     openapi,
+    docs,
     health,
     not_found,
     bad_date,
@@ -100,6 +101,7 @@ pub fn parse(target: []const u8) Route {
     } };
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
+    if (std.mem.eql(u8, path, "/docs")) return .docs;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
 
     // Help page (wttr.in `:help` style): global `/:help`, `/help` plus the
@@ -386,6 +388,8 @@ test "short routes parse and API targets are JSON" {
     try std.testing.expect(isJsonTarget("/api/v1/mlb?date=2026-09-06"));
     try std.testing.expect(isJsonTarget("/api/v1/leagues"));
     try std.testing.expect(!isJsonTarget("/"));
+    try std.testing.expect(parse("/docs") == .docs);
+    try std.testing.expect(!isJsonTarget("/docs"));
 }
 
 test "format comes from address, query, then Accept" {
