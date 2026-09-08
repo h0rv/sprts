@@ -12,5 +12,9 @@ run = "zig build run"
 [tasks."generate:espn"]
 run = "tools/generate-espn-client"
 
+[tasks.deploy]
+description = "Build wasm and deploy to Cloudflare Workers (sprts.horv.co)"
+run = "npx wrangler deploy --env wasm"
+
 [tasks."generate:art"]
 run = "tools/generate-art --write"
