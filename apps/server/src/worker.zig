@@ -354,7 +354,10 @@ fn serveDetail(
         },
     };
     const body = switch (format) {
-        .text => try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
+        .text => if (route.oneline)
+            try detail_view.renderTextOneLine(alloc, game_detail, color, route.quiet)
+        else
+            try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
         .html => try detail_view.detailHtml(alloc, game_detail, route.width, route.height),
         .json => try detail_view.json(alloc, game_detail),
     };
@@ -544,7 +547,10 @@ fn serveTeam(
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
     const body = switch (format) {
-        .text => try team_view.renderText(alloc, view, color, route.width, route.height),
+        .text => if (route.oneline)
+            try team_view.renderTextOneLine(alloc, view, color, route.quiet)
+        else
+            try team_view.renderText(alloc, view, color, route.width, route.height),
         .html => try team_view.teamHtml(alloc, view, league.slug, route.width, route.height),
         .json => try team_view.renderJson(alloc, view),
     };
@@ -561,14 +567,11 @@ fn serveTeam(
 }
 
 /// League standings through one normalized `fetchStandings` per request,
-/// every format rendered from it. Deliberately uncached on the edge:
-/// `edge_cache.zig` is frozen for this task (no new bucketed namespace),
-/// so there is no stale fallback here — an upstream failure is a 502 and
-/// errors are never stored. The native server caches the same payload
-/// under its `standings` key with the schedule windows; edge bucketing is
-/// the follow-up alongside the spec entry. Unknown league slugs are 404;
-/// known leagues without an ESPN table (`error.UnsupportedLeague`) are
-/// 404 as well, never 502.
+/// every format rendered from it. Edge scheme mirrors the team path:
+/// `standings/<slug>/<format>` namespace, fresh 60s bucket served directly,
+/// stale 600s bucket on upstream failure (else 502); errors never cached.
+/// `error.UnsupportedLeague` is authoritative (no table for this league),
+/// so it bypasses even the stale path with a 404.
 fn serveStandings(
     env: *workers.Env,
     alloc: std.mem.Allocator,
@@ -579,6 +582,22 @@ fn serveStandings(
     const league = core.leagues.find(route.league) orelse {
         return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
     };
+
+    const epoch_s = epochSecondsNow();
+    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const tag = edge.formatTag(format);
+    const key = try edge.standingsKey(alloc, slug, tag);
+    const fresh_key = try edge.standingsFreshKey(alloc, key, epoch_s);
+    const stale_key = try edge.standingsStaleKey(alloc, key, epoch_s);
+
+    const cache = workers.Cache.default();
+
+    if (cache.match(.{ .url = fresh_key })) |hit| {
+        var resp = hit.clone();
+        resp.setHeader("cache-control", edge.client_cache_control);
+        resp.setHeader("x-sprts-cache", "hit");
+        return resp;
+    }
 
     var transport_state = WorkerTransport{};
     const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
@@ -595,6 +614,12 @@ fn serveStandings(
             return errorResponse(alloc, "standings unavailable for this league; see /api/v1/leagues", format, .not_found);
         }
         workers.log("upstream ESPN standings fetch failed for {s}", .{league.slug});
+        if (cache.match(.{ .url = stale_key })) |stale| {
+            var resp = stale.clone();
+            resp.setHeader("cache-control", edge.client_cache_control);
+            resp.setHeader("x-sprts-cache", "stale");
+            return resp;
+        }
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
     const body = switch (format) {
@@ -602,7 +627,16 @@ fn serveStandings(
         .html => try standings_view.html(alloc, table_data, route.width, route.height),
         .json => try standings_view.json(alloc, table_data),
     };
-    return staticResponse(body, contentType(format), null);
+
+    var resp = boardResponse(body, format, "miss");
+
+    var for_fresh = resp.clone();
+    cache.put(.{ .url = fresh_key }, &for_fresh);
+    var for_stale = resp.clone();
+    for_stale.setHeader("cache-control", edge.stale_cache_control);
+    for_stale.setHeader("x-sprts-cache", "stale");
+    cache.put(.{ .url = stale_key }, &for_stale);
+    return resp;
 }
 
 fn errorResponse(

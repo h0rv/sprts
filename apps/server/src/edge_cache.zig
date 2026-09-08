@@ -332,6 +332,24 @@ pub fn teamStaleKey(arena: std.mem.Allocator, team_key: []const u8, epoch_s: i64
     return std.fmt.allocPrint(arena, "{s}/s{d}", .{ team_key, @divFloor(epoch_s, schedule_stale_ttl_s) });
 }
 
+/// Standings render namespace: `sprts/v1/standings/<slug>/<format>`.
+/// No date: the endpoint is the current table only. Same 60s/600s windows
+/// as the schedule (tables move at schedule cadence, not live-score
+/// cadence); matches the native `standings` key windows.
+pub fn standingsKey(arena: std.mem.Allocator, slug: []const u8, tag: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/standings/{s}/{s}", .{ slug, tag });
+}
+
+/// Standings fresh key: 60s bucket; a hit proves age < 60s.
+pub fn standingsFreshKey(arena: std.mem.Allocator, standings_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/f{d}", .{ standings_key, @divFloor(epoch_s, schedule_fresh_ttl_s) });
+}
+
+/// Standings stale key: 600s bucket, served on upstream failure (else 502).
+pub fn standingsStaleKey(arena: std.mem.Allocator, standings_key: []const u8, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/s{d}", .{ standings_key, @divFloor(epoch_s, schedule_stale_ttl_s) });
+}
+
 test "team keys canonicalize slug and abbrev" {
     const arena = std.testing.allocator;
     const slug = try canonicalSlug(arena, "MLB");
@@ -380,6 +398,35 @@ test "team buckets bound entry age" {
     const stale_b = try scheduleStaleKey(arena, sched, 599);
     defer arena.free(stale_b);
     const stale_c = try scheduleStaleKey(arena, sched, 600);
+    defer arena.free(stale_c);
+    try std.testing.expectEqualStrings(stale_a, stale_b);
+    try std.testing.expect(!std.mem.eql(u8, stale_a, stale_c));
+}
+
+test "standings keys namespace by league and format with schedule windows" {
+    const arena = std.testing.allocator;
+    const key = try standingsKey(arena, "mlb", "json");
+    defer arena.free(key);
+    try std.testing.expectEqualStrings("sprts/v1/standings/mlb/json", key);
+
+    const other_format = try standingsKey(arena, "mlb", "text");
+    defer arena.free(other_format);
+    try std.testing.expect(!std.mem.eql(u8, key, other_format));
+
+    const fresh_a = try standingsFreshKey(arena, key, 0);
+    defer arena.free(fresh_a);
+    const fresh_b = try standingsFreshKey(arena, key, 59);
+    defer arena.free(fresh_b);
+    const fresh_c = try standingsFreshKey(arena, key, 60);
+    defer arena.free(fresh_c);
+    try std.testing.expectEqualStrings(fresh_a, fresh_b);
+    try std.testing.expect(!std.mem.eql(u8, fresh_a, fresh_c));
+
+    const stale_a = try standingsStaleKey(arena, key, 0);
+    defer arena.free(stale_a);
+    const stale_b = try standingsStaleKey(arena, key, 599);
+    defer arena.free(stale_b);
+    const stale_c = try standingsStaleKey(arena, key, 600);
     defer arena.free(stale_c);
     try std.testing.expectEqualStrings(stale_a, stale_b);
     try std.testing.expect(!std.mem.eql(u8, stale_a, stale_c));

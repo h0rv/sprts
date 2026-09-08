@@ -292,7 +292,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             const game_detail = cached.data.detail;
             const body = switch (format) {
-                .text => try server_app.detail_view.renderText(arena, game_detail, game_route.color orelse color_default, game_route.width, game_route.height),
+                .text => if (game_route.oneline)
+                    try server_app.detail_view.renderTextOneLine(arena, game_detail, game_route.color orelse color_default, game_route.quiet)
+                else
+                    try server_app.detail_view.renderText(arena, game_detail, game_route.color orelse color_default, game_route.width, game_route.height),
                 .html => try server_app.detail_view.detailHtml(arena, game_detail, game_route.width, game_route.height),
                 .json => try server_app.detail_view.json(arena, game_detail),
             };
@@ -330,7 +333,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             const view = cached.data.team;
             const body = switch (format) {
-                .text => try server_app.team_view.renderText(arena, view, team_route.color orelse color_default, team_route.width, team_route.height),
+                .text => if (team_route.oneline)
+                    try server_app.team_view.renderTextOneLine(arena, view, team_route.color orelse color_default, team_route.quiet)
+                else
+                    try server_app.team_view.renderText(arena, view, team_route.color orelse color_default, team_route.width, team_route.height),
                 .html => try server_app.team_view.teamHtml(arena, view, league.slug, team_route.width, team_route.height),
                 .json => try server_app.team_view.renderJson(arena, view),
             };
