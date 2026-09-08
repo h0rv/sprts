@@ -7,9 +7,13 @@ const ScoreboardPath = struct {
 
 const ScoreboardQuery = struct {
     date: ?[]const u8 = null,
+    stream: ?[]const u8 = null,
 
     pub const jsonschema = .{
-        .fields = .{ .date = .{ .format = "date" } },
+        .fields = .{
+            .date = .{ .format = "date" },
+            .stream = .{},
+        },
     };
 };
 
@@ -53,6 +57,10 @@ pub const ApiSpec = z.Spec(.{
     z.endpoint(.GET, "/api/v1/{league}", .{
         .operation_id = "getScoreboard",
         .summary = "Scores for one league and date",
+        .description = "Pass ?stream=sse (or Accept: text/event-stream) for a text-only SSE feed: " ++
+            "framed as data: lines plus blank-line terminators, each event prefixed with the " ++
+            "clear-screen escape \\x1b[2J\\x1b[H for in-place redraw, with : ping keepalive comments. " ++
+            "Example: curl -N /nba?stream=sse. Text-only; JSON and HTML always return a single response.",
         .path = ScoreboardPath,
         .query = ScoreboardQuery,
         .responses = .{

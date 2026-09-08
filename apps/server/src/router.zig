@@ -11,6 +11,7 @@ pub const ScoreboardRoute = struct {
     height: ?u16,
     quiet: bool = false,
     oneline: bool = false,
+    stream: bool = false,
 };
 
 pub const GameRoute = struct {
@@ -118,6 +119,7 @@ pub fn parse(target: []const u8) Route {
         .height = queryUint(queryValue(query, "height")),
         .quiet = display.quiet,
         .oneline = display.oneline,
+        .stream = wantsStream(target, ""),
     } };
 }
 
@@ -148,6 +150,21 @@ pub fn isJsonTarget(target: []const u8) bool {
     const query_at = std.mem.indexOfScalar(u8, target, '?');
     const path = target[0 .. query_at orelse target.len];
     return std.mem.startsWith(u8, path, "/api/v1/");
+}
+
+/// True when the scoreboard request asks for a live SSE stream: either the
+/// `?stream=` query flag (`sse`, `1`, or `true`, case-insensitive) or an
+/// `Accept: text/event-stream` header. `parse` fills `ScoreboardRoute.stream`
+/// from the query half; callers OR in the header half with this helper.
+pub fn wantsStream(target: []const u8, accept: []const u8) bool {
+    const query_at = std.mem.indexOfScalar(u8, target, '?');
+    const query = if (query_at) |at| target[at + 1 ..] else "";
+    if (queryValue(query, "stream")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "sse")) return true;
+        if (std.ascii.eqlIgnoreCase(value, "1")) return true;
+        if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    }
+    return containsIgnoreCase(accept, "text/event-stream");
 }
 
 fn queryValue(query: []const u8, wanted: []const u8) ?[]const u8 {
@@ -372,4 +389,26 @@ test "second segment splits game ids from team abbrevs" {
     try std.testing.expect(api_team.width.? == 90);
     try std.testing.expect(parse("/mlb/") == .not_found);
     try std.testing.expect(parse("//phi") == .not_found);
+}
+
+test "stream flag parses query values and Accept header" {
+    try std.testing.expect(!parse("/mlb").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=sse").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=SSE").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=1").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=true").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=True").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=TRUE").scoreboard.stream);
+    try std.testing.expect(!parse("/mlb?stream=0").scoreboard.stream);
+    try std.testing.expect(!parse("/mlb?stream=no").scoreboard.stream);
+    try std.testing.expect(!parse("/mlb?stream=").scoreboard.stream);
+    try std.testing.expect(!wantsStream("/mlb", "*/*"));
+    try std.testing.expect(!wantsStream("/mlb", "text/html"));
+    try std.testing.expect(wantsStream("/mlb", "text/event-stream"));
+    try std.testing.expect(wantsStream("/mlb", "Text/Event-Stream"));
+    try std.testing.expect(wantsStream("/mlb", "text/html, text/event-stream"));
+    try std.testing.expect(wantsStream("/mlb?stream=sse", ""));
+    // Stream and display params compose: the poll key must vary renders.
+    try std.testing.expect(parse("/mlb?stream=sse&width=80").scoreboard.stream);
+    try std.testing.expect(parse("/mlb?stream=sse&width=80").scoreboard.width.? == 80);
 }

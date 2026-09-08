@@ -43,6 +43,7 @@ const team_view = @import("team_view.zig");
 const spec = @import("spec.zig");
 const provider = @import("provider.zig");
 const edge = @import("edge_cache.zig");
+const stream = @import("stream.zig");
 
 const default_base_url = "https://site.api.espn.com/apis/site/v2";
 
@@ -155,7 +156,19 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         },
         .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", format, .bad_request),
         .not_found => return errorResponse(alloc, "route not found", format, .not_found),
-        .scoreboard => |route| return serveBoard(env, alloc, route, format),
+        .scoreboard => |route| {
+            // SSE trigger mirrors main.zig exactly: ?stream= query flag
+            // (ScoreboardRoute.stream, filled from the query half by
+            // router.parse) OR'd with the Accept: text/event-stream half via
+            // router.wantsStream. Text-only: JSON/HTML stream requests get
+            // the normal single response. HEAD never streams (an open-ended
+            // body makes no sense there): falls back to the single response.
+            const wants_sse = route.stream or router.wantsStream(target, accept);
+            if (wants_sse and format == .text and method == .GET) {
+                return serveStream(env, alloc, route);
+            }
+            return serveBoard(env, alloc, route, format);
+        },
         .game => |route| return serveDetail(env, alloc, route, format),
         .team => |route| return serveTeam(env, alloc, route, format),
     }
@@ -310,6 +323,103 @@ fn serveDetail(
     cache.put(.{ .url = stale_key }, &for_stale);
     return resp;
 }
+
+fn serveStream(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.ScoreboardRoute,
+) !workers.Response {
+    const color = route.color orelse try colorDefault(env);
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", .text, .not_found);
+    };
+
+    const epoch_s = epochSecondsNow();
+    const day = try edge.resolveDay(alloc, route.date, epoch_s);
+
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+
+    // Fetch before opening the stream: an unavailable upstream still gets
+    // the normal single 502 instead of an empty SSE body (mirrors the
+    // native serveSse; errors are never cached).
+    const initial = adapter.fetch(alloc, league, day) catch {
+        workers.log("upstream ESPN fetch failed for {s} {s}", .{ league.slug, day });
+        return errorResponse(alloc, "scores are temporarily unavailable", .text, .bad_gateway);
+    };
+
+    // Reuse the shared text render + SSE framing verbatim: full text render
+    // (respecting color/width/height) prefixed with the clear-screen escape
+    // via stream.frame, so plain `curl -N` repaints in place.
+    const initial_text = try render.text(alloc, initial, color, route.width, route.height);
+    const initial_frame = try stream.frame(alloc, initial_text);
+
+    var sse = workers.StreamingResponse.start(.{ .status = .ok });
+    sse.setHeader("content-type", stream.content_type);
+    sse.setHeader("cache-control", stream.cache_control);
+    sse.setHeader("connection", "keep-alive");
+    sse.setHeader("vary", edge.vary_value);
+    sse.setHeader("x-content-type-options", "nosniff");
+    sse.write(initial_frame);
+
+    var last = stream.fingerprint(initial);
+    var interval_s = stream.pollIntervalSec(initial);
+    var elapsed_s: u64 = 0;
+    const tick_s: u64 = 1;
+
+    // Bounded loop, not `while (true)`: a bare infinite loop makes this
+    // function's inferred error set infinite, which callers cannot name or
+    // handle. The worker has no client-disconnect signal to break on anyway
+    // (writes only surface errors at close). The final-slate cadence (300s)
+    // bounds real duration; ~6h of 1s ticks covers a live game at 12s polls.
+    // Each iteration is one JSPI sleep + at most one ESPN fetch.
+    const max_ticks: u64 = 6 * 60 * 60;
+    var tick: u64 = 0;
+    while (tick < max_ticks) : (tick += 1) {
+        workers.sleep(@intCast(tick_s * 1000));
+        elapsed_s += tick_s;
+
+        if (elapsed_s % stream.keepalive_s == 0) {
+            sse.write(stream.keepalive_frame);
+        }
+
+        if (elapsed_s < interval_s) continue;
+        elapsed_s = 0;
+
+        const board = adapter.fetch(alloc, league, day) catch |err| {
+            workers.log("upstream ESPN fetch failed for {s}: {any}", .{ league.slug, err });
+            continue;
+        };
+        interval_s = stream.pollIntervalSec(board);
+        const current = stream.fingerprint(board);
+        if (!stream.changed(last, current)) continue;
+        last = current;
+        const body = render.text(alloc, board, color, route.width, route.height) catch continue;
+        const event = stream.frame(alloc, body) catch continue;
+        sse.write(event);
+        // Per-request arena memory grows with each tick's render; the outer
+        // entry arena is freed when the request ends, and frames for a
+        // final-slate resource stop changing (300s cadence, fingerprint
+        // stable), so steady-state allocation is bounded in practice.
+    }
+
+    sse.close();
+    return sse.response();
+}
+
+fn contentType(format: router.Format) []const u8 {
+    return switch (format) {
+        .text => "text/plain; charset=utf-8",
+        .html => "text/html; charset=utf-8",
+        .json => "application/json; charset=utf-8",
+    };
 
 fn contentType(format: router.Format) []const u8 {
     return switch (format) {

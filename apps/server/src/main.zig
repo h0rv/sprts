@@ -16,6 +16,11 @@ pub fn main(init: std.process.Init) !void {
     const adapter: server_app.provider.EspnAdapter = .{ .allocator = allocator, .io = io, .base_url = base_url };
     var cache = server_app.native_cache.NativeCache.init(allocator, io, server_app.native_cache.realClock);
     defer cache.deinit();
+    var subscriber_counts = server_app.stream.Subscribers.init(allocator);
+    defer subscriber_counts.deinit(allocator);
+    var subscriber_mutex: std.Io.Mutex = .init;
+    var shared_poll = server_app.stream.SharedCache.init(allocator);
+    defer shared_poll.deinit(allocator);
     // Server-side color default, read once. A remote client's own NO_COLOR
     // or TERM never reaches us; remote callers use ?color=0 or ?color=1.
     const term = init.environ_map.get("TERM") orelse "";
@@ -28,11 +33,11 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("accept failed: {t}", .{err});
             continue;
         };
-        group.async(io, serveConnection, .{ allocator, io, stream, adapter, color_default, &cache });
+        group.async(io, serveConnection, .{ allocator, io, stream, adapter, color_default, &cache, &subscriber_counts, &subscriber_mutex, &shared_poll });
     }
 }
 
-fn serveConnection(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, adapter: server_app.provider.EspnAdapter, color_default: bool, cache: *server_app.native_cache.NativeCache) void {
+fn serveConnection(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream, adapter: server_app.provider.EspnAdapter, color_default: bool, cache: *server_app.native_cache.NativeCache, subscriber_counts: *server_app.stream.Subscribers, subscriber_mutex: *std.Io.Mutex, shared_poll: *server_app.stream.SharedCache) void {
     defer stream.close(io);
     var receive_buffer: [16 * 1024]u8 = undefined;
     var send_buffer: [16 * 1024]u8 = undefined;
@@ -47,14 +52,14 @@ fn serveConnection(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.
                 return;
             },
         };
-        handleRequest(allocator, io, &request, adapter, color_default, cache) catch |err| {
+        handleRequest(allocator, io, &request, adapter, color_default, cache, subscriber_counts, subscriber_mutex, shared_poll) catch |err| {
             std.log.err("request failed: {t}", .{err});
             return;
         };
     }
 }
 
-fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Server.Request, adapter: server_app.provider.EspnAdapter, color_default: bool, cache: *server_app.native_cache.NativeCache) !void {
+fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Server.Request, adapter: server_app.provider.EspnAdapter, color_default: bool, cache: *server_app.native_cache.NativeCache, subscriber_counts: *server_app.stream.Subscribers, subscriber_mutex: *std.Io.Mutex, shared_poll: *server_app.stream.SharedCache) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -139,6 +144,28 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
             const day = score_route.date orelse try core.date.today(arena, io);
+            // SSE is a text-only progressive render: JSON and HTML shape a
+            // document, not a redraw loop. Header- or query-triggered stream
+            // requests on those formats get the normal single response.
+            const wants_sse = score_route.stream or server_app.router.wantsStream(target, accept);
+            if (wants_sse and format == .text) {
+                status = .ok;
+                // GET only: HEAD must not start an open-ended body. Fall back
+                // to the normal single response, consistent with non-stream.
+                if (request.head.method == .HEAD) {
+                    const board_once = adapter.fetch(arena, league, day) catch |err| {
+                        status = .bad_gateway;
+                        std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+                        try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                        return;
+                    };
+                    const body = try server_app.render.text(arena, board_once, score_route.color orelse color_default, score_route.width, score_route.height);
+                    try respond(request, body, format, .ok, commonHeaders());
+                    return;
+                }
+                try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default);
+                return;
+            }
             const key: server_app.native_cache.Key = .{ .board = .{ .slug = slug, .day = day } };
             var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
@@ -288,6 +315,181 @@ fn cacheHeaders(cache_state: []const u8) [4]std.http.Header {
     @memcpy(extra[0..3], commonHeaders());
     extra[3] = .{ .name = "x-sprts-cache", .value = cache_state };
     return extra;
+}
+
+/// Serve one SSE connection for a (league, day, render) resource. The first
+/// frame goes out immediately from a normal ESPN fetch; afterwards polls are
+/// shared per resource: each 1s tick at most one subscriber fetches ESPN per
+/// interval (mutex-guarded SharedCache in stream.zig), and the rest fan out
+/// from the cached frame. Only a changed fingerprint pushes a new frame. The
+/// render uses the same text path as a single response, so colors and
+/// width/height behave identically. Subscriber-gated: attaching/detaching the
+/// shared counts is what starts/stops ESPN polling for the resource — the
+/// last detach stops the timer and drops the cache entry. A failed body write
+/// means the client went away, so detach and return (ending the loop)
+/// instead of erroring the connection.
+fn serveSse(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    request: *std.http.Server.Request,
+    adapter: server_app.provider.EspnAdapter,
+    subscriber_counts: *server_app.stream.Subscribers,
+    subscriber_mutex: *std.Io.Mutex,
+    shared_poll: *server_app.stream.SharedCache,
+    league: *const core.leagues.League,
+    day: []const u8,
+    score_route: server_app.router.ScoreboardRoute,
+    color_default: bool,
+) !void {
+    const stream = server_app.stream;
+    const color = score_route.color orelse color_default;
+    const day_owned = try arena.dupe(u8, day);
+    const key = try stream.subKey(arena, league.slug, day_owned, color, score_route.width, score_route.height);
+
+    // Fetch before opening the stream: an unavailable upstream still gets
+    // the normal single 502 instead of an empty SSE body.
+    const initial = adapter.fetch(arena, league, day_owned) catch |err| {
+        std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+        try respondError(arena, request, "scores are temporarily unavailable", .text, .bad_gateway);
+        return;
+    };
+
+    var send_buffer: [16 * 1024]u8 = undefined;
+    var body_writer = try request.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .ok,
+            .keep_alive = true,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = stream.content_type },
+                .{ .name = "cache-control", .value = stream.cache_control },
+                .{ .name = "connection", .value = "keep-alive" },
+                .{ .name = "vary", .value = "accept" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            },
+        },
+    });
+
+    const initial_text = try server_app.render.text(arena, initial, color, score_route.width, score_route.height);
+    const initial_frame = try stream.frame(arena, initial_text);
+    body_writer.writer.writeAll(initial_frame) catch return;
+    // Two-stage flush: the inner writer buffers up to 16KB before emitting
+    // a chunk (BodyWriter.flush only flushes the socket side), so drain it
+    // first or small frames never reach the client until the buffer fills.
+    body_writer.writer.flush() catch return;
+    body_writer.flush() catch return;
+
+    {
+        subscriber_mutex.lockUncancelable(io);
+        defer subscriber_mutex.unlock(io);
+        _ = subscriber_counts.attach(gpa, key) catch {
+            body_writer.end() catch {};
+            return;
+        };
+    }
+    defer {
+        subscriber_mutex.lockUncancelable(io);
+        defer subscriber_mutex.unlock(io);
+        const remaining = subscriber_counts.detach(gpa, key);
+        if (remaining == 0) shared_poll.remove(gpa, key);
+    }
+
+    var last = stream.fingerprint(initial);
+    const initial_interval = stream.pollIntervalSec(initial);
+    {
+        // Warm the shared cache so later subscribers share this poll. Only
+        // store when no fresh entry exists, so a racing connect fetch can't
+        // clobber a newer frame another subscriber just published.
+        const now_s = adapter.clock(io);
+        subscriber_mutex.lockUncancelable(io);
+        defer subscriber_mutex.unlock(io);
+        if (shared_poll.needsPoll(key, now_s)) {
+            shared_poll.store(gpa, key, now_s, last, initial_interval, initial_frame) catch {};
+        }
+    }
+    var elapsed_s: u64 = 0;
+    const tick_s: u64 = 1;
+
+    while (true) {
+        const step: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromSeconds(@intCast(tick_s)),
+            .clock = .real,
+        } };
+        step.sleep(io) catch return;
+        elapsed_s += tick_s;
+
+        if (elapsed_s % @as(u64, stream.keepalive_s) == 0) {
+            body_writer.writer.writeAll(stream.keepalive_frame) catch return;
+            body_writer.writer.flush() catch return;
+            body_writer.flush() catch return;
+        }
+
+        {
+            subscriber_mutex.lockUncancelable(io);
+            const active = subscriber_counts.count(key);
+            subscriber_mutex.unlock(io);
+            if (active == 0) return;
+        }
+
+        // Block scope per tick: the poll scratch arena is backed by the
+        // long-lived gpa (not the per-request arena) so deinit each
+        // iteration truly frees fetch buffers instead of accumulating them
+        // in the connection arena for the life of the stream.
+        {
+            var poll_arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer poll_arena_state.deinit();
+            const poll_arena = poll_arena_state.allocator();
+
+            const now_s = adapter.clock(io);
+            const is_fetcher = blk: {
+                subscriber_mutex.lockUncancelable(io);
+                defer subscriber_mutex.unlock(io);
+                break :blk shared_poll.claim(gpa, key, now_s) catch false;
+            };
+
+            if (is_fetcher) {
+                const board = adapter.fetch(poll_arena, league, day_owned) catch |err| {
+                    // Claim already advanced last_poll, so the failure backs
+                    // off: no cache update, next attempt only after the
+                    // interval, one fetch attempt total per tick.
+                    std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+                    continue;
+                };
+                const current = stream.fingerprint(board);
+                const next_interval = stream.pollIntervalSec(board);
+                const body = server_app.render.text(poll_arena, board, color, score_route.width, score_route.height) catch continue;
+                const event = stream.frame(poll_arena, body) catch continue;
+                {
+                    subscriber_mutex.lockUncancelable(io);
+                    defer subscriber_mutex.unlock(io);
+                    shared_poll.store(gpa, key, now_s, current, next_interval, event) catch {};
+                }
+                if (!stream.changed(last, current)) continue;
+                last = current;
+                body_writer.writer.writeAll(event) catch return;
+                body_writer.writer.flush() catch return;
+                body_writer.flush() catch return;
+            } else {
+                // Fan-out: copy the cached frame while still holding the
+                // lock — the fetcher may free/replace it on store.
+                var hit_fp: u64 = undefined;
+                const pending_copy: []u8 = blk: {
+                    subscriber_mutex.lockUncancelable(io);
+                    defer subscriber_mutex.unlock(io);
+                    const entry = shared_poll.get(key) orelse break :blk null;
+                    if (!entry.ready) break :blk null;
+                    if (!stream.changed(last, entry.fingerprint)) break :blk null;
+                    hit_fp = entry.fingerprint;
+                    const copy = poll_arena.dupe(u8, entry.frame) catch break :blk null;
+                    break :blk copy;
+                } orelse continue;
+                last = hit_fp;
+                body_writer.writer.writeAll(pending_copy) catch return;
+                body_writer.writer.flush() catch return;
+                body_writer.flush() catch return;
+            }
+        }
+    }
 }
 
 fn respondError(arena: std.mem.Allocator, request: *std.http.Server.Request, message: []const u8, format: server_app.router.Format, status: std.http.Status) !void {

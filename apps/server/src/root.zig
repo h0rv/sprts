@@ -6,6 +6,7 @@ pub const spec = @import("spec.zig");
 pub const edge_cache = @import("edge_cache.zig");
 pub const team_view = @import("team_view.zig");
 pub const native_cache = @import("native_cache.zig");
+pub const stream = @import("stream.zig");
 
 test {
     _ = provider;
@@ -16,4 +17,5 @@ test {
     _ = edge_cache;
     _ = team_view;
     _ = native_cache;
+    _ = stream;
 }
