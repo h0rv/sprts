@@ -97,6 +97,10 @@ pub const DetailGame = struct {
     decisions: []const DetailDecision = &.{},
     scoring_plays: []const DetailScoringPlay = &.{},
     leaders: []const []const u8 = &.{},
+    // depth: box-score team totals, one preformatted line per stat
+    // (e.g. "ATL At Bats 35"). Empty when the provider supplies none;
+    // renderers skip the section rather than erroring.
+    team_stats: []const []const u8 = &.{},
 
     pub const jsonschema = .{
         .name = "DetailGame",
@@ -108,6 +112,7 @@ pub const DetailGame = struct {
             .attendance = .{ .description = "Ticketed attendance when the provider supplies it." },
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },
             .leaders = .{ .description = "Short statistical leader strings, e.g. team totals and top performers." },
+            .team_stats = .{ .description = "Box-score team total lines when the provider supplies them; absent otherwise." },
         },
     };
 };

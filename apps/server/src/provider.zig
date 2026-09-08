@@ -954,6 +954,34 @@ fn seriesFromSchedules(
     return null;
 }
 
+// depth: box-score team totals (additive; existing detail code above untouched).
+//
+// ESPN already ships `boxscore.teams[].statistics[]` in the summary payload
+// this path fetches; it was simply never threaded through. Formats up to 4
+// stats per side (first 2 teams) as "{ABBR} {label} {value}" so both sides
+// stay visible under the renderer's 8-line cap. A null boxscore or empty
+// statistics yield an empty list (section skipped, never an error).
+fn boxTeamStats(arena: std.mem.Allocator, boxscore: ?SummaryBoxscore) ![]const []const u8 {
+    const box = boxscore orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (box.teams[0..@min(box.teams.len, 2)]) |side| {
+        const abbr: []const u8 = if (side.team) |team| team.abbreviation else "?";
+        var taken: usize = 0;
+        outer: for (side.statistics) |group| {
+            for (group.stats) |stat| {
+                if (taken >= 4) break :outer;
+                const value = (try jsonText(arena, stat.displayValue)) orelse continue;
+                if (value.len == 0) continue;
+                const label: []const u8 = if (stat.displayName.len > 0) stat.displayName else stat.name;
+                if (label.len == 0) continue;
+                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, value }));
+                taken += 1;
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const summary_url = try espn.buildSummaryUrl(arena, self.base_url, endpoint.sport, endpoint.league, game_id);
@@ -1098,6 +1126,9 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         series = try seriesFromSchedules(self, arena, endpoint, day[0..4], competition, game.id);
     }
 
+    // depth: box-score team totals ride the already-fetched summary payload.
+    const team_stats = try boxTeamStats(arena, response.boxscore);
+
     return .{
         .id = try copy(arena, game.id),
         .league = league.slug,
@@ -1113,6 +1144,8 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .decisions = try decisions.toOwnedSlice(arena),
         .scoring_plays = try scoring_plays.toOwnedSlice(arena),
         .leaders = try leaders.toOwnedSlice(arena),
+        // depth: box-score team totals (optional; empty when not supplied).
+        .team_stats = team_stats,
     };
 }
 
@@ -1606,6 +1639,26 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         std.log.warn("team live join failed for {s}: {t}", .{ abbrev, err });
     }
 
+    // depth: full-season overflow beyond the 5/5 window above. `parsed.events`
+    // is the whole season already in hand — no extra upstream fetch. `last`
+    // holds the newest past games, so the overflow is the older head reversed
+    // (newest-first, continuing `last`); `next` holds the soonest upcoming,
+    // so the overflow is the tail in order (continuing `next`).
+    var extra_past: std.ArrayList(core.schedule.GameRef) = .empty;
+    if (split.past.len > last.items.len) {
+        var j: usize = split.past.len - last.items.len;
+        while (j > 0) {
+            j -= 1;
+            try extra_past.append(arena, try gameRefFromEvent(arena, split.past[j]));
+        }
+    }
+    var extra_next: std.ArrayList(core.schedule.GameRef) = .empty;
+    if (split.upcoming.len > next.items.len) {
+        for (split.upcoming[next.items.len..]) |event| {
+            try extra_next.append(arena, try gameRefFromEvent(arena, event));
+        }
+    }
+
     return .{
         .league = league.slug,
         .league_name = league.name,
@@ -1613,6 +1666,9 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         .last = try last.toOwnedSlice(arena),
         .next = try next.toOwnedSlice(arena),
         .live = live,
+        // depth: full-season overflow (optional; empty when within the window).
+        .extra_past = try extra_past.toOwnedSlice(arena),
+        .extra_next = try extra_next.toOwnedSlice(arena),
     };
 }
 
@@ -1748,4 +1804,96 @@ test "fetchTeam still renders when the live board fetch fails" {
 
 const team_fixture_schedule_empty =
     \\{"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"events":[]}
+;
+
+// depth: full-season overflow + box-score team totals (appended; existing
+// provider tests above untouched). No new upstream fetches: both ride
+// payloads the existing paths already fetch.
+test "depth fetchTeam threads overflow beyond the last/next five" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 7 past (Aug, all PHI wins) + 7 upcoming (Sep, all pre) around the
+    // fake today of 2026-09-07.
+    var sched: std.Io.Writer.Allocating = .init(arena);
+    try sched.writer.writeAll("{\"team\":{\"id\":\"22\",\"abbreviation\":\"PHI\",\"displayName\":\"Philadelphia Phillies\",\"recordSummary\":\"80-63\",\"standingSummary\":\"2nd in NL East\"},\"events\":[");
+    var n: u8 = 1;
+    while (n <= 7) : (n += 1) {
+        if (n > 1) try sched.writer.writeByte(',');
+        try sched.writer.print(
+            "{{\"id\":\"p{d}\",\"date\":\"2026-08-{d:0>2}T19:05Z\",\"competitions\":[{{\"id\":\"p{d}\",\"date\":\"2026-08-{d:0>2}T19:05Z\",\"status\":{{\"type\":{{\"state\":\"post\",\"shortDetail\":\"Final\"}}}},\"competitors\":[{{\"homeAway\":\"home\",\"winner\":true,\"score\":{{\"displayValue\":\"5\"}},\"team\":{{\"id\":\"22\",\"abbreviation\":\"PHI\",\"displayName\":\"Philadelphia Phillies\"}},\"probables\":[]}},{{\"homeAway\":\"away\",\"winner\":false,\"score\":{{\"displayValue\":\"3\"}},\"team\":{{\"id\":\"1\",\"abbreviation\":\"NYM\",\"displayName\":\"New York Mets\"}},\"probables\":[]}}]}}]}}",
+            .{ n, 19 + n, n, 19 + n },
+        );
+    }
+    n = 1;
+    while (n <= 7) : (n += 1) {
+        try sched.writer.writeByte(',');
+        try sched.writer.print(
+            "{{\"id\":\"f{d}\",\"date\":\"2026-09-{d:0>2}T19:05Z\",\"competitions\":[{{\"id\":\"f{d}\",\"date\":\"2026-09-{d:0>2}T19:05Z\",\"status\":{{\"type\":{{\"state\":\"pre\",\"shortDetail\":\"Scheduled\"}}}},\"competitors\":[{{\"homeAway\":\"home\",\"team\":{{\"id\":\"22\",\"abbreviation\":\"PHI\",\"displayName\":\"Philadelphia Phillies\"}},\"probables\":[]}},{{\"homeAway\":\"away\",\"team\":{{\"id\":\"1\",\"abbreviation\":\"NYM\",\"displayName\":\"New York Mets\"}},\"probables\":[]}}]}}]}}",
+            .{ n, 7 + n, n, 7 + n },
+        );
+    }
+    try sched.writer.writeAll("]}");
+    const sched_body = try sched.toOwnedSlice();
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = sched_body,
+        .board_body = team_fixture_board,
+        .fail_board = true, // live join off; overflow is schedule-only.
+    };
+    const adapter = teamTestAdapter(&fake);
+    const view = try fetchTeam(adapter, arena, core.leagues.find("mlb").?, "PHI");
+    try std.testing.expect(view.live == null);
+    try std.testing.expectEqual(@as(usize, 5), view.last.len);
+    try std.testing.expectEqualStrings("p7", view.last[0].id);
+    try std.testing.expectEqualStrings("W 5-3", view.last[0].result);
+    try std.testing.expectEqual(@as(usize, 2), view.extra_past.len);
+    try std.testing.expectEqualStrings("p2", view.extra_past[0].id);
+    try std.testing.expectEqualStrings("p1", view.extra_past[1].id);
+    try std.testing.expectEqual(@as(usize, 5), view.next.len);
+    try std.testing.expectEqualStrings("f1", view.next[0].id);
+    try std.testing.expectEqual(@as(usize, 2), view.extra_next.len);
+    try std.testing.expectEqualStrings("f6", view.extra_next[0].id);
+    try std.testing.expectEqualStrings("f7", view.extra_next[1].id);
+}
+
+test "depth fetchTeam leaves overflow empty within the window" {
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = team_fixture_schedule,
+        .board_body = team_fixture_board,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    try std.testing.expectEqual(@as(usize, 0), view.extra_past.len);
+    try std.testing.expectEqual(@as(usize, 0), view.extra_next.len);
+}
+
+test "depth detailFetch threads boxscore team totals and skips cleanly without" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"401816828","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"15","homeAway":"away","winner":true,"score":5,"team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}},{"id":"22","homeAway":"home","winner":false,"score":4,"team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}}]}]},"boxscore":{"teams":[{"team":{"id":"15","abbreviation":"ATL"},"statistics":[{"name":"batting","displayName":"Batting","stats":[{"name":"atBats","displayName":"At Bats","displayValue":"35"},{"name":"runs","displayName":"Runs","displayValue":"5"}]}]},{"team":{"id":"22","abbreviation":"PHI"},"statistics":[{"name":"batting","displayName":"Batting","stats":[{"name":"atBats","displayName":"At Bats","displayValue":"33"},{"name":"runs","displayName":"Runs","displayValue":"4"}]}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = detail_board_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const with_stats = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "401816828");
+    try std.testing.expectEqual(@as(usize, 4), with_stats.team_stats.len);
+    try std.testing.expectEqualStrings("ATL At Bats 35", with_stats.team_stats[0]);
+    try std.testing.expectEqualStrings("ATL Runs 5", with_stats.team_stats[1]);
+    try std.testing.expectEqualStrings("PHI At Bats 33", with_stats.team_stats[2]);
+    try std.testing.expectEqualStrings("PHI Runs 4", with_stats.team_stats[3]);
+
+    // No boxscore payload: empty list, never an error.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "7");
+    try std.testing.expectEqual(@as(usize, 0), bare.team_stats.len);
+}
+
+const detail_summary_minimal =
+    \\{"header":{"competitions":[{"id":"7","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":"1","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":"0","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}}
+;
+
+const detail_board_minimal =
+    \\{"events":[{"id":"7","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"7","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"1","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
 ;
