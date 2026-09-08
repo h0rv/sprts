@@ -3,7 +3,8 @@
 //! Mirrors the `edge_cache` scheme instead of inventing a second one:
 //!
 //! - Namespaces use the same components: board `(slug, day)`, detail
-//!   `(slug, id)`, team `(slug, abbr)`. Slugs/abbrevs must arrive
+//!   `(slug, id)`, team `(slug, abbr)`, standings `(slug)` (no date: the
+//!   endpoint is the current table only). Slugs/abbrevs must arrive
 //!   pre-canonicalized (lowercase via `edge_cache.canonicalSlug` /
 //!   `canonicalAbbr`); canonicalization stays in the serve layer exactly
 //!   like the worker's `serveBoard`/`serveTeam`.
@@ -12,8 +13,8 @@
 //!   fetch fails, else the error propagates (the native 502). The TTL
 //!   constants are reused from `edge_cache`, not redeclared.
 //! - Only successful fetches are ever stored; errors (including
-//!   `GameNotFound`/`TeamNotFound`, which bypass even the stale path) are
-//!   never cached.
+//!   `GameNotFound`/`TeamNotFound`/`UnsupportedLeague`, which bypass even
+//!   the stale path) are never cached.
 //!
 //! One deliberate difference from the edge: the native cache stores the
 //! NORMALIZED payload (`Scoreboard`/`GameDetail`/`TeamView`), not the
@@ -48,30 +49,35 @@ pub fn realClock(io: std.Io) i64 {
     return std.Io.Clock.real.now(io).toSeconds();
 }
 
-pub const Kind = enum { board, detail, team };
+pub const Kind = enum { board, detail, team, standings };
 
 fn kindOf(key: Key) Kind {
     return switch (key) {
         .board => .board,
         .detail => .detail,
         .team => .team,
+        .standings => .standings,
     };
 }
 
 /// Fresh window, reused from `edge_cache`: board/detail share the 30s
-/// board window; team renders track the 60s schedule window.
+/// board window; team renders track the 60s schedule window. Standings
+/// track the schedule window too: tables move at schedule cadence (a game
+/// final at a time), not at live-score cadence.
 pub fn freshTtl(kind: Kind) i64 {
     return switch (kind) {
         .board, .detail => edge.fresh_ttl_s,
-        .team => edge.schedule_fresh_ttl_s,
+        .team, .standings => edge.schedule_fresh_ttl_s,
     };
 }
 
 /// Stale window, reused from `edge_cache`: 300s board/detail, 600s team.
+/// Standings reuse the 600s schedule window: a stale table still renders
+/// usefully (positions barely move in 10 minutes).
 pub fn staleTtl(kind: Kind) i64 {
     return switch (kind) {
         .board, .detail => edge.stale_ttl_s,
-        .team => edge.schedule_stale_ttl_s,
+        .team, .standings => edge.schedule_stale_ttl_s,
     };
 }
 
@@ -81,6 +87,7 @@ pub const Key = union(enum) {
     board: struct { slug: []const u8, day: []const u8 },
     detail: struct { slug: []const u8, id: []const u8 },
     team: struct { slug: []const u8, abbr: []const u8 },
+    standings: struct { slug: []const u8 },
 };
 
 const KeyContext = struct {
@@ -100,6 +107,9 @@ const KeyContext = struct {
                 h.update(t.slug);
                 h.update(t.abbr);
             },
+            .standings => |s| {
+                h.update(s.slug);
+            },
         }
         return h.final();
     }
@@ -110,6 +120,7 @@ const KeyContext = struct {
             .board => |x| std.mem.eql(u8, x.slug, b.board.slug) and std.mem.eql(u8, x.day, b.board.day),
             .detail => |x| std.mem.eql(u8, x.slug, b.detail.slug) and std.mem.eql(u8, x.id, b.detail.id),
             .team => |x| std.mem.eql(u8, x.slug, b.team.slug) and std.mem.eql(u8, x.abbr, b.team.abbr),
+            .standings => |x| std.mem.eql(u8, x.slug, b.standings.slug),
         };
     }
 };
@@ -119,6 +130,7 @@ pub const Data = union(enum) {
     board: domain.Scoreboard,
     detail: core.detail.GameDetail,
     team: core.schedule.TeamView,
+    standings: core.standings.LeagueStandings,
 };
 
 pub const Outcome = enum { hit, miss, stale };
@@ -283,11 +295,42 @@ pub fn cloneTeamView(a: std.mem.Allocator, view: core.schedule.TeamView) !core.s
     };
 }
 
+pub fn cloneStandings(a: std.mem.Allocator, st: core.standings.LeagueStandings) !core.standings.LeagueStandings {
+    const groups = try a.alloc(core.standings.StandingGroup, st.groups.len);
+    for (st.groups, 0..) |group, i| {
+        const entries = try a.alloc(core.standings.StandingEntry, group.entries.len);
+        for (group.entries, 0..) |entry, j| {
+            entries[j] = .{
+                .team_id = try a.dupe(u8, entry.team_id),
+                .abbrev = try a.dupe(u8, entry.abbrev),
+                .name = try a.dupe(u8, entry.name),
+                .wins = try dupeOpt(a, entry.wins),
+                .losses = try dupeOpt(a, entry.losses),
+                .ties = try dupeOpt(a, entry.ties),
+                .points = try dupeOpt(a, entry.points),
+            };
+        }
+        groups[i] = .{
+            .name = try a.dupe(u8, group.name),
+            .entries = entries,
+        };
+    }
+    return .{
+        .schema_version = try a.dupe(u8, st.schema_version),
+        .league = try a.dupe(u8, st.league),
+        .league_name = try a.dupe(u8, st.league_name),
+        .season = try a.dupe(u8, st.season),
+        .groups = groups,
+        .source = try a.dupe(u8, st.source),
+    };
+}
+
 fn cloneData(a: std.mem.Allocator, data: Data) !Data {
     return switch (data) {
         .board => |b| .{ .board = try cloneScoreboard(a, b) },
         .detail => |d| .{ .detail = try cloneGameDetail(a, d) },
         .team => |t| .{ .team = try cloneTeamView(a, t) },
+        .standings => |s| .{ .standings = try cloneStandings(a, s) },
     };
 }
 
@@ -369,6 +412,9 @@ pub const NativeCache = struct {
                 .slug = try store.allocator().dupe(u8, t.slug),
                 .abbr = try store.allocator().dupe(u8, t.abbr),
             } },
+            .standings => |s| .{ .standings = .{
+                .slug = try store.allocator().dupe(u8, s.slug),
+            } },
         };
         const owned_data = try cloneData(store.allocator(), data);
         const entry = Entry{
@@ -403,8 +449,9 @@ pub const NativeCache = struct {
 
     /// Fresh hit returns `.hit`; a successful fetch stores and returns
     /// `.miss`; a failed fetch with a live stale entry returns `.stale`,
-    /// else the fetch error propagates. `GameNotFound`/`TeamNotFound`
-    /// bypass the stale path (a 404 is authoritative, never staleable).
+    /// else the fetch error propagates. `GameNotFound`/`TeamNotFound`/
+    /// `UnsupportedLeague` bypass the stale path (a 404 is authoritative,
+    /// never staleable).
     pub fn getOrFetch(
         cache: *NativeCache,
         arena: std.mem.Allocator,
@@ -415,7 +462,7 @@ pub const NativeCache = struct {
     ) !Cached {
         if (try cache.getFresh(arena, key, at)) |data| return .{ .data = data, .outcome = .hit };
         const data = fetch(ctx, arena) catch |err| {
-            if (err == error.GameNotFound or err == error.TeamNotFound) return err;
+            if (err == error.GameNotFound or err == error.TeamNotFound or err == error.UnsupportedLeague) return err;
             if (try cache.getStale(arena, key, at)) |stale| return .{ .data = stale, .outcome = .stale };
             return err;
         };
@@ -770,4 +817,55 @@ test "concurrent hammer stays consistent" {
     const hit = try cache.getFresh(check_arena.allocator(), board_key, 1_000_000);
     try std.testing.expect(hit != null);
     try std.testing.expectEqualStrings("5", hit.?.board.games[0].participants[1].score);
+}
+
+test "standings entries use the schedule windows and survive the cache" {
+    try std.testing.expectEqual(edge.schedule_fresh_ttl_s, freshTtl(.standings));
+    try std.testing.expectEqual(edge.schedule_stale_ttl_s, staleTtl(.standings));
+    var cache = testCache();
+    defer cache.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t0: i64 = 1_000_000;
+    const key: Key = .{ .standings = .{ .slug = "nhl" } };
+
+    const StandingsFake = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fail_err: anyerror = error.UpstreamResponse,
+        fn fetch(ctx: *anyopaque, a: std.mem.Allocator) anyerror!Data {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.fail) return self.fail_err;
+            return .{ .standings = try cloneStandings(a, .{
+                .league = "nhl",
+                .league_name = "NHL",
+                .season = "2026",
+                .source = "test",
+                .groups = &.{
+                    .{ .name = "Atlantic Division", .entries = &.{
+                        .{ .team_id = "6", .abbrev = "BOS", .name = "Boston Bruins", .wins = "38", .losses = "14", .points = "85" },
+                    } },
+                },
+            }) };
+        }
+    };
+    var fake = StandingsFake{};
+    const first = try cache.getOrFetch(arena, key, t0, &fake, StandingsFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, first.outcome);
+    const second = try cache.getOrFetch(arena, key, t0, &fake, StandingsFake.fetch);
+    try std.testing.expectEqual(Outcome.hit, second.outcome);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("BOS", second.data.standings.groups[0].entries[0].abbrev);
+    try std.testing.expectEqualStrings("85", second.data.standings.groups[0].entries[0].points.?);
+    // Stale serves on upstream failure; unsupported leagues never stale.
+    fake.fail = true;
+    const stale = try cache.getOrFetch(arena, key, t0 + edge.schedule_fresh_ttl_s, &fake, StandingsFake.fetch);
+    try std.testing.expectEqual(Outcome.stale, stale.outcome);
+    fake.fail_err = error.UnsupportedLeague;
+    try std.testing.expectError(
+        error.UnsupportedLeague,
+        cache.getOrFetch(arena, key, t0 + edge.schedule_fresh_ttl_s, &fake, StandingsFake.fetch),
+    );
 }

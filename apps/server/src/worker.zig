@@ -41,6 +41,7 @@ const render = @import("render.zig");
 const help = @import("help.zig");
 const detail_view = @import("detail_view.zig");
 const team_view = @import("team_view.zig");
+const standings_view = @import("standings_view.zig");
 const spec = @import("spec.zig");
 const provider = @import("provider.zig");
 const edge = @import("edge_cache.zig");
@@ -182,6 +183,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         },
         .game => |route| return serveDetail(env, alloc, route, format),
         .team => |route| return serveTeam(env, alloc, route, format),
+        .standings => |route| return serveStandings(env, alloc, route, format),
     }
 }
 
@@ -532,6 +534,51 @@ fn serveTeam(
     for_stale.setHeader("x-sprts-cache", "stale");
     cache.put(.{ .url = stale_key }, &for_stale);
     return resp;
+}
+
+/// League standings through one normalized `fetchStandings` per request,
+/// every format rendered from it. Deliberately uncached on the edge:
+/// `edge_cache.zig` is frozen for this task (no new bucketed namespace),
+/// so there is no stale fallback here — an upstream failure is a 502 and
+/// errors are never stored. The native server caches the same payload
+/// under its `standings` key with the schedule windows; edge bucketing is
+/// the follow-up alongside the spec entry. Unknown league slugs are 404;
+/// known leagues without an ESPN table (`error.UnsupportedLeague`) are
+/// 404 as well, never 502.
+fn serveStandings(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.StandingsRoute,
+    format: router.Format,
+) !workers.Response {
+    const color = route.color orelse try colorDefault(env);
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+
+    const table_data = provider.fetchStandings(adapter, alloc, league) catch |err| {
+        if (err == error.UnsupportedLeague) {
+            return errorResponse(alloc, "standings unavailable for this league; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN standings fetch failed for {s}", .{league.slug});
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const body = switch (format) {
+        .text => try standings_view.text(alloc, table_data, color, route.width, route.height),
+        .html => try standings_view.html(alloc, table_data, route.width, route.height),
+        .json => try standings_view.json(alloc, table_data),
+    };
+    return staticResponse(body, contentType(format), null);
 }
 
 fn errorResponse(

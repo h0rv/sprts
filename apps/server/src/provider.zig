@@ -1749,3 +1749,368 @@ test "fetchTeam still renders when the live board fetch fails" {
 const team_fixture_schedule_empty =
     \\{"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"events":[]}
 ;
+
+// ---- League standings (additive; existing fns above are untouched) ----
+//
+// ESPN serves current standings at `{base}/sports/{sport}/{league}/standings`
+// (same path convention as `buildScoreboardUrl`, hand-built here because the
+// generated client only exposes the soccer operation — `getSoccerStandings`
+// — so the portable `HttpTransport` seam carries every sport instead).
+//
+// Supported sports: football, basketball, baseball, hockey, soccer (resolved
+// through the same `endpointFor` sport/league keys as the scoreboard, so a
+// league without a mapping — or a mapped sport ESPN has no table for, such
+// as tennis, racing, MMA, golf — fails with `error.UnsupportedLeague`
+// without ever contacting upstream). The serve layer maps that to 404
+// ("standings unavailable for league"); a non-200 upstream is
+// `error.UpstreamResponse` (serve layer 502), mirroring the scoreboard.
+//
+// Response shape: every sport serves `children[]`; US team sports nest one
+// level (conference -> division) while soccer serves one flat level, so the
+// parser walks `children` recursively and collects every node carrying a
+// `standings.entries[]` block under that node's name. Entry stats are
+// name-looked-up (`wins`/`losses`/`ties`+`draws`/`points`+`pts`), preferring
+// `displayValue` with the numeric `value` as fallback, kept as display
+// text per `core.standings` (a missing stat is null, never zero).
+// `season` is the adapter-clock year: the endpoint is current-season only.
+
+/// Pure URL builder for the standings endpoint, mirroring
+/// `espn.buildScoreboardUrl`'s `{base}/sports/{sport}/{league}/...` shape.
+pub fn buildStandingsUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    sport: []const u8,
+    league: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/sports/{s}/{s}/standings", .{ base_url, sport, league });
+}
+
+fn standingsSupported(sport: []const u8) bool {
+    return std.mem.eql(u8, sport, "football") or
+        std.mem.eql(u8, sport, "basketball") or
+        std.mem.eql(u8, sport, "baseball") or
+        std.mem.eql(u8, sport, "hockey") or
+        std.mem.eql(u8, sport, "soccer");
+}
+
+pub fn fetchStandings(adapter: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League) !core.standings.LeagueStandings {
+    const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
+    if (!standingsSupported(endpoint.sport)) return error.UnsupportedLeague;
+    const url = try buildStandingsUrl(arena, adapter.base_url, endpoint.sport, endpoint.league);
+    const body = try adapterFetchUrl(adapter, arena, url);
+    const today = try adapter.today(arena);
+    return parseStandings(arena, league, today[0..4], body);
+}
+
+const StandingsResponse = struct {
+    children: []const StandingsNode = &.{},
+};
+
+const StandingsNode = struct {
+    name: []const u8 = "",
+    displayName: []const u8 = "",
+    abbreviation: []const u8 = "",
+    standings: ?StandingsBlock = null,
+    children: []const StandingsNode = &.{},
+};
+
+const StandingsBlock = struct {
+    entries: []const StandingsRawEntry = &.{},
+};
+
+const StandingsRawEntry = struct {
+    team: ?StandingsRawTeam = null,
+    stats: []const StandingsRawStat = &.{},
+};
+
+const StandingsRawTeam = struct {
+    id: []const u8 = "",
+    abbreviation: []const u8 = "?",
+    displayName: []const u8 = "Unknown",
+};
+
+const StandingsRawStat = struct {
+    name: []const u8 = "",
+    value: std.json.Value = .null,
+    displayValue: ?[]const u8 = null,
+};
+
+fn standingsStatText(arena: std.mem.Allocator, stats: []const StandingsRawStat, names: []const []const u8) !?[]const u8 {
+    for (stats) |stat| {
+        for (names) |wanted| {
+            if (!std.mem.eql(u8, stat.name, wanted)) continue;
+            if (stat.displayValue) |display| {
+                if (display.len > 0) return display;
+            }
+            if (try jsonText(arena, stat.value)) |rendered| {
+                if (rendered.len > 0) return rendered;
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+fn groupDisplayName(node: StandingsNode) []const u8 {
+    if (node.name.len > 0) return node.name;
+    if (node.displayName.len > 0) return node.displayName;
+    return node.abbreviation;
+}
+
+fn collectStandingsGroups(
+    arena: std.mem.Allocator,
+    nodes: []const StandingsNode,
+    out: *std.ArrayList(core.standings.StandingGroup),
+) !void {
+    for (nodes) |node| {
+        if (node.standings) |block| {
+            var entries: std.ArrayList(core.standings.StandingEntry) = .empty;
+            for (block.entries) |raw| {
+                const team = raw.team orelse continue;
+                try entries.append(arena, .{
+                    .team_id = team.id,
+                    .abbrev = team.abbreviation,
+                    .name = if (team.displayName.len > 0) team.displayName else "Unknown",
+                    .wins = try standingsStatText(arena, raw.stats, &.{"wins"}),
+                    .losses = try standingsStatText(arena, raw.stats, &.{"losses"}),
+                    .ties = try standingsStatText(arena, raw.stats, &.{ "ties", "draws" }),
+                    .points = try standingsStatText(arena, raw.stats, &.{ "points", "pts" }),
+                });
+            }
+            try out.append(arena, .{
+                .name = groupDisplayName(node),
+                .entries = try entries.toOwnedSlice(arena),
+            });
+        }
+        try collectStandingsGroups(arena, node.children, out);
+    }
+}
+
+pub fn parseStandings(
+    arena: std.mem.Allocator,
+    league: *const core.leagues.League,
+    season: []const u8,
+    body: []const u8,
+) !core.standings.LeagueStandings {
+    const response = try std.json.parseFromSliceLeaky(StandingsResponse, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    var groups: std.ArrayList(core.standings.StandingGroup) = .empty;
+    try collectStandingsGroups(arena, response.children, &groups);
+    return .{
+        .league = league.slug,
+        .league_name = league.name,
+        .season = try copy(arena, season),
+        .groups = try groups.toOwnedSlice(arena),
+        .source = "site.api.espn.com",
+    };
+}
+
+const StandingsFake = struct {
+    seen_url: ?[]const u8 = null,
+    body: []const u8,
+    status: std.http.Status = .ok,
+
+    fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
+        _ = extra_headers;
+        const self: *StandingsFake = @ptrCast(@alignCast(ptr));
+        self.seen_url = try arena.dupe(u8, url);
+        return .{ .status = self.status, .body = try arena.dupe(u8, self.body) };
+    }
+
+    fn asTransport(self: *StandingsFake) espn.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+fn standingsTestAdapter(fake: *StandingsFake) EspnAdapter {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    return .{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+}
+
+test "standings URLs follow the scoreboard path convention per sport" {
+    const cases = [_]struct { slug: []const u8, want: []const u8 }{
+        .{ .slug = "nfl", .want = "https://example.test/base/sports/football/nfl/standings" },
+        .{ .slug = "nba", .want = "https://example.test/base/sports/basketball/nba/standings" },
+        .{ .slug = "mlb", .want = "https://example.test/base/sports/baseball/mlb/standings" },
+        .{ .slug = "nhl", .want = "https://example.test/base/sports/hockey/nhl/standings" },
+        .{ .slug = "epl", .want = "https://example.test/base/sports/soccer/eng.1/standings" },
+        .{ .slug = "mls", .want = "https://example.test/base/sports/soccer/usa.1/standings" },
+    };
+    for (cases) |c| {
+        var fake = StandingsFake{ .body = "{\"children\":[]}" };
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find(c.slug).?);
+        try std.testing.expectEqualStrings(c.want, fake.seen_url.?);
+        try std.testing.expectEqualStrings(c.slug, standings.league);
+        try std.testing.expectEqualStrings("2026", standings.season);
+    }
+}
+
+test "fetchStandings rejects sports without an ESPN table" {
+    for ([_][]const u8{ "atp", "wta", "f1", "ufc", "pga" }) |slug| {
+        var fake = StandingsFake{ .body = "{\"children\":[]}" };
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        try std.testing.expectError(
+            error.UnsupportedLeague,
+            fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find(slug).?),
+        );
+        // Rejected before any upstream contact.
+        try std.testing.expect(fake.seen_url == null);
+    }
+}
+
+test "fetchStandings maps a non-200 upstream to UpstreamResponse" {
+    var fake = StandingsFake{ .body = "{}", .status = .bad_gateway };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.UpstreamResponse,
+        fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?),
+    );
+}
+
+const standings_nfl_fixture =
+    \\{"children":[
+    \\{"name":"AFC","abbreviation":"AFC","children":[
+    \\{"name":"AFC East","abbreviation":"AFCE","standings":{"entries":[
+    \\{"team":{"id":"2","abbreviation":"BUF","displayName":"Buffalo Bills"},"stats":[{"name":"wins","value":11,"displayValue":"11"},{"name":"losses","value":3,"displayValue":"3"},{"name":"ties","value":1,"displayValue":"1"}]},
+    \\{"team":{"id":"15","abbreviation":"MIA","displayName":"Miami Dolphins"},"stats":[{"name":"wins","value":7,"displayValue":"7"},{"name":"losses","value":7,"displayValue":"7"},{"name":"ties","value":0,"displayValue":"0"}]}
+    \\]}},
+    \\{"name":"AFC West","abbreviation":"AFCW","standings":{"entries":[
+    \\{"team":{"id":"12","abbreviation":"KC","displayName":"Kansas City Chiefs"},"stats":[{"name":"wins","value":12,"displayValue":"12"},{"name":"losses","value":2,"displayValue":"2"}]}
+    \\]}}
+    \\]},
+    \\{"name":"NFC","abbreviation":"NFC","children":[
+    \\{"name":"NFC North","abbreviation":"NFCN","standings":{"entries":[
+    \\{"team":{"id":"22","abbreviation":"DET","displayName":"Detroit Lions"},"stats":[{"name":"wins","value":10,"displayValue":"10"},{"name":"losses","value":4,"displayValue":"4"}]}
+    \\]}}
+    \\]}
+    \\]}
+;
+
+test "standings parse the nested football shape with ties" {
+    var fake = StandingsFake{ .body = standings_nfl_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nfl").?);
+    try std.testing.expectEqual(@as(usize, 3), standings.groups.len);
+    try std.testing.expectEqualStrings("AFC East", standings.groups[0].name);
+    try std.testing.expectEqual(@as(usize, 2), standings.groups[0].entries.len);
+    const buf = standings.groups[0].entries[0];
+    try std.testing.expectEqualStrings("BUF", buf.abbrev);
+    try std.testing.expectEqualStrings("Buffalo Bills", buf.name);
+    try std.testing.expectEqualStrings("11", buf.wins.?);
+    try std.testing.expectEqualStrings("3", buf.losses.?);
+    try std.testing.expectEqualStrings("1", buf.ties.?);
+    // Football carries no points column.
+    try std.testing.expect(buf.points == null);
+    // Conference nodes without a block contribute no group of their own.
+    try std.testing.expectEqualStrings("AFC West", standings.groups[1].name);
+    try std.testing.expectEqualStrings("NFC North", standings.groups[2].name);
+}
+
+const standings_nba_fixture =
+    \\{"children":[
+    \\{"name":"Eastern Conference","displayName":"Eastern Conference","children":[
+    \\{"name":"Atlantic","standings":{"entries":[
+    \\{"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"},"stats":[{"name":"wins","value":45,"displayValue":"45"},{"name":"losses","value":12,"displayValue":"12"}]}
+    \\]}}
+    \\]},
+    \\{"name":"Western Conference","children":[
+    \\{"name":"Pacific","standings":{"entries":[
+    \\{"team":{"id":"14","abbreviation":"LAL","displayName":"Los Angeles Lakers"},"stats":[{"name":"wins","value":33,"displayValue":"33"},{"name":"losses","value":24,"displayValue":"24"}]}
+    \\]}}
+    \\]}
+    \\]}
+;
+
+test "standings parse the nested basketball shape" {
+    var fake = StandingsFake{ .body = standings_nba_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nba").?);
+    try std.testing.expectEqual(@as(usize, 2), standings.groups.len);
+    try std.testing.expectEqualStrings("Atlantic", standings.groups[0].name);
+    try std.testing.expectEqualStrings("BOS", standings.groups[0].entries[0].abbrev);
+    try std.testing.expectEqualStrings("45", standings.groups[0].entries[0].wins.?);
+    try std.testing.expect(standings.groups[0].entries[0].ties == null);
+    try std.testing.expectEqualStrings("Pacific", standings.groups[1].name);
+}
+
+const standings_mlb_fixture =
+    \\{"children":[
+    \\{"name":"American League","children":[
+    \\{"name":"AL East","standings":{"entries":[
+    \\{"team":{"id":"19","abbreviation":"NYY","displayName":"New York Yankees"},"stats":[{"name":"wins","value":80},{"name":"losses","value":63}]},
+    \\{"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"stats":[{"name":"wins","value":80,"displayValue":"80"},{"name":"losses","value":63,"displayValue":"63"}]}
+    \\]}}
+    \\]}
+    \\]}
+;
+
+test "standings fall back to numeric values without displayValue" {
+    var fake = StandingsFake{ .body = standings_mlb_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?);
+    try std.testing.expectEqual(@as(usize, 1), standings.groups.len);
+    try std.testing.expectEqualStrings("AL East", standings.groups[0].name);
+    // Bare numerics still render as text.
+    try std.testing.expectEqualStrings("80", standings.groups[0].entries[0].wins.?);
+    try std.testing.expectEqualStrings("63", standings.groups[0].entries[0].losses.?);
+    try std.testing.expectEqualStrings("PHI", standings.groups[0].entries[1].abbrev);
+}
+
+const standings_nhl_fixture =
+    \\{"children":[
+    \\{"name":"Eastern Conference","children":[
+    \\{"name":"Atlantic Division","standings":{"entries":[
+    \\{"team":{"id":"6","abbreviation":"BOS","displayName":"Boston Bruins"},"stats":[{"name":"wins","value":38,"displayValue":"38"},{"name":"losses","value":14,"displayValue":"14"},{"name":"ties","value":9,"displayValue":"9"},{"name":"points","value":85,"displayValue":"85"}]}
+    \\]}}
+    \\]}
+    \\]}
+;
+
+test "standings parse the hockey shape with points" {
+    var fake = StandingsFake{ .body = standings_nhl_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nhl").?);
+    try std.testing.expectEqual(@as(usize, 1), standings.groups.len);
+    try std.testing.expectEqualStrings("Atlantic Division", standings.groups[0].name);
+    const bos = standings.groups[0].entries[0];
+    try std.testing.expectEqualStrings("85", bos.points.?);
+    try std.testing.expectEqualStrings("38", bos.wins.?);
+}
+
+const standings_soccer_fixture =
+    \\{"id":"eng.1","name":"English Premier League","abbreviation":"EPL","children":[
+    \\{"id":"eng.1","name":"English Premier League","abbreviation":"EPL","standings":{"entries":[
+    \\{"team":{"id":"360","abbreviation":"ARS","displayName":"Arsenal"},"stats":[{"name":"wins","value":18,"displayValue":"18"},{"name":"losses","value":3,"displayValue":"3"},{"name":"draws","value":5,"displayValue":"5"},{"name":"points","value":59,"displayValue":"59"}]},
+    \\{"team":{"id":"359","abbreviation":"MCI","displayName":"Manchester City"},"stats":[{"name":"wins","value":17,"displayValue":"17"},{"name":"losses","value":4,"displayValue":"4"},{"name":"draws","value":5,"displayValue":"5"},{"name":"points","value":56,"displayValue":"56"}]}
+    \\]}}
+    \\]}
+;
+
+test "standings parse the flat soccer shape with draws and points" {
+    var fake = StandingsFake{ .body = standings_soccer_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("epl").?);
+    try std.testing.expectEqual(@as(usize, 1), standings.groups.len);
+    try std.testing.expectEqualStrings("English Premier League", standings.groups[0].name);
+    const ars = standings.groups[0].entries[0];
+    try std.testing.expectEqualStrings("ARS", ars.abbrev);
+    try std.testing.expectEqualStrings("5", ars.ties.?);
+    try std.testing.expectEqualStrings("59", ars.points.?);
+}
