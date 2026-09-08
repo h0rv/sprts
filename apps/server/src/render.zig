@@ -78,6 +78,14 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
         for (game.participants) |participant| {
             try table.participantRow(participant);
         }
+        // Plain-text pointer to the game view; the HTML renderer turns
+        // the status row into a real link instead (see scoreHtml).
+        const game_link = try std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{
+            board.league, game.id, board.league,
+            if (game.participants.len > 0) game.participants[0].abbreviation else "",
+        });
+        defer allocator.free(game_link);
+        try table.row(game_link, "2");
     }
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
@@ -611,13 +619,16 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
 /// Minimal browser page: the same table as text, never ANSI, with real
 /// links. Browsers cannot use terminal escapes, so HTML output is always
 /// uncolored and the text renderer stays the single source of layout.
+/// Minimal browser page: the same detail table as text, never ANSI, with
+/// real per-game and per-team links. The plain-text body carries
+/// `game: /{league}/{id}` pointer rows (see `text`); here each game block
+/// is wrapped in links instead: the status line links to the game view.
+/// and each participant row links to its team view. Links cannot nest in
+/// HTML, so the body is rendered game by game with the linkable rows
+/// emitted as separate anchored lines around the shared table renderer.
 pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16) ![]u8 {
-    const body = try text(allocator, board, false, width, height);
-    defer allocator.free(body);
-    const previous = try dates.shift(allocator, board.date, -1);
-    defer allocator.free(previous);
-    const next = try dates.shift(allocator, board.date, 1);
-    defer allocator.free(next);
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const shown: usize = @min(height orelse board.games.len, board.games.len);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -625,13 +636,115 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
     defer allocator.free(title);
     try pageHead(w, title);
     try w.writeAll("<pre>");
-    try escapeInto(w, body);
-    try w.writeAll("</pre><nav>");
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
+    defer allocator.free(heading);
+    try writeHtmlTable(allocator, heading, null, inner, w, null);
+    if (board.games.len == 0) {
+        try writeHtmlTable(allocator, "No games scheduled.", null, inner, w, null);
+    }
+    for (board.games[0..shown]) |game| {
+        // Status row links to the game view.
+        const status_link = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ board.league, game.id });
+        defer allocator.free(status_link);
+        try writeHtmlTable(allocator, game.status, statusColor(game.state), inner, w, status_link);
+        // Participant rows link to their team views.
+        for (game.participants) |participant| {
+            const team_link = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ board.league, participant.abbreviation });
+            defer allocator.free(team_link);
+            const row = try participantText(allocator, participant, inner);
+            defer allocator.free(row);
+            try writeHtmlTable(allocator, row, if (participant.winner) "32" else null, inner, w, team_link);
+        }
+        if (game.participants.len == 0 and game.name.len > 0) {
+            try writeHtmlTable(allocator, game.name, null, inner, w, null);
+        }
+    }
+    if (shown < board.games.len) {
+        const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
+        defer allocator.free(more);
+        try writeHtmlTable(allocator, more, "2", inner, w, null);
+    }
+    try w.writeAll("</pre>");
+    const previous = try dates.shift(allocator, board.date, -1);
+    defer allocator.free(previous);
+    const next = try dates.shift(allocator, board.date, 1);
+    defer allocator.free(next);
+    try w.writeAll("<nav>");
     try w.print("<a href=\"/{s}?date={s}\">earlier</a>", .{ board.league, previous });
     try w.print("<a href=\"/{s}\">today</a>", .{board.league});
     try w.print("<a href=\"/{s}?date={s}\">later</a>", .{ board.league, next });
     try w.print("<a href=\"/api/v1/{s}?date={s}\">json</a>", .{ board.league, board.date });
     try w.writeAll("</nav></main></body></html>");
+    return out.toOwnedSlice();
+}
+
+/// One table row as HTML: `│ <a href>cell</a> │` with the cell padded to
+/// `inner - 2` columns and escaped. Either link may be null for a plain
+/// row. Cell content is escaped so status text like `Final <OT>` cannot
+/// break the page.
+fn writeHtmlTable(allocator: std.mem.Allocator, s: []const u8, code: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
+    _ = code;
+    try w.writeAll("│ ");
+    if (link) |href| {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, inner - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    try escapeCellInto(w, padded);
+    if (link != null) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
+/// box-safe bytes through untouched.
+fn escapeCellInto(w: *std.Io.Writer, cell: []const u8) !void {
+    for (cell) |byte| switch (byte) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(byte),
+    };
+}
+
+/// Plain-text participant row content, shared by the HTML linker above.
+/// Mirrors `Table.participantRow` layout without ANSI or borders.
+fn participantText(allocator: std.mem.Allocator, participant: domain.Participant, inner: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const suffix_len: usize = if (participant.record) |record|
+        2 + countCells(record) + 1
+    else
+        0;
+    var name_width: usize = undefined;
+    if (participant.abbreviation.len > 0) {
+        try writeCell(w, participant.abbreviation, 4, null, false);
+        try w.writeByte(' ');
+        name_width = inner - 2 - 12;
+    } else {
+        name_width = inner - 2 - 7;
+    }
+    name_width = name_width -| suffix_len;
+    try writeCell(w, participant.name, name_width, null, false);
+    try w.writeByte(' ');
+    try writeCellRight(w, participant.score, 4, null, false);
+    if (participant.record) |record| {
+        try w.writeAll(" (");
+        try w.writeAll(record);
+        try w.writeByte(')');
+    }
+    if (participant.winner) {
+        try w.writeAll(" ✓");
+    } else {
+        try w.writeAll("  ");
+    }
     return out.toOwnedSlice();
 }
 
@@ -856,6 +969,11 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Per-game and per-team links: status links to the game view, each
+    // participant row links to its team view.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">") != null);
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);

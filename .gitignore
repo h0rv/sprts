@@ -2,6 +2,7 @@
 zig-out/
 zig-pkg/
 apps/server/zig-pkg/
+.worktrees/
 .env
 node_modules/
 .wrangler/
