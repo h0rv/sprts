@@ -292,9 +292,79 @@ pub const Table = struct {
 /// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
 /// byte-based slicing would split glyphs and break the rules. Pads by
 /// visible cells; the tool guarantees single-cell glyphs.
+
+/// RGB for an xterm-256 index: indices 16-231 are the 6x6x6 cube over
+/// (0,95,135,175,215,255), 232-255 the grayscale ramp. Indices 0-15 are
+/// terminal-themed; marks never use them, and they read as dark here so
+/// they get filtered.
+fn xtermRgb(idx: u8) [3]u16 {
+    if (idx >= 232) {
+        const v: u16 = 8 + 10 * @as(u16, idx - 232);
+        return .{ v, v, v };
+    }
+    if (idx >= 16) {
+        const levels = [_]u16{ 0, 95, 135, 175, 215, 255 };
+        const k: usize = idx - 16;
+        return .{ levels[k / 36], levels[(k / 6) % 6], levels[k % 6] };
+    }
+    return .{ 0, 0, 0 };
+}
+
+/// True when an xterm color is too dark to read on a dark terminal
+/// background (gruvbox-dark and friends): near-black logo ink rendered
+/// in SGR black is invisible, while the terminal foreground (mono mark)
+/// always reads. Threshold is relative luminance below ~48/255.
+fn isDarkXterm(idx: u8) bool {
+    const rgb = xtermRgb(idx);
+    // Rec. 709 luma, integer math: 2126*R + 7152*G + 722*B < 48*10000.
+    const luma = 2126 * @as(u32, rgb[0]) + 7152 * @as(u32, rgb[1]) + 722 * @as(u32, rgb[2]);
+    return luma < 480000;
+}
+
+/// Copy a (possibly colored) mark line, dropping SGR `38;5;N` runs whose
+/// palette index is unreadably dark and keeping the glyphs. Other runs
+/// (resets) pass through so open spans still close. Keeps logo ink
+/// visible on dark terminals without regenerating the data files.
+fn writeContrastLine(w: *std.Io.Writer, line: []const u8) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and line[j] != 'm') : (j += 1) {}
+            if (j >= line.len) return;
+            const seq = line[i .. j + 1];
+            if (parseXtermIndex(seq)) |idx| {
+                if (!isDarkXterm(idx)) try w.writeAll(seq);
+            } else {
+                try w.writeAll(seq);
+            }
+            i = j + 1;
+            continue;
+        }
+        try w.writeByte(line[i]);
+        i += 1;
+    }
+}
+
+/// Parse `ESC[38;5;Nm` into N. Null for resets and anything else.
+fn parseXtermIndex(seq: []const u8) ?u8 {
+    const prefix = "\x1b[38;5;";
+    if (seq.len <= prefix.len or !std.mem.startsWith(u8, seq, prefix)) return null;
+    if (seq[seq.len - 1] != 'm') return null;
+    const digits = seq[prefix.len .. seq.len - 1];
+    if (digits.len == 0 or digits.len > 3) return null;
+    var n: u16 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n > 255) return null;
+    return @intCast(n);
+}
+
 pub fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     try w.writeAll("│ ");
-    try w.writeAll(line);
+    try writeContrastLine(w, line);
     var i: usize = countCells(line);
     while (i < inner - 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
@@ -839,4 +909,20 @@ test "hardened battery: interior blank mark rows survive the card" { // MLS ATX 
         }
     }
     try std.testing.expect(blank_inside);
+}
+
+test "dark logo ink is filtered for terminal contrast" {
+    // Near-black (xterm 16) is dropped, readable red kept, resets pass
+    // through so spans still close.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeContrastLine(&out.writer, "\x1b[38;5;16m██\x1b[0m \x1b[38;5;196m██\x1b[0m");
+    const got = try out.toOwnedSlice();
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("██\x1b[0m \x1b[38;5;196m██\x1b[0m", got);
+    try std.testing.expect(isDarkXterm(16));
+    try std.testing.expect(!isDarkXterm(196));
+    try std.testing.expect(!isDarkXterm(226));
+    try std.testing.expectEqual(@as(?u8, 196), parseXtermIndex("\x1b[38;5;196m"));
+    try std.testing.expect(parseXtermIndex("\x1b[0m") == null);
 }

@@ -10,9 +10,10 @@ const render = @import("render.zig");
 const router = @import("router.zig");
 const table = @import("table.zig");
 
-/// Text view: header (name, record, standing), LIVE row when present, last
-/// result, then the next games capped by `height` (null/0 = all, but at
-/// least the first so the box never renders an empty body section).
+/// Text view: logo mark, header (name, record, standing), LIVE row when
+/// present, last results (up to 5), then the next games (up to 5). `height`
+/// caps the next tail (`+N more`); last games always show all five so the
+/// recent form reads at a glance. Empty when nothing is scheduled.
 pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16) ![]u8 {
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     const upcoming = view.next[0..@min(view.next.len, height orelse view.next.len)];
@@ -20,6 +21,19 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
     errdefer out.deinit();
     const w = &out.writer;
     try table.writeRule(w, .top, inner);
+    // Team logo mark above the header when the generator has one.
+    if (core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark| {
+        const use_mark = if (color)
+            core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse mark
+        else
+            mark;
+        var lines = std.mem.splitScalar(u8, use_mark, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try table.writeArtRow(w, line, inner);
+        }
+        try table.writeRule(w, .mid, inner);
+    }
     {
         const header = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
         defer allocator.free(header);
@@ -42,20 +56,20 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         defer allocator.free(live_line);
         try table.writeRow(w, live_line, inner - 2, "1;31", color);
     }
-    if (view.last) |last| {
+    if (view.last.len > 0) {
         try table.writeRule(w, .mid, inner);
-        const last_head = try std.fmt.allocPrint(allocator, "Last: {s}", .{last.result});
-        defer allocator.free(last_head);
-        try table.writeRow(w, last_head, inner - 2, null, color);
-        const last_line = try gameLine(allocator, last);
-        defer allocator.free(last_line);
-        try table.writeRow(w, last_line, inner - 2, "2", color);
+        try table.writeRow(w, "Last 5:", inner - 2, null, color);
+        for (view.last) |game| {
+            const line = try gameLineFull(allocator, view.league, game);
+            defer allocator.free(line);
+            try table.writeRow(w, line, inner - 2, null, color);
+        }
     }
     if (upcoming.len > 0) {
         try table.writeRule(w, .mid, inner);
-        try table.writeRow(w, "Next:", inner - 2, null, color);
+        try table.writeRow(w, "Next 5:", inner - 2, null, color);
         for (upcoming) |game| {
-            const next_line = try gameLine(allocator, game);
+            const next_line = try gameLineFull(allocator, view.league, game);
             defer allocator.free(next_line);
             try table.writeRow(w, next_line, inner - 2, null, color);
             if (game.probable.len > 0) {
@@ -70,7 +84,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
             try table.writeRule(w, .mid, inner);
             try table.writeRow(w, more, inner - 2, "2", color);
         }
-    } else if (view.last == null and view.live == null) {
+    } else if (view.last.len == 0 and view.live == null) {
         try table.writeRule(w, .mid, inner);
         try table.writeRow(w, "No games scheduled.", inner - 2, null, color);
     }
@@ -90,11 +104,24 @@ fn gameLine(allocator: std.mem.Allocator, game: schedule.GameRef) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ date, versus, game.opponent_abbrev, game.result });
 }
 
-/// HTML view: same text table, never ANSI, with links. Mirrors the
-/// scoreboard HTML approach: text renderer is the single source of layout.
+/// Schedule line with a game pointer for linking: the base `gameLine`
+/// plus `  /{league}/{id}` so terminals can jump to the game view.
+/// HTML callers link the row instead (see `teamScheduleHtml`).
+fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, game: schedule.GameRef) ![]u8 {
+    const base = try gameLine(allocator, game);
+    defer allocator.free(base);
+    if (game.id.len == 0) return allocator.dupe(u8, base);
+    return std.fmt.allocPrint(allocator, "{s}  /{s}/{s}", .{ base, league, game.id });
+}
+
+/// HTML view: same sections as text (logo, header, live, last 5, next 5),
+/// never ANSI, with links. Schedule rows link to their game views; the
+/// nav mirrors the scoreboard pages. Logo marks render as plain braille
+/// (no SGR in HTML): `renderText(mono)` body is only the fallback for
+/// sections this builder does not re-emit.
 pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_slug: []const u8, width: ?u16, height: ?u16) ![]u8 {
-    const body = try renderText(allocator, view, false, width, height);
-    defer allocator.free(body);
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const upcoming = view.next[0..@min(view.next.len, height orelse view.next.len)];
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -102,12 +129,111 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
     defer allocator.free(title);
     try render.pageHead(w, title);
     try w.writeAll("<pre>");
-    try render.escapeInto(w, body);
+    try render.writeRule(w, .top, inner);
+    if (core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark| {
+        var lines = std.mem.splitScalar(u8, mark, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try render.writeArtRow(w, line, inner);
+        }
+        try render.writeRule(w, .mid, inner);
+    }
+    {
+        const header = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
+        defer allocator.free(header);
+        try writeHtmlCell(allocator, header, null, inner, w);
+    }
+    if (view.team.record_summary) |record| {
+        const line = if (view.team.standing_summary) |standing|
+            try std.fmt.allocPrint(allocator, "{s}  {s}", .{ record, standing })
+        else
+            try std.fmt.allocPrint(allocator, "{s}", .{record});
+        defer allocator.free(line);
+        try writeHtmlCell(allocator, line, "dim", inner, w);
+    } else if (view.team.standing_summary) |standing| {
+        try writeHtmlCell(allocator, standing, "dim", inner, w);
+    }
+    if (view.live) |live| {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "LIVE NOW", "live", inner, w);
+        try teamGameHtml(allocator, w, league_slug, live, "live", inner);
+    }
+    if (view.last.len > 0) {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "Last 5:", null, inner, w);
+        for (view.last) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
+    }
+    if (upcoming.len > 0) {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "Next 5:", null, inner, w);
+        for (upcoming) |game| {
+            try teamGameHtml(allocator, w, league_slug, game, null, inner);
+            if (game.probable.len > 0) {
+                const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
+                defer allocator.free(line);
+                try writeHtmlCell(allocator, line, "dim", inner, w);
+            }
+        }
+        if (upcoming.len < view.next.len) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
+            defer allocator.free(more);
+            try render.writeRule(w, .mid, inner);
+            try writeHtmlCell(allocator, more, "dim", inner, w);
+        }
+    } else if (view.last.len == 0 and view.live == null) {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "No games scheduled.", null, inner, w);
+    }
+    try render.writeRule(w, .bottom, inner);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}\">scores</a>", .{league_slug});
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ league_slug, view.team.abbrev });
     try w.writeAll("</nav></main></body></html>");
     return out.toOwnedSlice();
+}
+
+/// One schedule row as HTML: `│ <a>line</a> │` linking to the game view.
+/// Empty ids (should not happen; the provider always sets one) render
+/// as a plain row rather than a dead link.
+fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, game: schedule.GameRef, css: ?[]const u8, inner: usize) !void {
+    const line = try gameLine(allocator, game);
+    defer allocator.free(line);
+    try w.writeAll("│ ");
+    if (game.id.len > 0) {
+        try w.print("<a href=\"/{s}/{s}\">", .{ league, game.id });
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try render.writeCell(&cell.writer, line, inner - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    try render.escapeInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
+    if (game.id.len > 0) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// Padded + escaped cell with optional color span, no borders or link.
+fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer) !void {
+    try w.writeAll("│ ");
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try render.writeCell(&cell.writer, s, inner - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    try render.escapeInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
+    try w.writeAll(" │\n");
 }
 
 /// JSON view. Validated through the shared `render.validatedJson` gate —
@@ -130,7 +256,7 @@ fn testView() schedule.TeamView {
             .record_summary = "80-63",
             .standing_summary = "2nd in NL East",
         },
-        .last = .{
+        .last = &.{.{
             .id = "401814694",
             .date = "2026-09-05T23:10Z",
             .opponent_abbrev = "NYM",
@@ -141,7 +267,7 @@ fn testView() schedule.TeamView {
             .our_score = "5",
             .opp_score = "3",
             .result = "W 5-3",
-        },
+        }},
         .next = &.{
             .{
                 .id = "live1",
@@ -188,7 +314,9 @@ test "team text shows header, live, last, and next with probables" {
     try std.testing.expect(std.mem.indexOf(u8, output, "2nd in NL East") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "LIVE NOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "3-2 Top 7th") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Last: W 5-3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Last 5:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "W 5-3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/401814694") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Probable: Jesus Luzardo") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
     _ = try std.unicode.Utf8View.init(output);
@@ -225,7 +353,12 @@ test "team HTML links and never carries ANSI" {
     const page = try teamHtml(std.testing.allocator, testView(), "mlb", null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/scores\">") == null);
+    // Schedule rows link to their game views; both last and next shown.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/live1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Last 5:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Next 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/PHI\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 

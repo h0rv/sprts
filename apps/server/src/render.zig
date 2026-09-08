@@ -93,6 +93,16 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
         for (game.participants) |participant| {
             try t.participantRow(participant);
         }
+        // Plain-text pointer to the game view; the HTML renderer turns
+        // the status row into a real link instead (see scoreHtml).
+        {
+            const game_link = try std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{
+                board.league, game.id, board.league,
+                if (game.participants.len > 0) game.participants[0].abbreviation else "",
+            });
+            defer allocator.free(game_link);
+            try t.row(game_link, "2");
+        }
     }
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
@@ -252,9 +262,11 @@ fn gameIsLive(game: domain.Game) bool {
     return std.mem.eql(u8, game.state, "in");
 }
 
-/// Live games first, then the rest of today, then idle leagues as links.
-/// Leagues with no board (fetch failed) count as idle: the page never
-/// fails because of one league.
+/// Live games first, then one section per league with games today
+/// (league header links to the league page in HTML), then idle leagues
+/// as links. Leagues with no board (fetch failed) count as idle: the
+/// page never fails because of one league. A blank spacer row separates
+/// each section so dense days stay scannable.
 fn homeSections(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -264,7 +276,6 @@ fn homeSections(
     day: []const u8,
 ) !void {
     var live = false;
-    var today = false;
     for (boards) |result| {
         const board = result.board orelse continue;
         for (board.games) |game| {
@@ -272,30 +283,52 @@ fn homeSections(
                 if (!live) {
                     live = true;
                     try writeRule(w, .mid, default_inner_width);
-                    try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color and !html);
+                    if (html) {
+                        try writeHtmlRow(allocator, "LIVE NOW", "live", default_inner_width, w, null);
+                    } else {
+                        try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color);
+                    }
                 }
-                try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+                try homeGameLine(allocator, w, result.league, game, color and !html, html);
             }
         }
     }
+    var first_section = true;
     for (boards) |result| {
         const board = result.board orelse continue;
-        var shown = false;
+        var has_today = false;
+        for (board.games) |game| {
+            if (!gameIsLive(game)) {
+                has_today = true;
+                break;
+            }
+        }
+        if (!has_today) continue;
+        if (!first_section) try spacerRow(w);
+        try writeRule(w, .mid, default_inner_width);
+        // League header: whole line links to the league page in HTML.
+        const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, day });
+        defer allocator.free(header);
+        if (html) {
+            const href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ result.league.slug, day });
+            defer allocator.free(href);
+            try writeHtmlRow(allocator, header, "dim", default_inner_width, w, href);
+        } else {
+            try writeRow(w, header, default_inner_width - 2, "2", color);
+        }
         for (board.games) |game| {
             if (gameIsLive(game)) continue;
-            if (!shown) {
-                if (!today) {
-                    today = true;
-                    try writeRule(w, .mid, default_inner_width);
-                    try writeRow(w, "TODAY", default_inner_width - 2, "2", color and !html);
-                }
-                shown = true;
-            }
-            try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+            try homeGameLine(allocator, w, result.league, game, color and !html, html);
         }
+        first_section = false;
     }
+    if (!first_section) try spacerRow(w);
     try writeRule(w, .mid, default_inner_width);
-    try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color and !html);
+    if (html) {
+        try writeHtmlRow(allocator, "ALL LEAGUES", "dim", default_inner_width, w, null);
+    } else {
+        try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color);
+    }
     for (boards) |result| {
         const board = result.board;
         if (board != null and board.?.games.len > 0) continue;
@@ -309,23 +342,146 @@ fn homeSections(
     }
 }
 
+/// A blank spacer row: `│` borders with nothing between, so sections
+/// breathe without breaking the table frame. Callers place one between
+/// sections, never after the last line before a rule.
+fn spacerRow(w: *std.Io.Writer) !void {
+    try w.writeAll("│ ");
+    var i: usize = 0;
+    while (i < default_inner_width - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(" │\n");
+}
+
+/// Padded + escaped cell with optional color span, without borders or
+/// link. Shared by home game lines; keeps the span inside the anchor so
+/// the whole row stays one link.
+fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, w: *std.Io.Writer) !void {
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, default_inner_width - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    try escapeCellInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
+}
+
+/// Section header row for the HTML home renderer (league names, LIVE
+/// NOW, ALL LEAGUES): padded cell with optional span and link.
+fn writeHtmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
+    _ = inner;
+    try w.writeAll("│ ");
+    if (link) |href| {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    try writeHtmlCell(allocator, s, css, w);
+    if (link != null) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// HTML home game line: the whole row is one link to the game view,
+/// with the live/upcoming color span inside it.
+fn writeHtmlGameLine(allocator: std.mem.Allocator, line: []const u8, game: domain.Game, w: *std.Io.Writer, href: []const u8) !void {
+    try w.writeAll("│ ");
+    try w.writeAll("<a href=\"");
+    try escapeInto(w, href);
+    try w.writeAll("\">");
+    try writeHtmlCell(allocator, line, stateClass(game.state), w);
+    try w.writeAll("</a> │\n");
+}
+
 fn homeGameLine(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     league: *const leagues.League,
     game: domain.Game,
-    day: []const u8,
     color: bool,
     html: bool,
 ) !void {
     const line = try gameLine(allocator, league, game) orelse return;
     defer allocator.free(line);
+    if (html) {
+        // Whole line links to the game view; per-team spans link each
+        // side to its team page, matching the scoreboard's granular
+        // links. The status word carries the live/upcoming color span.
+        const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, game.id });
+        defer allocator.free(href);
+        try writeHtmlHomeGameLine(allocator, line, league, game, w, href);
+        return;
+    }
     try w.writeAll("│ ");
-    if (html) try w.print("<a href=\"/{s}?date={s}\">", .{ league.slug, day });
     try writeCell(w, line, 48, statusColor(game.state), color);
-    if (html) try w.writeAll("</a>");
     try w.writeAll(" │\n");
 }
+
+/// HTML home game line: `│ <a game>line with <a team>abbr</a> spans</a> │`.
+/// The whole row links to the game view; each participant abbreviation
+/// additionally links to its team page. The status word carries the
+/// live/upcoming color span. Padding reuses writeHtmlCell so the frame
+/// aligns with the text renderer.
+fn writeHtmlHomeGameLine(allocator: std.mem.Allocator, line: []const u8, league: *const leagues.League, game: domain.Game, w: *std.Io.Writer, href: []const u8) !void {
+    try w.writeAll("│ ");
+    try w.writeAll("<a href=\"");
+    try escapeInto(w, href);
+    try w.writeAll("\">");
+    try writeLinkedGameCell(allocator, line, league, game, w);
+    try w.writeAll("</a> │\n");
+}
+
+/// Cell content for a home game line: the status word wrapped in its
+/// color span, each participant abbreviation wrapped in a team link.
+/// Abbreviations are matched positionally (away first, then home) so a
+/// truncated name can never steal another team's link. Unmatched tails
+/// (padding, scores, status) escape through verbatim.
+fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *const leagues.League, game: domain.Game, w: *std.Io.Writer) !void {
+    const css = stateClass(game.state);
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    // Collect the padded cell first so link offsets stay aligned.
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, line, default_inner_width - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    var cursor: usize = 0;
+    if (game.participants.len == 2) {
+        const first = game.participants[0];
+        const second = game.participants[1];
+        const away, const home_team = if (std.mem.eql(u8, second.home_away orelse "", "home"))
+            .{ first, second }
+        else if (std.mem.eql(u8, first.home_away orelse "", "home"))
+            .{ second, first }
+        else
+            .{ first, second };
+        for ([2]domain.Participant{ away, home_team }) |part| {
+            if (part.abbreviation.len == 0) continue;
+            if (std.mem.indexOf(u8, padded[cursor..], part.abbreviation)) |rel| {
+                const at = cursor + rel;
+                try escapeCellInto(w, padded[cursor..at]);
+                const team_href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, part.abbreviation });
+                defer allocator.free(team_href);
+                try w.writeAll("<a href=\"");
+                try escapeInto(w, team_href);
+                try w.writeAll("\">");
+                try escapeCellInto(w, part.abbreviation);
+                try w.writeAll("</a>");
+                cursor = at + part.abbreviation.len;
+            }
+        }
+    }
+    try escapeCellInto(w, padded[cursor..]);
+    if (css != null) try w.writeAll("</span>");
+}
+
 
 fn homeFooter(w: *std.Io.Writer, host: []const u8, color: bool) !void {
     try colorize(w, "2", "Try: curl ", color);
@@ -698,6 +854,12 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("</title>" ++ page_style ++ "</head><body><main>");
 }
 
+/// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
+/// box-safe bytes through untouched.
+fn escapeCellInto(w: *std.Io.Writer, cell: []const u8) !void {
+    try escapeInto(w, cell);
+}
+
 pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
     for (value) |byte| switch (byte) {
         '&' => try w.writeAll("&amp;"),
@@ -710,8 +872,16 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}nav{margin-top:14px;display:flex;flex-wrap:wrap;gap:12px;font:14px ui-monospace,monospace}nav a{display:inline-block;min-height:44px;line-height:44px;padding:0 14px;border:1px solid #2a332c;border-radius:8px}nav a:hover{border-color:#6fd3a0}@media(max-width:480px){main{padding:12px 8px}pre{font-size:12px;white-space:pre-wrap;word-wrap:break-word}}</style>
+    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;display:flex;flex-wrap:wrap;gap:12px;font:14px ui-monospace,monospace}nav a{display:inline-block;min-height:44px;line-height:44px;padding:0 14px;border:1px solid #2a332c;border-radius:8px}nav a:hover{border-color:#6fd3a0}@media(max-width:480px){main{padding:12px 8px}pre{font-size:12px;white-space:pre-wrap;word-wrap:break-word}}</style>
 ;
+
+/// CSS class matching the ANSI role for a game state: live games glow
+/// red, upcoming games read yellow, finished games stay plain.
+fn stateClass(state: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, state, "in")) return "live";
+    if (std.mem.eql(u8, state, "pre")) return "upcoming";
+    return null;
+}
 
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
     return validatedJson(leagues.LeagueList, allocator, .{ .leagues = &leagues.all });
@@ -856,12 +1026,10 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     // Game and team links: status cell links the game (with anchor id),
-    // team abbrevs and names link their team pages.
+    // team abbrevs link their team pages.
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\" id=\"game-1\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">Away</a>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">Home</a>") != null);
     // Hostile status text stays escaped even inside a link (padding
     // follows the text inside the anchor, so only check the escape).
     try std.testing.expect(std.mem.indexOf(u8, page, "<OT>") == null);
@@ -1103,10 +1271,10 @@ test "home groups live games, then today, then idle leagues" {
     const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(output);
     const live_at = std.mem.indexOf(u8, output, "LIVE NOW").?;
-    const today_at = std.mem.indexOf(u8, output, "TODAY").?;
+    const nba_at = std.mem.indexOf(u8, output, "NBA").?;
     const leagues_at = std.mem.indexOf(u8, output, "ALL LEAGUES").?;
-    try std.testing.expect(live_at < today_at);
-    try std.testing.expect(today_at < leagues_at);
+    try std.testing.expect(live_at < nba_at);
+    try std.testing.expect(nba_at < leagues_at);
     try std.testing.expect(std.mem.indexOf(u8, output, "mlb  AWY 0 @ HME 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "nba  TRD @ FRT  7:05 PM ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "nfl") != null);
@@ -1114,10 +1282,16 @@ test "home groups live games, then today, then idle leagues" {
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/api/v1/leagues") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, repo_url) != null);
     try expectAlignedTable(output);
+    // Whitespace: a blank spacer row separates each section.
+    try std.testing.expect(std.mem.indexOf(u8, output, "│                                                  │\n") != null);
 
     const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\">") != null);
+    // Granular team spans inside the game link: each side links its team.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nba?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "github") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
@@ -1154,6 +1328,7 @@ test "scoreboard table rows align with the frame" {
     defer std.testing.allocator.free(output);
     try expectAlignedTable(output);
 }
+
 
 test "text renderer prints both marks side by side" {
     const home_mark = core.art.teamArt("mlb", "PHI", .xs).?;

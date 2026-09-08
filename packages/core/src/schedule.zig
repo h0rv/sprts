@@ -52,13 +52,13 @@ pub const TeamView = struct {
     league: []const u8,
     league_name: []const u8,
     team: TeamInfo,
-    last: ?GameRef = null,
+    last: []const GameRef = &.{},
     next: []const GameRef = &.{},
     live: ?GameRef = null,
 
     pub const jsonschema = .{
         .name = "ScheduleTeamView",
-        .description = "Per-team view: header, last result, upcoming games, live game when present.",
+        .description = "Per-team view: header, last results, upcoming games, live game when present.",
         .fields = .{
             .schema_version = .{ .@"const" = "1" },
         },
