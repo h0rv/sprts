@@ -120,6 +120,15 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
         defer allocator.free(series_line);
         try writeRow(w, series_line, inner - 2, null, color);
     }
+    // depth: box-score team totals (optional; skipped when the provider
+    // supplies none). Capped like Leaders: first 8 lines, no trailer.
+    if (game.team_stats.len > 0) {
+        try writeRule(w, .mid, inner);
+        try writeRow(w, "Team stats", inner - 2, "2", color);
+        for (game.team_stats[0..@min(game.team_stats.len, 8)]) |stat| {
+            try writeRow(w, stat, inner - 2, null, color);
+        }
+    }
     try writeRule(w, .bottom, inner);
     const back = try std.fmt.allocPrint(allocator, "/{s}?date={s}\n", .{ game.league, game.date });
     defer allocator.free(back);
@@ -219,6 +228,13 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         const series_line = try std.fmt.allocPrint(allocator, "Series: {s}", .{series});
         defer allocator.free(series_line);
         try htmlRow(allocator, series_line, null, inner, w, null);
+    }
+    // depth: box-score team totals (optional; skipped when absent).
+    if (game.team_stats.len > 0) {
+        try htmlRow(allocator, "Team stats", "dim", inner, w, null);
+        for (game.team_stats[0..@min(game.team_stats.len, 8)]) |stat| {
+            try htmlRow(allocator, stat, null, inner, w, null);
+        }
     }
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}?date={s}\">scores</a>", .{ game.league, game.date });
@@ -775,4 +791,62 @@ test "detail box headings carry the zone label" {
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "(9/6 ET)") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+// depth: box-score team stats section (appended; existing tests above untouched).
+test "detail depth team stats render with data and skip without" {
+    var game = testDetail();
+    game.team_stats = &.{ "ATL At Bats 35", "PHI At Bats 33" };
+    const output = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Team stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ATL At Bats 35") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+    // Section rows keep the box borders so alignment holds.
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var found = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "ATL At Bats 35") == null) continue;
+        found = true;
+        try std.testing.expect(std.mem.startsWith(u8, line, "│ "));
+        try std.testing.expect(std.mem.endsWith(u8, line, " │"));
+    }
+    try std.testing.expect(found);
+
+    const bare = try renderText(std.testing.allocator, testDetail(), false, null, null);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Team stats") == null);
+    _ = try std.unicode.Utf8View.init(bare);
+}
+
+test "detail depth team stats html escapes and carries no ansi" {
+    var game = testDetail();
+    game.team_stats = &.{"ATL <b> & \"hits\" 10"};
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Team stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "&lt;b&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "&amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<b>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+
+    const bare = try detailHtml(std.testing.allocator, testDetail(), null, null);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Team stats") == null);
+}
+
+test "detail depth team stats ride the json wire format additively" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var game = testDetail();
+    game.team_stats = &.{"ATL At Bats 35"};
+    const output = try json(arena, game);
+    try std.testing.expect(std.mem.indexOf(u8, output, "team_stats") != null);
+    const parsed = try std.json.parseFromSliceLeaky(detail.GameDetail, arena, output, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.team_stats.len);
+    // Payloads without the field still parse (additive default).
+    const legacy = try std.json.parseFromSliceLeaky(detail.GameDetail, arena, try json(arena, testDetail()), .{});
+    try std.testing.expectEqual(@as(usize, 0), legacy.team_stats.len);
 }

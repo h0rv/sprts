@@ -96,6 +96,45 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         try table.writeRule(w, .mid, inner);
         try table.writeRow(w, "No games scheduled.", inner - 2, null, color);
     }
+    // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
+    // absent). Each side shows up to `height orelse 5` rows with a `+N more`
+    // trailer, mirroring the Next tail. Earlier continues Last newest-first;
+    // Later continues Next chronological, with probable starters like Next.
+    if (view.extra_past.len > 0) {
+        try table.writeRule(w, .mid, inner);
+        try table.writeRow(w, "Earlier:", inner - 2, null, color);
+        const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
+        for (shown_past) |game| {
+            const line = try gameLineFull(allocator, view.league, game);
+            defer allocator.free(line);
+            try table.writeRow(w, line, inner - 2, null, color);
+        }
+        if (shown_past.len < view.extra_past.len) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
+            defer allocator.free(more);
+            try table.writeRow(w, more, inner - 2, "2", color);
+        }
+    }
+    if (view.extra_next.len > 0) {
+        try table.writeRule(w, .mid, inner);
+        try table.writeRow(w, "Later:", inner - 2, null, color);
+        const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
+        for (shown_next) |game| {
+            const next_line = try gameLineFull(allocator, view.league, game);
+            defer allocator.free(next_line);
+            try table.writeRow(w, next_line, inner - 2, null, color);
+            if (game.probable.len > 0) {
+                const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
+                defer allocator.free(line);
+                try table.writeRow(w, line, inner - 2, "2", color);
+            }
+        }
+        if (shown_next.len < view.extra_next.len) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
+            defer allocator.free(more);
+            try table.writeRow(w, more, inner - 2, "2", color);
+        }
+    }
     try table.writeRule(w, .bottom, inner);
     return out.toOwnedSlice();
 }
@@ -204,6 +243,37 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
     } else if (view.last.len == 0 and view.live == null) {
         try render.writeRule(w, .mid, inner);
         try writeHtmlCell(allocator, "No games scheduled.", null, inner, w);
+    }
+    // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
+    // absent). Same caps and trailers as text; rows link to game views.
+    if (view.extra_past.len > 0) {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "Earlier:", null, inner, w);
+        const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
+        for (shown_past) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
+        if (shown_past.len < view.extra_past.len) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
+            defer allocator.free(more);
+            try writeHtmlCell(allocator, more, "dim", inner, w);
+        }
+    }
+    if (view.extra_next.len > 0) {
+        try render.writeRule(w, .mid, inner);
+        try writeHtmlCell(allocator, "Later:", null, inner, w);
+        const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
+        for (shown_next) |game| {
+            try teamGameHtml(allocator, w, league_slug, game, null, inner);
+            if (game.probable.len > 0) {
+                const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
+                defer allocator.free(line);
+                try writeHtmlCell(allocator, line, "dim", inner, w);
+            }
+        }
+        if (shown_next.len < view.extra_next.len) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
+            defer allocator.free(more);
+            try writeHtmlCell(allocator, more, "dim", inner, w);
+        }
     }
     try render.writeRule(w, .bottom, inner);
     try w.writeAll("</pre><nav>");
@@ -539,4 +609,122 @@ test "team box headers carry the zone label" {
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "9/7 ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+// depth: full-season overflow sections (appended; existing tests above untouched).
+fn depthOverflowView() schedule.TeamView {
+    var view = testView();
+    view.extra_past = &.{
+        .{
+            .id = "old1",
+            .date = "2026-09-04T19:05Z",
+            .opponent_abbrev = "NYM",
+            .opponent_name = "New York Mets",
+            .home_away = "away",
+            .status = "Final",
+            .state = "post",
+            .our_score = "2",
+            .opp_score = "4",
+            .result = "L 2-4",
+        },
+    };
+    view.extra_next = &.{
+        .{
+            .id = "fut1",
+            .date = "2026-09-09T19:05Z",
+            .opponent_abbrev = "NYM",
+            .opponent_name = "New York Mets",
+            .home_away = "home",
+            .status = "9/9 - 3:05 PM EDT",
+            .state = "pre",
+            .result = "vs NYM 3:05 PM",
+            .probable = "Ranger Suarez",
+        },
+    };
+    return view;
+}
+
+test "team depth overflow renders earlier and later with data, skips without" {
+    const output = try renderText(std.testing.allocator, depthOverflowView(), false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Earlier:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Later:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "L 2-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/old1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/fut1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Probable: Ranger Suarez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+    // Section rows keep the box borders so alignment holds.
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var found = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "/mlb/fut1") == null) continue;
+        found = true;
+        try std.testing.expect(std.mem.startsWith(u8, line, "│ "));
+        try std.testing.expect(std.mem.endsWith(u8, line, " │"));
+    }
+    try std.testing.expect(found);
+
+    const bare = try renderText(std.testing.allocator, testView(), false, null, null);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Earlier:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Later:") == null);
+    _ = try std.unicode.Utf8View.init(bare);
+}
+
+test "team depth overflow honors height with trailers" {
+    var refs = [_]schedule.GameRef{
+        .{ .id = "f1", .date = "2026-09-09T19:05Z", .opponent_abbrev = "NYM", .opponent_name = "New York Mets", .home_away = "home", .status = "pre", .state = "pre", .result = "vs NYM" },
+        .{ .id = "f2", .date = "2026-09-10T19:05Z", .opponent_abbrev = "NYM", .opponent_name = "New York Mets", .home_away = "home", .status = "pre", .state = "pre", .result = "vs NYM" },
+        .{ .id = "f3", .date = "2026-09-11T19:05Z", .opponent_abbrev = "NYM", .opponent_name = "New York Mets", .home_away = "home", .status = "pre", .state = "pre", .result = "vs NYM" },
+    };
+    var view = testView();
+    view.extra_next = &refs;
+    const capped = try renderText(std.testing.allocator, view, false, null, 2);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
+    _ = try std.unicode.Utf8View.init(capped);
+}
+
+test "team depth overflow html links and escapes, never ansi" {
+    // Copy the overflow row onto the stack before mutating: the fixture
+    // slices point at comptime-known (read-only) memory.
+    var refs = [_]schedule.GameRef{depthOverflowView().extra_next[0]};
+    refs[0].probable = "A & B <ace>";
+    var view = depthOverflowView();
+    view.extra_next = &refs;
+    const page = try teamHtml(std.testing.allocator, view, "mlb", null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Earlier:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Later:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/old1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/fut1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "A &amp; B &lt;ace&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+
+    const bare = try teamHtml(std.testing.allocator, testView(), "mlb", null, null);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Earlier:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Later:") == null);
+}
+
+test "team depth overflow rides the json wire format additively" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const output = try renderJson(arena, depthOverflowView());
+    try std.testing.expect(std.mem.indexOf(u8, output, "extra_past") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "extra_next") != null);
+    const parsed = try std.json.parseFromSliceLeaky(schedule.TeamView, arena, output, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.extra_past.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.extra_next.len);
+    try std.testing.expectEqualStrings("old1", parsed.extra_past[0].id);
+    // Payloads without the fields still parse (additive defaults).
+    const legacy = try std.json.parseFromSliceLeaky(schedule.TeamView, arena, try renderJson(arena, testView()), .{});
+    try std.testing.expectEqual(@as(usize, 0), legacy.extra_past.len);
+    try std.testing.expectEqual(@as(usize, 0), legacy.extra_next.len);
 }

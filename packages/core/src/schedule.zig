@@ -55,12 +55,20 @@ pub const TeamView = struct {
     last: []const GameRef = &.{},
     next: []const GameRef = &.{},
     live: ?GameRef = null,
+    // depth: full-season overflow beyond `last`/`next` (both capped at 5 by
+    // the provider). `extra_past` continues `last` newest-first; `extra_next`
+    // continues `next` chronological. Empty when there is nothing beyond the
+    // window; renderers skip the sections rather than erroring.
+    extra_past: []const GameRef = &.{},
+    extra_next: []const GameRef = &.{},
 
     pub const jsonschema = .{
         .name = "ScheduleTeamView",
         .description = "Per-team view: header, last results, upcoming games, live game when present.",
         .fields = .{
             .schema_version = .{ .@"const" = "1" },
+            .extra_past = .{ .description = "Older past games beyond the last window, newest-first; empty when none." },
+            .extra_next = .{ .description = "Later upcoming games beyond the next window, chronological; empty when none." },
         },
     };
 };
