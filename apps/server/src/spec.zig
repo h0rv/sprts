@@ -130,6 +130,19 @@ pub const ApiSpec = z.Spec(.{
             z.case(.bad_gateway, z.ErrorBody),
         },
     }),
+    // Standings tab (plaintextsports parity). Current table only: no date
+    // or week query. Unknown slugs and leagues without an ESPN table are
+    // both 404; upstream failure is 502.
+    z.endpoint(.GET, "/api/v1/{league}/standings", .{
+        .operation_id = "getStandings",
+        .summary = "Current standings table for one league",
+        .path = ScoreboardPath,
+        .responses = .{
+            z.case(.ok, core.standings.LeagueStandings),
+            z.case(.not_found, z.ErrorBody),
+            z.case(.bad_gateway, z.ErrorBody),
+        },
+    }),
 });
 
 pub fn openApiJson(allocator: std.mem.Allocator) ![]u8 {
@@ -158,10 +171,10 @@ const team_view = @import("team_view.zig");
 test "spec emits all five JSON operations" {
     const doc = try openApiJson(std.testing.allocator);
     defer std.testing.allocator.free(doc);
-    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam" }) |id| {
+    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings" }) |id| {
         try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
     }
-    for ([_][]const u8{ "LeagueList", "DigestJson", "Scoreboard", "DetailGame", "ScheduleTeamView", "ErrorBody" }) |name| {
+    for ([_][]const u8{ "LeagueList", "DigestJson", "Scoreboard", "DetailGame", "ScheduleTeamView", "LeagueStandings", "ErrorBody" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, doc, name) != null);
     }
     // Digest envelope reuses existing field names only (see digest.DigestJson).
@@ -190,10 +203,12 @@ test "served openapi.json parses and covers every JSON route" {
     try std.testing.expect(router.parse("/api/v1/nfl?week=2").scoreboard.week.? == 2);
     try std.testing.expect(router.parse("/api/v1/mlb/401816828") == .game);
     try std.testing.expect(router.parse("/api/v1/mlb/PHI") == .team);
+    try std.testing.expect(router.parse("/api/v1/nfl/standings") == .standings);
     try std.testing.expect(router.isJsonTarget("/api/v1/leagues"));
     try std.testing.expect(router.isJsonTarget("/api/v1/all?date=2026-09-06"));
     try std.testing.expect(router.isJsonTarget("/api/v1/mlb/401816828"));
     try std.testing.expect(router.isJsonTarget("/api/v1/mlb/PHI"));
+    try std.testing.expect(router.isJsonTarget("/api/v1/nfl/standings"));
     try std.testing.expect(router.parse("/mlb/401816828") == .game);
     try std.testing.expectEqual(router.Format.json, router.formatFor("/mlb/401816828", "application/json"));
 
@@ -213,6 +228,7 @@ test "served openapi.json parses and covers every JSON route" {
         .{ .path = "/api/v1/{league}", .operation_id = "getScoreboard", .errors = &.{ "400", "404", "502" } },
         .{ .path = "/api/v1/{league}/{id}", .operation_id = "getGame", .errors = &.{ "404", "502" } },
         .{ .path = "/api/v1/{league}/{abbr}", .operation_id = "getTeam", .errors = &.{ "404", "502" } },
+        .{ .path = "/api/v1/{league}/standings", .operation_id = "getStandings", .errors = &.{ "404", "502" } },
     };
     for (cases) |c| {
         try std.testing.expect(paths.get(c.path) != null);
