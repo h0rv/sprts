@@ -1,17 +1,11 @@
 //! Per-game detail renderer (wt-detail).
 //!
-//! Built ONLY on render.zig's existing primitives (`writeCell`, `writeRow`,
-//! `writeRule`, `fit` are duplicated here with identical semantics because
-//! those helpers are private to render.zig; `detail_view` must not assume the
-//! table stream's refactor has landed). SEAM for the coordinator: once the
-//! shared table primitives move to a common module, replace the local copies
-//! below with imports and delete the duplicates — the call sites are the same
-//! names and signatures.
-//!
-//! Layout mirrors the scoreboard box rules (52-min columns, `+N more`
-//! trailer for scoring plays via `height`): header (teams + score + status +
-//! venue/attendance), linescore grid (period columns + R/H/E), live situation
-//! chip, decisions + probables, scoring plays (latest 5), series line.
+//! Built ONLY on the shared `table.zig` box primitives (`writeCell`,
+//! `writeRow`, `writeRule`, `writeCellRight`, `fit`). Layout mirrors the
+//! scoreboard box rules (52-min columns, `+N more` trailer for scoring
+//! plays via `height`): header (teams + score + status + venue/attendance),
+//! linescore grid (period columns + R/H/E), live situation chip, decisions
+//! + probables, scoring plays (latest 5), series line.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -19,6 +13,11 @@ const z = @import("zchema");
 const detail = core.detail;
 const router = @import("router.zig");
 const render = @import("render.zig");
+const table = @import("table.zig");
+const writeCell = table.writeCell;
+const writeCellRight = table.writeCellRight;
+const writeRow = table.writeRow;
+const writeRule = table.writeRule;
 
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
@@ -254,71 +253,6 @@ fn writeDetailParticipantRow(w: *std.Io.Writer, participant: detail.DetailPartic
         try w.writeAll("  ");
     }
     try w.writeAll(" │\n");
-}
-
-// --- Local copies of render.zig's private primitives (see module doc). ---
-
-fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    try w.writeAll("│ ");
-    try writeCell(w, s, width, code, color);
-    try w.writeAll(" │\n");
-}
-
-const Rule = enum { top, mid, bottom };
-
-fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
-    const left: []const u8 = switch (which) {
-        .top => "┌",
-        .mid => "├",
-        .bottom => "└",
-    };
-    const right: []const u8 = switch (which) {
-        .top => "┐\n",
-        .mid => "┤\n",
-        .bottom => "┘\n",
-    };
-    try w.writeAll(left);
-    var i: usize = 0;
-    while (i < inner) : (i += 1) try w.writeAll("─");
-    try w.writeAll(right);
-}
-
-/// Writes `s` fitted to exactly `width` bytes, truncating at a code point
-/// boundary with an ellipsis when too long. Escape bytes are never part of
-/// the width: color wraps the fitted bytes only.
-fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = fit(s, width);
-    const use_color = color and code != null;
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-    const pad: usize = end + (if (ellipsis) "...".len else 0);
-    // "…" is 3 bytes; byte padding keeps the rules aligned for the
-    // Latin names this server renders.
-    var i: usize = pad;
-    while (i < width) : (i += 1) try w.writeByte(' ');
-}
-
-fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = fit(s, width);
-    const use_color = color and code != null;
-    const pad: usize = end + (if (ellipsis) "...".len else 0);
-    var spaces: usize = 0;
-    while (pad + spaces < width) : (spaces += 1) {}
-    while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-}
-
-fn fit(s: []const u8, width: usize) struct { usize, bool } {
-    if (s.len <= width) return .{ s.len, false };
-    if (width < 4) return .{ 0, true };
-    var end: usize = width - 3;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return .{ end, true };
 }
 
 fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
