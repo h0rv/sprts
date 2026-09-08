@@ -20,6 +20,7 @@
 const std = @import("std");
 const core = @import("sprts_core");
 const render = @import("render.zig");
+const tz = @import("tz.zig");
 
 /// Games shown per league section before the `+N more` pointer.
 pub const default_games_per_league: u16 = 5;
@@ -44,7 +45,8 @@ pub const DigestJson = struct {
 /// render a one-line `unavailable` section; output is always valid UTF-8
 /// (it only concatenates `render.text` output and ASCII pointers) and
 /// strips all color when `color` is false (same flag as `render.text`).
-pub fn text(
+/// The heading names its zone (`sprts all  2026-09-06 ET`).
+pub fn textWithZone(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
     day: []const u8,
@@ -52,13 +54,16 @@ pub fn text(
     width: ?u16,
     height: ?u16,
     quiet: bool,
+    zone: tz.Zone,
 ) ![]u8 {
     const per_league = height orelse default_games_per_league;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     if (!quiet) {
-        const heading = try std.fmt.allocPrint(allocator, "sprts all  {s}", .{day});
+        const tag = try tz.zoneTag(allocator, zone);
+        defer allocator.free(tag);
+        const heading = try std.fmt.allocPrint(allocator, "sprts all  {s} {s}", .{ day, tag });
         defer allocator.free(heading);
         if (color) try w.print("\x1b[2m{s}\x1b[0m\n", .{heading}) else try w.print("{s}\n", .{heading});
     }
@@ -75,7 +80,7 @@ pub fn text(
             .source = board.source,
             .games = board.games[0..capped],
         };
-        const body = try render.text(allocator, slice, color, width, null);
+        const body = try render.textWithZone(allocator, slice, color, width, null, zone);
         defer allocator.free(body);
         try w.writeAll(body);
         if (capped < board.games.len) {
@@ -84,6 +89,19 @@ pub fn text(
     }
     if (!quiet) try w.writeAll("more: /<league>?date=<day>\n");
     return out.toOwnedSlice();
+}
+
+/// ET-default wrapper for `textWithZone`.
+pub fn text(
+    allocator: std.mem.Allocator,
+    sections: []const DigestSection,
+    day: []const u8,
+    color: bool,
+    width: ?u16,
+    height: ?u16,
+    quiet: bool,
+) ![]u8 {
+    return textWithZone(allocator, sections, day, color, width, height, quiet, .et);
 }
 
 /// JSON digest: one `domain.Scoreboard` per league in `core.leagues.all`
@@ -120,13 +138,15 @@ pub fn json(allocator: std.mem.Allocator, sections: []const DigestSection, day: 
 
 /// HTML digest: the text digest (uncolored) in a `<pre>` block with nav.
 /// Same single-source layout principle as `render.scoreHtml`.
-pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool) ![]u8 {
-    const body = try text(allocator, sections, day, false, width, height, true);
+pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone) ![]u8 {
+    const body = try textWithZone(allocator, sections, day, false, width, height, true, zone);
     defer allocator.free(body);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    const title = try std.fmt.allocPrint(allocator, "sprts all {s}", .{day});
+    const tag = try tz.zoneTag(allocator, zone);
+    defer allocator.free(tag);
+    const title = try std.fmt.allocPrint(allocator, "sprts all {s} {s}", .{ day, tag });
     defer allocator.free(title);
     try render.pageHead(w, title);
     try w.writeAll("<pre>");
@@ -137,6 +157,11 @@ pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: 
     try w.writeAll("</nav></main></body></html>");
     _ = quiet;
     return out.toOwnedSlice();
+}
+
+/// ET-default wrapper for `htmlWithZone`.
+pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool) ![]u8 {
+    return htmlWithZone(allocator, sections, day, width, height, quiet, .et);
 }
 
 fn stripAnsi(allocator: std.mem.Allocator, s: []const u8) ![]u8 {

@@ -98,6 +98,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
     format_label = @tagName(format);
     const route = server_app.router.parse(target);
     route_label = try routeLabel(arena, route);
+    // Zone + clock once per request: missing ?date resolves to the ET
+    // calendar day (ESPN parity); explicit ?date wins verbatim via
+    // tz.resolveDay. Native has no client-TZ signal: ET default + ?tz=.
+    const zone = server_app.tz.zoneFromTarget(target);
+    const now_s = adapter.clock(io);
 
     switch (route) {
         .health => {
@@ -114,15 +119,15 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         },
         .home => |home_route| {
             status = .ok;
-            const day = try core.date.today(arena, io);
+            const day = try server_app.tz.resolveDay(arena, null, now_s, zone);
             const boards = try adapter.fetchAll(arena, day);
             defer server_app.provider.EspnAdapter.releaseAll(boards);
             const color = home_route.color orelse color_default;
             const body = switch (format) {
                 .text => if (home_route.oneline)
-                    try server_app.render.homeOneLine(arena, boards, color)
+                    try server_app.render.homeOneLineWithZone(arena, boards, color, zone)
                 else
-                    try server_app.render.homeLive(arena, color, host, boards, day, home_route.quiet),
+                    try server_app.render.homeLiveWithZone(arena, color, host, boards, day, home_route.quiet, zone),
                 .html => try server_app.render.homeHtmlLive(arena, host, boards, day, home_route.quiet),
                 .json => try server_app.render.leaguesJson(arena),
             };
@@ -156,7 +161,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 return;
             };
             const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
-            const day = score_route.date orelse try core.date.today(arena, io);
+            const day = try server_app.tz.resolveDay(arena, score_route.date, now_s, zone);
             // SSE is a text-only progressive render: JSON and HTML shape a
             // document, not a redraw loop. Header- or query-triggered stream
             // requests on those formats get the normal single response.
@@ -175,11 +180,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                         try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
                         return;
                     };
-                    const body = try server_app.render.text(arena, board_once, score_route.color orelse color_default, score_route.width, score_route.height);
+                    const body = try server_app.render.textWithZone(arena, board_once, score_route.color orelse color_default, score_route.width, score_route.height, zone);
                     try respond(request, body, format, .ok, commonHeaders());
                     return;
                 }
-                try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default);
+                try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default, zone);
                 return;
             }
             // ?week= boards bypass the cache: the board key is (slug, day)
@@ -197,8 +202,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 cache_state = "n/a";
                 status = .ok;
                 const body = switch (format) {
-                    .text => try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
-                    .html => try server_app.render.scoreHtml(arena, board, score_route.width, score_route.height),
+                    .text => try server_app.render.textWithZone(arena, board, score_route.color orelse color_default, score_route.width, score_route.height, zone),
+                    .html => try server_app.render.scoreHtmlWithZone(arena, board, score_route.width, score_route.height, zone),
                     .json => try server_app.render.json(arena, board),
                 };
                 try respond(request, body, format, .ok, commonHeaders());
@@ -222,8 +227,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 .text => if (score_route.oneline)
                     try server_app.help.scoreOneLine(arena, board, score_route.color orelse color_default, score_route.quiet)
                 else
-                    try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
-                .html => try server_app.render.scoreHtml(arena, board, score_route.width, score_route.height),
+                    try server_app.render.textWithZone(arena, board, score_route.color orelse color_default, score_route.width, score_route.height, zone),
+                .html => try server_app.render.scoreHtmlWithZone(arena, board, score_route.width, score_route.height, zone),
                 .json => try server_app.render.json(arena, board),
             };
             const extra = cacheHeaders(cache_state);
@@ -231,7 +236,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         },
         .all => |all_route| {
             status = .ok;
-            const day = all_route.date orelse try core.date.today(arena, io);
+            const day = try server_app.tz.resolveDay(arena, all_route.date, now_s, zone);
             const at = cache.now();
             var sections = try arena.alloc(server_app.digest.DigestSection, core.leagues.all.len);
             for (&core.leagues.all, 0..) |*league, i| {
@@ -251,8 +256,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 .text => if (all_route.oneline)
                     try allOneLine(arena, sections, color)
                 else
-                    try server_app.digest.text(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet),
-                .html => try server_app.digest.html(arena, sections, day, all_route.width, all_route.height, all_route.quiet),
+                    try server_app.digest.textWithZone(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet, zone),
+                .html => try server_app.digest.htmlWithZone(arena, sections, day, all_route.width, all_route.height, all_route.quiet, zone),
                 .json => try server_app.digest.json(arena, sections, day),
             };
             try respond(request, body, format, .ok, commonHeaders());
@@ -496,6 +501,7 @@ fn serveSse(
     day: []const u8,
     score_route: server_app.router.ScoreboardRoute,
     color_default: bool,
+    zone: server_app.tz.Zone,
 ) !void {
     const stream = server_app.stream;
     const color = score_route.color orelse color_default;
@@ -525,7 +531,7 @@ fn serveSse(
         },
     });
 
-    const initial_text = try server_app.render.text(arena, initial, color, score_route.width, score_route.height);
+    const initial_text = try server_app.render.textWithZone(arena, initial, color, score_route.width, score_route.height, zone);
     const initial_frame = try stream.frame(arena, initial_text);
     body_writer.writer.writeAll(initial_frame) catch return;
     // Two-stage flush: the inner writer buffers up to 16KB before emitting
@@ -612,7 +618,7 @@ fn serveSse(
                 };
                 const current = stream.fingerprint(board);
                 const next_interval = stream.pollIntervalSec(board);
-                const body = server_app.render.text(poll_arena, board, color, score_route.width, score_route.height) catch continue;
+                const body = server_app.render.textWithZone(poll_arena, board, color, score_route.width, score_route.height, zone) catch continue;
                 const event = stream.frame(poll_arena, body) catch continue;
                 {
                     subscriber_mutex.lockUncancelable(io);

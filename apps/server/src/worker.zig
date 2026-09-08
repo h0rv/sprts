@@ -46,6 +46,7 @@ const spec = @import("spec.zig");
 const provider = @import("provider.zig");
 const edge = @import("edge_cache.zig");
 const stream = @import("stream.zig");
+const tz = @import("tz.zig");
 
 const default_base_url = "https://site.api.espn.com/apis/site/v2";
 
@@ -92,6 +93,15 @@ fn incomingHeader(request: *const workers.Request, name: []const u8) !?[]const u
     return null;
 }
 
+/// CF timezone signal for zone guessing: `request.cf.timezone` (IANA
+/// name). Fallible → null (local dev, missing property, bad JSON all
+/// fall back to the ET default via `tz.zoneFromWorkerRequest`).
+fn cfTimezone(request: *const workers.Request) ?[]const u8 {
+    const cf = request.cf() catch return null;
+    const props = cf orelse return null;
+    return props.timezone;
+}
+
 pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) !workers.Response {
     // Per-request arena; freed automatically when the request ends.
     const alloc = env.allocator;
@@ -114,6 +124,13 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
     }
 
     const format = router.formatFor(target, accept);
+
+    // Zone once per request: explicit ?tz= beats the CF source guess
+    // (`request.cf.timezone` / `CF-Timezone` header) beats the ET default.
+    // Missing ?date resolves in this zone (ESPN parity); explicit ?date
+    // wins verbatim via tz.resolveDay.
+    const cf_header: ?[]const u8 = incomingHeader(request, "CF-Timezone") catch null;
+    const zone = tz.zoneFromWorkerRequest(target, cfTimezone(request), cf_header);
 
     switch (router.parse(target)) {
         .health => {
@@ -142,15 +159,15 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
                 .transport = transport_state.asTransport(),
                 .clock = workerClock,
             };
-            const day = try edge.resolveDay(alloc, null, epochSecondsNow());
+            const day = try tz.resolveDay(alloc, null, epochSecondsNow(), zone);
             const boards = try adapter.fetchAll(alloc, day);
             defer provider.EspnAdapter.releaseAll(boards);
             const color = home_route.color orelse try colorDefault(env);
             const body = switch (format) {
                 .text => if (home_route.oneline)
-                    try render.homeOneLine(alloc, boards, color)
+                    try render.homeOneLineWithZone(alloc, boards, color, zone)
                 else
-                    try render.homeLive(alloc, color, host, boards, day, home_route.quiet),
+                    try render.homeLiveWithZone(alloc, color, host, boards, day, home_route.quiet, zone),
                 .html => try render.homeHtmlLive(alloc, host, boards, day, home_route.quiet),
                 .json => try render.leaguesJson(alloc),
             };
@@ -171,7 +188,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             }, format);
             return staticResponse(body, contentType(format), null);
         },
-        .all => |route| return serveAll(env, alloc, route, format),
+        .all => |route| return serveAll(env, alloc, route, format, zone),
         .scoreboard => |route| {
             // SSE trigger mirrors main.zig exactly: ?stream= query flag
             // (ScoreboardRoute.stream, filled from the query half by
@@ -181,9 +198,9 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             // body makes no sense there): falls back to the single response.
             const wants_sse = route.stream or router.wantsStream(target, accept);
             if (wants_sse and format == .text and method == .GET and route.week == null) {
-                return serveStream(env, alloc, route);
+                return serveStream(env, alloc, route, zone);
             }
-            return serveBoard(env, alloc, route, format);
+            return serveBoard(env, alloc, route, format, zone);
         },
         .game => |route| return serveDetail(env, alloc, route, format),
         .team => |route| return serveTeam(env, alloc, route, format),
@@ -203,17 +220,19 @@ fn serveBoard(
     alloc: std.mem.Allocator,
     route: router.ScoreboardRoute,
     format: router.Format,
+    zone: tz.Zone,
 ) !workers.Response {
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
         return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
     };
 
-    // Canonicalize: lowercase slug, concrete day (missing ?date resolves via
-    // todayFromEpoch), path prefix and non-date query excluded from the key.
+    // Canonicalize: lowercase slug, concrete day (missing ?date resolves in
+    // the request zone via tz.resolveDay), path prefix and non-date query
+    // excluded from the key.
     const epoch_s = epochSecondsNow();
     const slug = try edge.canonicalSlug(alloc, league.slug);
-    const day = try edge.resolveDay(alloc, route.date, epoch_s);
+    const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
     const tag = edge.formatTag(format);
     const board_key = try edge.boardKey(alloc, slug, day, tag);
     const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
@@ -260,8 +279,8 @@ fn serveBoard(
         .text => if (route.oneline)
             try help.scoreOneLine(alloc, board, color, route.quiet)
         else
-            try render.text(alloc, board, color, route.width, route.height),
-        .html => try render.scoreHtml(alloc, board, route.width, route.height),
+            try render.textWithZone(alloc, board, color, route.width, route.height, zone),
+        .html => try render.scoreHtmlWithZone(alloc, board, route.width, route.height, zone),
         .json => try render.json(alloc, board),
     };
 
@@ -355,6 +374,7 @@ fn serveStream(
     env: *workers.Env,
     alloc: std.mem.Allocator,
     route: router.ScoreboardRoute,
+    zone: tz.Zone,
 ) !workers.Response {
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
@@ -362,7 +382,7 @@ fn serveStream(
     };
 
     const epoch_s = epochSecondsNow();
-    const day = try edge.resolveDay(alloc, route.date, epoch_s);
+    const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
 
     var transport_state = WorkerTransport{};
     const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
@@ -385,7 +405,7 @@ fn serveStream(
     // Reuse the shared text render + SSE framing verbatim: full text render
     // (respecting color/width/height) prefixed with the clear-screen escape
     // via stream.frame, so plain `curl -N` repaints in place.
-    const initial_text = try render.text(alloc, initial, color, route.width, route.height);
+    const initial_text = try render.textWithZone(alloc, initial, color, route.width, route.height, zone);
     const initial_frame = try stream.frame(alloc, initial_text);
 
     var sse = workers.StreamingResponse.start(.{ .status = .ok });
@@ -428,7 +448,7 @@ fn serveStream(
         const current = stream.fingerprint(board);
         if (!stream.changed(last, current)) continue;
         last = current;
-        const body = render.text(alloc, board, color, route.width, route.height) catch continue;
+        const body = render.textWithZone(alloc, board, color, route.width, route.height, zone) catch continue;
         const event = stream.frame(alloc, body) catch continue;
         sse.write(event);
         // Per-request arena memory grows with each tick's render; the outer
@@ -609,6 +629,7 @@ fn serveAll(
     alloc: std.mem.Allocator,
     route: router.AllRoute,
     format: router.Format,
+    zone: tz.Zone,
 ) !workers.Response {
     const digest = @import("digest.zig");
     const color = route.color orelse try colorDefault(env);
@@ -622,7 +643,7 @@ fn serveAll(
         .transport = transport_state.asTransport(),
         .clock = workerClock,
     };
-    const day = try edge.resolveDay(alloc, route.date, epoch_s);
+    const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
     const tag = edge.formatTag(format);
     const sections = try alloc.alloc(digest.DigestSection, core.leagues.all.len);
     const cache = workers.Cache.default();
@@ -646,8 +667,8 @@ fn serveAll(
         sections[i].board = board;
         // Refresh per-league edge entries from the normalized board.
         const body = switch (format) {
-            .text => render.text(alloc, board, color, route.width, route.height) catch continue,
-            .html => render.scoreHtml(alloc, board, route.width, route.height) catch continue,
+            .text => render.textWithZone(alloc, board, color, route.width, route.height, zone) catch continue,
+            .html => render.scoreHtmlWithZone(alloc, board, route.width, route.height, zone) catch continue,
             .json => render.json(alloc, board) catch continue,
         };
         var resp = boardResponse(body, format, "miss");
@@ -655,8 +676,8 @@ fn serveAll(
         cache.put(.{ .url = fresh_key }, &for_fresh);
     }
     const body = switch (format) {
-        .text => try digest.text(alloc, sections, day, color, route.width, route.height, route.quiet),
-        .html => try digest.html(alloc, sections, day, route.width, route.height, route.quiet),
+        .text => try digest.textWithZone(alloc, sections, day, color, route.width, route.height, route.quiet, zone),
+        .html => try digest.htmlWithZone(alloc, sections, day, route.width, route.height, route.quiet, zone),
         .json => try digest.json(alloc, sections, day),
     };
     return staticResponse(body, contentType(format), null);
