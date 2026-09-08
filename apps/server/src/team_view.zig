@@ -9,6 +9,7 @@ const schedule = core.schedule;
 const render = @import("render.zig");
 const router = @import("router.zig");
 const table = @import("table.zig");
+const tz = @import("tz.zig");
 
 /// Text view: logo mark, header (name, record, standing), LIVE row when
 /// present, last results (up to 5), then the next games (up to 5). `height`
@@ -35,7 +36,14 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         try table.writeRule(w, .mid, inner);
     }
     {
-        const header = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
+        // one-line: header gains the zone label via `tz.labelFor` (ET default;
+        // `?tz=` plumbing stays in main/worker, which this task must not touch).
+        const zone_tag = try zoneTag(allocator, view);
+        defer allocator.free(zone_tag);
+        const header = if (zone_tag.len == 0)
+            try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev })
+        else
+            try std.fmt.allocPrint(allocator, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, zone_tag });
         defer allocator.free(header);
         try table.writeRow(w, header, inner - 2, null, color);
     }
@@ -146,7 +154,13 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         try render.writeRule(w, .mid, inner);
     }
     {
-        const header = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
+        // one-line: header gains the zone label via `tz.labelFor` (ET default; see renderText).
+        const zone_tag = try zoneTag(allocator, view);
+        defer allocator.free(zone_tag);
+        const header = if (zone_tag.len == 0)
+            try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev })
+        else
+            try std.fmt.allocPrint(allocator, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, zone_tag });
         defer allocator.free(header);
         try writeHtmlCell(allocator, header, null, inner, w);
     }
@@ -402,4 +416,127 @@ test "router team route carries display params" {
     const team = router.parse("/mlb/phi?width=90").team;
     try std.testing.expectEqualStrings("phi", team.abbr);
     try std.testing.expect(team.width.? == 90);
+}
+
+// one-line: team `?0` support. Additive section (sibling agent
+// `views-depth` owns the box renderers above; only the 2-line header
+// hooks touch existing functions).
+
+/// Team one-line fallback (`?0`): everything about a team on one line.
+///
+/// Exact framed shape (`quiet == false`):
+///   `{ABBR}[ {record}][  {standing}] | Last: {last} | Next: {next}[ | Live: {live}]`
+/// - `{record}` / `{standing}` mirror the box's record line (`{record}  {standing}`,
+///   each omitted when absent).
+/// - `{last}` / `{next}` are the schedule `GameRef.result` display strings
+///   (`"W 5-3"`, `"vs ATL 1:05 PM"`; falls back to `status` when `result` is
+///   empty), comma-joined across all entries, or `none` when empty.
+/// - ` | Live: {live}` appears only when `view.live` is present.
+/// `quiet` drops the `{ABBR} ... | ` identity prefix, leaving the bare
+/// `Last: ... | Next: ...[ | Live: ...]` segments. Color tints only the
+/// `Live:` result (`1;31`); zero ANSI when `color` is off. Always ends in `\n`.
+pub fn renderTextOneLine(arena: std.mem.Allocator, view: schedule.TeamView, color: bool, quiet: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    const w = &out.writer;
+    if (!quiet) {
+        try w.writeAll(view.team.abbrev);
+        if (view.team.record_summary) |record| {
+            if (view.team.standing_summary) |standing| {
+                try w.print(" {s}  {s}", .{ record, standing });
+            } else {
+                try w.print(" {s}", .{record});
+            }
+        } else if (view.team.standing_summary) |standing| {
+            try w.print(" {s}", .{standing});
+        }
+        try w.writeAll(" | ");
+    }
+    try w.writeAll("Last: ");
+    try writeResults(w, view.last);
+    try w.writeAll(" | Next: ");
+    try writeResults(w, view.next);
+    if (view.live) |live| {
+        try w.writeAll(" | Live: ");
+        const s: []const u8 = if (live.result.len > 0) live.result else live.status;
+        if (color) {
+            try w.print("\x1b[1;31m{s}\x1b[0m", .{s});
+        } else {
+            try w.writeAll(s);
+        }
+    }
+    try w.writeByte('\n');
+    return out.toOwnedSlice();
+}
+
+// one-line: comma-joined `result` (else `status`) list, or `none`.
+fn writeResults(w: *std.Io.Writer, games: []const schedule.GameRef) !void {
+    if (games.len == 0) {
+        try w.writeAll("none");
+        return;
+    }
+    for (games, 0..) |game, i| {
+        if (i > 0) try w.writeAll(", ");
+        if (game.result.len > 0) {
+            try w.writeAll(game.result);
+        } else {
+            try w.writeAll(game.status);
+        }
+    }
+}
+
+// one-line: header-hook day (next game first, then live, then first last);
+// null when the view carries no games.
+fn zoneDayFor(view: schedule.TeamView) ?[]const u8 {
+    if (view.next.len > 0) return view.next[0].date[0..@min(view.next[0].date.len, 10)];
+    if (view.live) |live| return live.date[0..@min(live.date.len, 10)];
+    if (view.last.len > 0) return view.last[0].date[0..@min(view.last[0].date.len, 10)];
+    return null;
+}
+
+// one-line: `M/D ZONE` header tag via `tz.labelFor` (ET default), or "" when dateless.
+fn zoneTag(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
+    const day = zoneDayFor(view) orelse return allocator.dupe(u8, "");
+    return tz.labelFor(allocator, day, .et);
+}
+
+// one-line: tests (append-only block; box tests above belong to views-depth).
+test "team one-line is a single compact line with no box rules" {
+    const output = try renderTextOneLine(std.testing.allocator, testView(), false, false);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("PHI 80-63  2nd in NL East | Last: W 5-3 | Next: vs ATL 1:05 PM, at ATL 1:05 PM | Live: 3-2 Top 7th\n", output);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "team one-line honors quiet framing and strips color when off" {
+    const quiet = try renderTextOneLine(std.testing.allocator, testView(), false, true);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expectEqualStrings("Last: W 5-3 | Next: vs ATL 1:05 PM, at ATL 1:05 PM | Live: 3-2 Top 7th\n", quiet);
+    for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, quiet, rule) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "\x1b[") == null);
+
+    const colored = try renderTextOneLine(std.testing.allocator, testView(), true, false);
+    defer std.testing.allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[1;31m3-2 Top 7th\x1b[0m") != null);
+
+    const empty: schedule.TeamView = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+    };
+    const bare = try renderTextOneLine(std.testing.allocator, empty, false, false);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expectEqualStrings("PHI | Last: none | Next: none\n", bare);
+}
+
+test "team box headers carry the zone label" {
+    const text = try renderText(std.testing.allocator, testView(), false, null, null);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Philadelphia Phillies (PHI)  9/7 ET") != null);
+    const page = try teamHtml(std.testing.allocator, testView(), "mlb", null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "9/7 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
