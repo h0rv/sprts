@@ -580,8 +580,6 @@ fn serveAll(
         const slug = try edge.canonicalSlug(alloc, league.slug);
         const board_key = try edge.boardKey(alloc, slug, day, tag);
         const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
-        const stale_key = try edge.staleKey(alloc, board_key, epoch_s);
-        _ = stale_key;
         // Edge stores renders, not boards, so the digest always does one
         // normalized fetch per league and refreshes that league's edge
         // entries from it. A fresh hit still saves nothing here — the
@@ -604,10 +602,6 @@ fn serveAll(
         var resp = boardResponse(body, format, "miss");
         var for_fresh = resp.clone();
         cache.put(.{ .url = fresh_key }, &for_fresh);
-        var for_stale = resp.clone();
-        for_stale.setHeader("cache-control", edge.stale_cache_control);
-        for_stale.setHeader("x-sprts-cache", "stale");
-        cache.put(.{ .url = stale_key }, &for_stale);
     }
     const body = switch (format) {
         .text => try digest.text(alloc, sections, day, color, route.width, route.height, route.quiet),
