@@ -415,7 +415,7 @@ fn homeSections(
         const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, shortDate(day) });
         defer allocator.free(header);
         if (html) {
-            const href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ result.league.slug, day });
+            const href = try homeLeagueHref(allocator, result.league.slug, day);
             defer allocator.free(href);
             try writeHtmlRow(allocator, header, "dim", default_inner_width, w, href);
         } else {
@@ -438,7 +438,13 @@ fn homeSections(
         const board = result.board;
         if (board != null and board.?.games.len > 0) continue;
         try w.writeAll("│ ");
-        if (html) try w.print("<a href=\"/{s}\">", .{result.league.slug});
+        if (html) {
+            const href = try homeLeagueHref(allocator, result.league.slug, day);
+            defer allocator.free(href);
+            try w.writeAll("<a href=\"");
+            try escapeInto(w, href);
+            try w.writeAll("\">");
+        }
         try writeCell(w, result.league.slug, 13, null, false);
         try w.writeByte(' ');
         try writeCell(w, result.league.name, 34, null, false);
@@ -888,6 +894,17 @@ fn writeLinkedParticipantRow(
     try w.writeByte('\n');
 }
 
+/// Per-league today link shared by the static home rows and the live
+/// home rows: `/{slug}?date={day}` when a day is in hand, dateless
+/// `/{slug}` otherwise. One spelling everywhere, so the shortcut never
+/// drifts between the two homes. Returned raw; callers escape it.
+fn homeLeagueHref(allocator: std.mem.Allocator, slug: []const u8, day: ?[]const u8) ![]u8 {
+    if (day) |d| {
+        return try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ slug, d });
+    }
+    return try std.fmt.allocPrint(allocator, "/{s}", .{slug});
+}
+
 /// Static home: league slugs link to today's board for that league
 /// (`/{slug}` defaults to today). The optional `day` spells the today
 /// link out as `/{slug}?date={day}`; without it rows stay exactly as
@@ -906,14 +923,10 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     try writeRule(w, .top, default_inner_width);
     for (leagues.all) |league| {
         try w.writeAll("│ ");
-        try w.writeAll("<a href=\"/");
-        try escapeInto(w, league.slug);
-        if (day) |d| {
-            // Date shortcut: spell today out so the link always lands
-            // on this day even if the default changes.
-            try w.writeAll("?date=");
-            try escapeInto(w, d);
-        }
+        const href = try homeLeagueHref(allocator, league.slug, day);
+        defer allocator.free(href);
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
         try w.writeAll("\">");
         try writeCell(w, league.slug, 13, null, false);
         try w.writeByte(' ');
@@ -927,7 +940,9 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
 }
 
 /// Live HTML home: same sections as `homeLive`, never ANSI, with links.
-/// Game lines link to their league page; the nav mirrors `homeHtml`.
+/// Game lines link to their league page; per-league links spell today
+/// out (`/{slug}?date={day}`), sharing the static home spelling. The
+/// nav mirrors `homeHtml`.
 pub fn homeHtmlLive(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -1461,7 +1476,7 @@ test "home groups live games, then today, then idle leagues" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nba?date=2026-09-06\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "github") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
@@ -1875,4 +1890,35 @@ test "?tz= wiring flips day and label, invalid is ignored" {
     const explicit = try tz.resolveDay(arena, "2026-01-01", epoch, .utc);
     defer arena.free(explicit);
     try std.testing.expectEqualStrings("2026-01-01", explicit);
+}
+
+test "live home idle leagues link today with the date" {
+    // Idle league only: no board, so it lands in the ALL LEAGUES rows.
+    const results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("nfl").? },
+    };
+    const day = "2026-09-06";
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, day, false);
+    defer std.testing.allocator.free(page);
+    // Same spelling as the static dated home: today spelled out.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl?date=2026-09-06\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl\">") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Dateless fallback is unchanged: static home without a day stays bare.
+    const bare = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "<a href=\"/nfl\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "?date=") == null);
+    // Hostile day text stays escaped in the shared spelling, both homes.
+    const hostile = "2026-09-06&<>\"'";
+    const evil_live = try homeHtmlLive(std.testing.allocator, "example.test", &results, hostile, true);
+    defer std.testing.allocator.free(evil_live);
+    try std.testing.expect(std.mem.indexOf(u8, evil_live, "/nfl?date=2026-09-06&amp;&lt;&gt;&quot;&#39;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evil_live, hostile) == null);
+    try std.testing.expect(std.mem.indexOf(u8, evil_live, "\x1b[") == null);
+    const evil_static = try homeHtmlDay(std.testing.allocator, hostile);
+    defer std.testing.allocator.free(evil_static);
+    try std.testing.expect(std.mem.indexOf(u8, evil_static, "/nfl?date=2026-09-06&amp;&lt;&gt;&quot;&#39;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evil_static, hostile) == null);
+    _ = try std.unicode.Utf8View.init(evil_live);
 }
