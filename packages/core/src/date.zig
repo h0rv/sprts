@@ -28,6 +28,84 @@ pub fn todayFromEpoch(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
     return fromEpochDay(allocator, @intCast(@divFloor(epoch_seconds, std.time.s_per_day)));
 }
 
+/// US Eastern day derivation (plaintextsports parity).
+///
+/// ET rule: UTC-5 (EST) outside daylight time, UTC-4 (EDT) inside it.
+/// DST rule (US, since 2007): starts 2:00am local on the SECOND Sunday of
+/// March, ends 2:00am local on the FIRST Sunday of November. That is
+/// 07:00 UTC on that March Sunday and 06:00 UTC on that November Sunday.
+/// Pure: year math only, no clock, no locale tables.
+pub const et_standard_offset_minutes: i16 = -5 * 60;
+pub const et_daylight_offset_minutes: i16 = -4 * 60;
+
+/// Offset in minutes east of UTC for US Eastern at this instant.
+/// Returns -300 (EST) or -240 (EDT).
+pub fn etOffsetMinutes(epoch_seconds: i64) i16 {
+    if (epoch_seconds < 0) return et_standard_offset_minutes;
+    const epoch_day: i64 = @divFloor(epoch_seconds, std.time.s_per_day);
+    const year = yearOfEpochDay(epoch_day);
+    const march_sunday = nthSundayOfMarch(year, 2);
+    const nov_sunday = nthSundayOfNovember(year, 1);
+    const dst_start = march_sunday * std.time.s_per_day + 7 * std.time.s_per_hour;
+    const dst_end = nov_sunday * std.time.s_per_day + 6 * std.time.s_per_hour;
+    if (epoch_seconds >= dst_start and epoch_seconds < dst_end) return et_daylight_offset_minutes;
+    return et_standard_offset_minutes;
+}
+
+/// Derive the calendar day for `epoch_seconds` at a fixed offset east of
+/// UTC (minutes; negative west). Pure; inject the epoch in tests.
+pub fn todayInTz(allocator: std.mem.Allocator, epoch_seconds: i64, offset_minutes: i16) ![]u8 {
+    if (epoch_seconds < 0) return error.InvalidDate;
+    const shifted = epoch_seconds + @as(i64, offset_minutes) * std.time.s_per_min;
+    if (shifted < 0) return error.InvalidDate;
+    return fromEpochDay(allocator, @intCast(@divFloor(shifted, std.time.s_per_day)));
+}
+
+/// Derive "today" in US Eastern (EST/EDT by the rule above).
+pub fn todayET(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
+    return todayInTz(allocator, epoch_seconds, etOffsetMinutes(epoch_seconds));
+}
+
+/// Year (e.g. 2026) containing this epoch day (days since 1970-01-01).
+fn yearOfEpochDay(epoch_day: i64) u16 {
+    var day = epoch_day;
+    var year: u16 = 1970;
+    while (true) {
+        const len: i64 = if (isLeap(year)) 366 else 365;
+        if (day < len) return year;
+        day -= len;
+        year += 1;
+    }
+}
+
+/// Epoch day of the nth Sunday of March (DST start month).
+fn nthSundayOfMarch(year: u16, n: u8) i64 {
+    return nthSundayOfMonth(year, 3, n);
+}
+
+/// Epoch day of the nth Sunday of November (DST end month).
+fn nthSundayOfNovember(year: u16, n: u8) i64 {
+    return nthSundayOfMonth(year, 11, n);
+}
+
+fn nthSundayOfMonth(year: u16, month: u4, n: u8) i64 {
+    const first_day = epochDayOfDate(year, month, 1);
+    // 1970-01-01 was a Thursday; Sunday is 3 days later mod 7.
+    const weekday_of_first: u8 = @intCast(@mod(first_day + 4, 7)); // 0=Sunday..6=Saturday
+    const days_to_first_sunday: i64 = @intCast(@mod(7 - weekday_of_first, 7));
+    return first_day + days_to_first_sunday + @as(i64, n - 1) * 7;
+}
+
+fn epochDayOfDate(year: u16, month: u4, day: u5) i64 {
+    var total: i64 = 0;
+    var y: u16 = 1970;
+    while (y < year) : (y += 1) total += if (isLeap(y)) 366 else 365;
+    var m: u4 = 1;
+    while (m < month) : (m += 1) total += daysInMonth(year, m);
+    total += day - 1;
+    return total;
+}
+
 pub fn shift(allocator: std.mem.Allocator, value: []const u8, delta: i32) ![]u8 {
     const epoch_day = try toEpochDay(value);
     const shifted = @as(i64, @intCast(epoch_day)) + delta;
@@ -84,4 +162,61 @@ test "todayFromEpoch maps epoch seconds to UTC date" {
     defer std.testing.allocator.free(before_midnight);
     try std.testing.expectEqualStrings("2026-09-06", before_midnight);
     try std.testing.expectError(error.InvalidDate, todayFromEpoch(std.testing.allocator, -1));
+}
+
+test "etOffsetMinutes follows the US DST rule" {
+    // EST (-300) in January; EDT (-240) in September.
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1768453200)); // 2026-01-15T05:00Z
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1788753600)); // 2026-09-07T04:00Z
+    // 2026 spring forward: second Sunday of March, 07:00 UTC.
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1772953199)); // 06:59:59 UTC
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1772953200)); // 07:00:00 UTC
+    // 2026 fall back: first Sunday of November, 06:00 UTC.
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1793512799)); // 05:59:59 UTC
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1793512800)); // 06:00:00 UTC
+    // Other years, same rule shape (2nd Sun Mar / 1st Sun Nov).
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1741503599));
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1741503600)); // 2025-03-09T07:00Z
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1762063199));
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1762063200)); // 2025-11-02T06:00Z
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1710053999));
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1710054000)); // 2024-03-10T07:00Z
+    try std.testing.expectEqual(@as(i16, -240), etOffsetMinutes(1730613599));
+    try std.testing.expectEqual(@as(i16, -300), etOffsetMinutes(1730613600)); // 2024-11-03T06:00Z
+}
+
+test "todayET keeps night games on the ET day" {
+    // 2026-09-07T03:59:59Z is still Sep 6 in ET (11:59pm EDT).
+    const late = try todayET(std.testing.allocator, 1788753599);
+    defer std.testing.allocator.free(late);
+    try std.testing.expectEqualStrings("2026-09-06", late);
+    // 2026-09-07T04:00:00Z is midnight EDT: Sep 7.
+    const midnight = try todayET(std.testing.allocator, 1788753600);
+    defer std.testing.allocator.free(midnight);
+    try std.testing.expectEqualStrings("2026-09-07", midnight);
+    // Winter: EST boundary is 05:00 UTC.
+    const jan_late = try todayET(std.testing.allocator, 1768453199); // 04:59:59Z
+    defer std.testing.allocator.free(jan_late);
+    try std.testing.expectEqualStrings("2026-01-14", jan_late);
+    const jan_mid = try todayET(std.testing.allocator, 1768453200); // 05:00:00Z
+    defer std.testing.allocator.free(jan_mid);
+    try std.testing.expectEqualStrings("2026-01-15", jan_mid);
+    // Spring-forward day: offset flips at 07:00 UTC, day derivation holds.
+    const spring = try todayET(std.testing.allocator, 1772953200); // 2026-03-08T07:00Z
+    defer std.testing.allocator.free(spring);
+    try std.testing.expectEqualStrings("2026-03-08", spring);
+    try std.testing.expectError(error.InvalidDate, todayET(std.testing.allocator, -1));
+}
+
+test "todayInTz applies a fixed offset" {
+    const utc = try todayInTz(std.testing.allocator, 1788739200, 0);
+    defer std.testing.allocator.free(utc);
+    try std.testing.expectEqualStrings("2026-09-07", utc);
+    const et = try todayInTz(std.testing.allocator, 1788739200, -240);
+    defer std.testing.allocator.free(et);
+    try std.testing.expectEqualStrings("2026-09-06", et);
+    const plus = try todayInTz(std.testing.allocator, 1788739200, 60);
+    defer std.testing.allocator.free(plus);
+    try std.testing.expectEqualStrings("2026-09-07", plus);
+    try std.testing.expectError(error.InvalidDate, todayInTz(std.testing.allocator, -1, 0));
 }

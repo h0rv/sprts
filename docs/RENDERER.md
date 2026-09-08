@@ -49,6 +49,15 @@ server reads it once at startup from `NO_COLOR` and `TERM`. A remote
 client env never reaches the server, so the flag is the only remote
 switch.
 
+## Time zone
+
+A missing `?date` resolves to the US Eastern calendar day (EST/EDT by
+the US DST rule: second Sunday of March to first Sunday of November),
+matching ESPN and plaintextsports, so US night games never flip a day
+early. `?tz=ET|UTC` (plus `EST`, `EDT`, `America/New_York`, `GMT`, `Z`,
+`Etc/UTC`, or a fixed `[+-]H[H][:MM]` offset) overrides it; an invalid
+`?tz=` is ignored, never a 400. Date labels name their zone (`9/6 ET`).
+
 ## Code shape
 
 - `router.parse` takes the request target only. `router.formatFor` takes
