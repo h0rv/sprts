@@ -40,12 +40,21 @@ pub const HomeRoute = struct {
     oneline: bool = false,
 };
 
+/// Help page route (`/:help`, wttr.in style). No league, date, or size to
+/// carry: the page is static copy plus display flags.
+pub const HelpRoute = struct {
+    color: ?bool,
+    quiet: bool = false,
+    oneline: bool = false,
+};
+
 pub const Route = union(enum) {
     home: HomeRoute,
     leagues,
     scoreboard: ScoreboardRoute,
     game: GameRoute,
     team: TeamRoute,
+    help: HelpRoute,
     openapi,
     health,
     not_found,
@@ -67,6 +76,19 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
 
+    // Help page (wttr.in `:help` style): global `/:help`, `/help` plus the
+    // `/api/v1/` twins. Per-league `/{league}/:help` and `/{league}/help`
+    // (and the `/api/v1/{league}/` twins) are caught in the two-segment
+    // branch below before the game/team split, so a help segment never
+    // falls into the team view. Display flags ride along via the same
+    // `display` parsed once at the top (aliases + precedence documented
+    // on `parseDisplay`).
+    if (isHelpPath(path)) return .{ .help = .{
+        .color = display.color,
+        .quiet = display.quiet,
+        .oneline = display.oneline,
+    } };
+
     const api_prefix = "/api/v1/";
     const slug = if (std.mem.startsWith(u8, path, api_prefix))
         path[api_prefix.len..]
@@ -82,6 +104,11 @@ pub fn parse(target: []const u8) Route {
         const segment = slug[slash + 1 ..];
         if (league.len == 0 or segment.len == 0 or
             std.mem.indexOfScalar(u8, segment, '/') != null) return .not_found;
+        if (isHelpSegment(segment)) return .{ .help = .{
+            .color = display.color,
+            .quiet = display.quiet,
+            .oneline = display.oneline,
+        } };
         const sized = .{
             .color = display.color,
             .width = queryUint(queryValue(query, "width")),
@@ -127,6 +154,22 @@ fn isAllDigits(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| if (c < '0' or c > '9') return false;
     return true;
+}
+
+/// Global help addresses: `/:help`, `/help`, and the `/api/v1/` twins.
+/// A bare `help` team abbrev (`/mlb/help`) is NOT matched here — it arrives
+/// as slug `mlb/help` and is caught by `isHelpSegment` in the two-segment
+/// branch, so help never falls into the team view.
+fn isHelpPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/:help") or
+        std.mem.eql(u8, path, "/help") or
+        std.mem.eql(u8, path, "/api/v1/:help") or
+        std.mem.eql(u8, path, "/api/v1/help");
+}
+
+/// Second segment of `/{league}/:help` or `/{league}/help`.
+fn isHelpSegment(segment: []const u8) bool {
+    return std.mem.eql(u8, segment, ":help") or std.mem.eql(u8, segment, "help");
 }
 
 /// Response format for a request. The address decides first: `/api/v1/`
@@ -199,9 +242,13 @@ const DisplayFlags = struct {
 /// Single-letter display aliases, wttr.in style. `?T` is `?color=0`,
 /// `?A` is `?color=1`, `?q` is quiet (no header/footer), `?0` is one-line.
 /// Both combined (`?0q`, `?0pq` with unknown letters ignored) and
-/// `&`-separated (`?0&q`) spellings work on every human route.
-/// Precedence: long flags win over aliases (`?color=1&T` is color on);
-/// among aliases the later letter wins (`?T&A` is color on).
+/// `&`-separated (`?0&q`) spellings work on every human route,
+/// including the `:help` page.
+/// Precedence: long flags win over aliases regardless of order
+/// (`?color=1&T` and `?T&color=1` are both color on; `?q&quiet=0` and
+/// `?quiet=0&q` are both quiet off); an invalid long flag is ignored so
+/// the alias still applies (`?color=off&T` is color off). Among aliases
+/// alone the later letter wins (`?T&A` is color on, `?A&T` off).
 fn parseDisplay(query: []const u8) DisplayFlags {
     const long_color = parseColor(queryValue(query, "color"));
     const long_quiet = parseFlagBool(queryValue(query, "quiet"));
@@ -411,4 +458,39 @@ test "stream flag parses query values and Accept header" {
     // Stream and display params compose: the poll key must vary renders.
     try std.testing.expect(parse("/mlb?stream=sse&width=80").scoreboard.stream);
     try std.testing.expect(parse("/mlb?stream=sse&width=80").scoreboard.width.? == 80);
+}
+
+test "help routes parse with display flags" {
+    // Global spellings plus the /api/v1/ twins (JSON by address, rendered
+    // from the same help route).
+    try std.testing.expect(parse("/:help") == .help);
+    try std.testing.expect(parse("/help") == .help);
+    try std.testing.expect(parse("/api/v1/:help") == .help);
+    try std.testing.expect(parse("/api/v1/help") == .help);
+    try std.testing.expect(isJsonTarget("/api/v1/:help"));
+    try std.testing.expect(isJsonTarget("/api/v1/help"));
+    // Per-league spellings (and the API twins) never fall into the team view.
+    try std.testing.expect(parse("/mlb/:help") == .help);
+    try std.testing.expect(parse("/mlb/help") == .help);
+    try std.testing.expect(parse("/api/v1/mlb/:help") == .help);
+    try std.testing.expect(parse("/api/v1/mlb/help") == .help);
+    // Display aliases (combined, separate, and precedence) ride on help too.
+    const combined = parse("/:help?0pq").help;
+    try std.testing.expect(combined.oneline);
+    try std.testing.expect(combined.quiet);
+    try std.testing.expect(combined.color == null);
+    const separate = parse("/mlb/help?0&q").help;
+    try std.testing.expect(separate.oneline);
+    try std.testing.expect(separate.quiet);
+    try std.testing.expect(parse("/help?T").help.color.? == false);
+    try std.testing.expect(parse("/help?A").help.color.? == true);
+    try std.testing.expect(parse("/help?color=1&T").help.color.? == true);
+    try std.testing.expect(parse("/help?T&color=1").help.color.? == true);
+    try std.testing.expect(parse("/help?q&quiet=0").help.quiet == false);
+    try std.testing.expect(parse("/help?0&oneline=0").help.oneline == false);
+    // Help beats date validation: a bad ?date on a help address still helps.
+    try std.testing.expect(parse("/:help?date=tomorrow") == .help);
+    // Almost-help still misses: deeper paths and team abbrevs are untouched.
+    try std.testing.expect(parse("/mlb/help/x") == .not_found);
+    try std.testing.expect(parse("/mlb/helpful").team.abbr[0] == 'h');
 }
