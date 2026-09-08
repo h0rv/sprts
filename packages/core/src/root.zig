@@ -4,6 +4,7 @@ pub const domain = @import("domain.zig");
 pub const leagues = @import("leagues.zig");
 pub const art = @import("art.zig");
 pub const schedule = @import("schedule.zig");
+pub const standings = @import("standings.zig");
 
 test {
     _ = date;
@@ -11,4 +12,5 @@ test {
     _ = leagues;
     _ = art;
     _ = schedule;
+    _ = standings;
 }

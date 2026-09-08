@@ -37,6 +37,18 @@ pub const TeamRoute = struct {
     oneline: bool = false,
 };
 
+/// Standings tab (`/{league}/standings`, plaintextsports parity with the
+/// Schedule/Standings/Teams tabs). No date or week: the endpoint is the
+/// current table only. Display flags ride along like every human route.
+pub const StandingsRoute = struct {
+    league: []const u8,
+    color: ?bool,
+    width: ?u16,
+    height: ?u16,
+    quiet: bool = false,
+    oneline: bool = false,
+};
+
 pub const HomeRoute = struct {
     color: ?bool,
     quiet: bool = false,
@@ -67,6 +79,7 @@ pub const Route = union(enum) {
     scoreboard: ScoreboardRoute,
     game: GameRoute,
     team: TeamRoute,
+    standings: StandingsRoute,
     help: HelpRoute,
     openapi,
     health,
@@ -119,6 +132,17 @@ pub fn parse(target: []const u8) Route {
             std.mem.indexOfScalar(u8, segment, '/') != null) return .not_found;
         if (isHelpSegment(segment)) return .{ .help = .{
             .color = display.color,
+            .quiet = display.quiet,
+            .oneline = display.oneline,
+        } };
+        // Standings tab: caught before the game/team split so the literal
+        // never falls into the team view (no team is abbreviated
+        // "standings", and game ids are digits-only, so the match is exact).
+        if (isStandingsSegment(segment)) return .{ .standings = .{
+            .league = league,
+            .color = display.color,
+            .width = queryUint(queryValue(query, "width")),
+            .height = queryUint(queryValue(query, "height")),
             .quiet = display.quiet,
             .oneline = display.oneline,
         } };
@@ -187,6 +211,11 @@ fn isHelpPath(path: []const u8) bool {
         std.mem.eql(u8, path, "/help") or
         std.mem.eql(u8, path, "/api/v1/:help") or
         std.mem.eql(u8, path, "/api/v1/help");
+}
+
+/// Second segment of `/{league}/standings` (and the `/api/v1/` twin).
+fn isStandingsSegment(segment: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(segment, "standings");
 }
 
 /// Second segment of `/{league}/:help` or `/{league}/help`.
@@ -550,4 +579,32 @@ test "help routes parse with display flags" {
     // Almost-help still misses: deeper paths and team abbrevs are untouched.
     try std.testing.expect(parse("/mlb/help/x") == .not_found);
     try std.testing.expect(parse("/mlb/helpful").team.abbr[0] == 'h');
+}
+
+test "standings routes parse before the game/team split" {
+    const short = parse("/nfl/standings").standings;
+    try std.testing.expectEqualStrings("nfl", short.league);
+    try std.testing.expect(short.color == null);
+    const api = parse("/api/v1/mlb/standings").standings;
+    try std.testing.expectEqualStrings("mlb", api.league);
+    try std.testing.expect(isJsonTarget("/api/v1/mlb/standings"));
+    try std.testing.expect(!isJsonTarget("/mlb/standings"));
+    // Display flags ride along (combined, separate, and precedence).
+    const sized = parse("/nhl/standings?width=80&height=3").standings;
+    try std.testing.expect(sized.width.? == 80);
+    try std.testing.expect(sized.height.? == 3);
+    try std.testing.expect(parse("/epl/standings?T").standings.color.? == false);
+    try std.testing.expect(parse("/epl/standings?0q").standings.oneline);
+    try std.testing.expect(parse("/epl/standings?0q").standings.quiet);
+    // Case-insensitive like team abbrevs; help and game regions untouched.
+    try std.testing.expect(parse("/mlb/STANDINGS") == .standings);
+    try std.testing.expect(parse("/mlb/help") == .help);
+    try std.testing.expect(parse("/mlb/401816828") == .game);
+    try std.testing.expect(parse("/mlb/phi") == .team);
+    // Deeper paths are not routes; a bare /standings is a (unknown) league.
+    try std.testing.expect(parse("/mlb/standings/x") == .not_found);
+    try std.testing.expect(parse("/standings") == .scoreboard);
+    // Unknown-league slugs still parse: the serve layer answers 404 via
+    // the league lookup, so the route carries the slug verbatim.
+    try std.testing.expectEqualStrings("quidditch", parse("/quidditch/standings").standings.league);
 }
