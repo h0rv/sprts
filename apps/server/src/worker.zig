@@ -420,13 +420,6 @@ fn contentType(format: router.Format) []const u8 {
         .html => "text/html; charset=utf-8",
         .json => "application/json; charset=utf-8",
     };
-
-fn contentType(format: router.Format) []const u8 {
-    return switch (format) {
-        .text => "text/plain; charset=utf-8",
-        .html => "text/html; charset=utf-8",
-        .json => "application/json; charset=utf-8",
-    };
 }
 
 /// Non-board responses (static renders + errors): shared cache headers for

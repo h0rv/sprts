@@ -71,7 +71,7 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
     for (board.games[0..shown]) |game| {
         try table.rule(.mid);
         try table.row(game.status, statusColor(game.state));
-        try writeGameMarks(w, allocator, board.league, &game, inner);
+        try writeGameMarks(w, allocator, board.league, &game, inner, color);
         if (game.participants.len == 0) {
             try table.row(game.name, null);
         }
@@ -107,14 +107,21 @@ fn statusColor(state: []const u8) ?[]const u8 {
 
 /// Both teams' marks side by side at `.xs`: a horizontal card instead of
 /// a tall stacked block. A side with no mark is skipped; if the pair is
-/// wider than the box, the marks stack vertically.
-fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []const u8, game: *const domain.Game, inner: usize) !void {
+/// wider than the box, the marks stack vertically. When `color` is set and
+/// a team has a color sidecar, the colored mark renders; otherwise (or
+/// with color=false) the mono mark renders, so `?color=0` strips ALL color.
+fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []const u8, game: *const domain.Game, inner: usize, color: bool) !void {
     var marks: [2][]const u8 = undefined;
     var n: usize = 0;
     for (game.participants) |p| {
         if (n == marks.len) break;
-        if (core.art.teamArt(league, p.abbreviation, .xs)) |mark| {
-            marks[n] = mark;
+        const mark = if (color)
+            core.art.teamArtColor(league, p.abbreviation, .xs) orelse
+                core.art.teamArt(league, p.abbreviation, .xs)
+        else
+            core.art.teamArt(league, p.abbreviation, .xs);
+        if (mark) |m| {
+            marks[n] = m;
             n += 1;
         }
     }
@@ -127,7 +134,7 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
         var lines = std.mem.splitScalar(u8, mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            widths[i] = @max(widths[i], countCells(line));
+            widths[i] = @max(widths[i], countVisibleCells(line));
             try rows[i].append(allocator, line);
         }
     }
@@ -153,7 +160,7 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
             }
             const line = if (r < rows[i].items.len) rows[i].items[r] else "";
             try w.writeAll(line);
-            var pad: usize = widths[i] - countCells(line);
+            var pad: usize = widths[i] - countVisibleCells(line);
             while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         }
         var fill: usize = inner - 2 - (widths[0] + gap + widths[1]);
@@ -163,12 +170,30 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
 }
 
 /// Terminal cells in a line. The tool guarantees single-cell glyphs, so
-/// code points are cells; on invalid UTF-8 fall back to bytes.
+/// code points are cells; on invalid UTF-8 fall back to bytes. SGR
+/// escapes (colored marks) are zero-width and skipped.
 fn countCells(line: []const u8) usize {
-    var view = std.unicode.Utf8View.init(line) catch return line.len;
+    return countVisibleCells(line);
+}
+
+fn countVisibleCells(line: []const u8) usize {
     var cells: usize = 0;
-    var it = view.iterator();
-    while (it.nextCodepoint()) |_| cells += 1;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and line[j] != 'm') : (j += 1) {}
+            i = if (j < line.len) j + 1 else line.len;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
+            cells += 1;
+            i += 1;
+            continue;
+        };
+        cells += 1;
+        i += len;
+    }
     return cells;
 }
 
@@ -1029,6 +1054,68 @@ test "text renderer prints both marks side by side" {
     }
     try std.testing.expect(found);
     _ = try std.unicode.Utf8View.init(output);
+}
+
+test "text renderer colors marks and strips them with color=false" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "PHI at NYY",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
+                    .{ .id = "2", .name = "New York Yankees", .abbreviation = "NYY", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+    const colored = try text(std.testing.allocator, board, true, null, null);
+    defer std.testing.allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[38;5;") != null);
+    try expectAlignedTableColored(colored);
+    const plain = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
+    try expectAlignedTable(plain);
+    // Stripping SGR from the colored render reproduces the mono render.
+    var stripped: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stripped.deinit();
+    try stripAnsi(&stripped.writer, colored);
+    const stripped_slice = try stripped.toOwnedSlice();
+    defer std.testing.allocator.free(stripped_slice);
+    try std.testing.expectEqualStrings(plain, stripped_slice);
+}
+
+fn stripAnsi(w: *std.Io.Writer, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            var j = i + 2;
+            while (j < s.len and s[j] != 'm') : (j += 1) {}
+            i = if (j < s.len) j + 1 else s.len;
+            continue;
+        }
+        try w.writeByte(s[i]);
+        i += 1;
+    }
+}
+
+fn expectAlignedTableColored(output: []const u8) !void {
+    // Same frame-alignment check as expectAlignedTable, but ANSI-aware:
+    // strip SGR runs first so colored marks measure by visible cells.
+    var stripped: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stripped.deinit();
+    try stripAnsi(&stripped.writer, output);
+    const slice = try stripped.toOwnedSlice();
+    defer std.testing.allocator.free(slice);
+    try expectAlignedTable(slice);
 }
 
 test "text renderer prints no mark for teams without one" {
