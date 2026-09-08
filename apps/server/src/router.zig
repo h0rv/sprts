@@ -6,6 +6,9 @@ pub const Format = enum { text, html, json };
 pub const ScoreboardRoute = struct {
     league: []const u8,
     date: ?[]const u8,
+    /// ESPN week selector (football leases it; most sports ignore it).
+    /// Strict positive int like width/height; null = date-driven board.
+    week: ?u16 = null,
     color: ?bool,
     width: ?u16,
     height: ?u16,
@@ -48,9 +51,19 @@ pub const HelpRoute = struct {
     oneline: bool = false,
 };
 
+pub const AllRoute = struct {
+    date: ?[]const u8,
+    color: ?bool,
+    width: ?u16,
+    height: ?u16,
+    quiet: bool = false,
+    oneline: bool = false,
+};
+
 pub const Route = union(enum) {
     home: HomeRoute,
     leagues,
+    all: AllRoute,
     scoreboard: ScoreboardRoute,
     game: GameRoute,
     team: TeamRoute,
@@ -138,9 +151,18 @@ pub fn parse(target: []const u8) Route {
 
     const day = queryValue(query, "date");
     if (day) |value| if (!dates.validate(value)) return .bad_date;
+    if (std.mem.eql(u8, slug, "all")) return .{ .all = .{
+        .date = day,
+        .color = display.color,
+        .width = queryUint(queryValue(query, "width")),
+        .height = queryUint(queryValue(query, "height")),
+        .quiet = display.quiet,
+        .oneline = display.oneline,
+    } };
     return .{ .scoreboard = .{
         .league = slug,
         .date = day,
+        .week = queryUint(queryValue(query, "week")),
         .color = display.color,
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
@@ -365,6 +387,41 @@ test "display params parse strict" {
     try std.testing.expect(parse("/mlb?width=0").scoreboard.width == null);
     try std.testing.expect(parse("/mlb?width=999999").scoreboard.width == null);
     try std.testing.expect(parse("/mlb?width=80x").scoreboard.width == null);
+}
+
+test "week param parses strict like width and height" {
+    try std.testing.expect(parse("/mlb").scoreboard.week == null);
+    try std.testing.expect(parse("/nfl?week=1").scoreboard.week.? == 1);
+    try std.testing.expect(parse("/nfl?week=18").scoreboard.week.? == 18);
+    try std.testing.expect(parse("/mlb?week=abc").scoreboard.week == null);
+    try std.testing.expect(parse("/mlb?week=0").scoreboard.week == null);
+    try std.testing.expect(parse("/mlb?week=999999").scoreboard.week == null);
+    try std.testing.expect(parse("/mlb?week=2x").scoreboard.week == null);
+    try std.testing.expect(parse("/mlb?week=").scoreboard.week == null);
+    // Composes with date and display params.
+    const composed = parse("/nfl?date=2026-09-06&week=2&width=80").scoreboard;
+    try std.testing.expect(composed.week.? == 2);
+    try std.testing.expect(composed.width.? == 80);
+    try std.testing.expectEqualStrings("2026-09-06", composed.date.?);
+}
+
+test "all route parses date and display flags, never a league" {
+    const all = parse("/all").all;
+    try std.testing.expect(all.date == null);
+    try std.testing.expect(all.color == null);
+    const dated = parse("/all?date=2026-09-06").all;
+    try std.testing.expectEqualStrings("2026-09-06", dated.date.?);
+    const api = parse("/api/v1/all?date=2026-09-06").all;
+    try std.testing.expectEqualStrings("2026-09-06", api.date.?);
+    try std.testing.expect(isJsonTarget("/api/v1/all?date=2026-09-06"));
+    try std.testing.expect(!isJsonTarget("/all?date=2026-09-06"));
+    const sized = parse("/all?width=80&height=3").all;
+    try std.testing.expect(sized.width.? == 80);
+    try std.testing.expect(sized.height.? == 3);
+    try std.testing.expect(parse("/all?date=tomorrow") == .bad_date);
+    try std.testing.expect(parse("/api/v1/all?date=tomorrow") == .bad_date);
+    // A league literally named "all" is unreachable; the digest owns /all.
+    try std.testing.expect(parse("/all") != .scoreboard);
 }
 
 test "bad dates and unknown shapes still route" {

@@ -156,13 +156,16 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             // SSE is a text-only progressive render: JSON and HTML shape a
             // document, not a redraw loop. Header- or query-triggered stream
             // requests on those formats get the normal single response.
+            // A ?week= board also takes the single response: the shared
+            // stream poll key has no week component, so week boards never
+            // join the shared poll.
             const wants_sse = score_route.stream or server_app.router.wantsStream(target, accept);
-            if (wants_sse and format == .text) {
+            if (wants_sse and format == .text and score_route.week == null) {
                 status = .ok;
                 // GET only: HEAD must not start an open-ended body. Fall back
                 // to the normal single response, consistent with non-stream.
                 if (request.head.method == .HEAD) {
-                    const board_once = adapter.fetch(arena, league, day) catch |err| {
+                    const board_once = adapter.fetchWeek(arena, league, day, score_route.week) catch |err| {
                         status = .bad_gateway;
                         std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
                         try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
@@ -173,6 +176,28 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                     return;
                 }
                 try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default);
+                return;
+            }
+            // ?week= boards bypass the cache: the board key is (slug, day)
+            // and a week selector must never poison date-driven entries.
+            // Direct fetchWeek keeps the default null path cached as before.
+            if (score_route.week != null) {
+                const week_start = std.Io.Clock.Timestamp.now(io, .awake);
+                const board = adapter.fetchWeek(arena, league, day, score_route.week) catch |err| {
+                    upstream_ms = elapsedMs(week_start, io);
+                    status = .bad_gateway;
+                    std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                    return;
+                };
+                cache_state = "n/a";
+                status = .ok;
+                const body = switch (format) {
+                    .text => try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
+                    .html => try server_app.render.scoreHtml(arena, board, score_route.width, score_route.height),
+                    .json => try server_app.render.json(arena, board),
+                };
+                try respond(request, body, format, .ok, commonHeaders());
                 return;
             }
             const key: server_app.native_cache.Key = .{ .board = .{ .slug = slug, .day = day } };
@@ -199,6 +224,34 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             const extra = cacheHeaders(cache_state);
             try respond(request, body, format, .ok, &extra);
+        },
+        .all => |all_route| {
+            status = .ok;
+            const day = all_route.date orelse try core.date.today(arena, io);
+            const at = cache.now();
+            var sections = try arena.alloc(server_app.digest.DigestSection, core.leagues.all.len);
+            for (&core.leagues.all, 0..) |*league, i| {
+                sections[i] = .{ .league = league };
+                const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+                const key: server_app.native_cache.Key = .{ .board = .{ .slug = slug, .day = day } };
+                var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
+                if (cache.getOrFetch(arena, key, at, &fetch_ctx, fetchBoardPayload)) |cached| {
+                    sections[i].board = cached.data.board;
+                } else |_| {
+                    sections[i].board = null;
+                }
+            }
+            cache_state = "n/a";
+            const color = all_route.color orelse color_default;
+            const body = switch (format) {
+                .text => if (all_route.oneline)
+                    try allOneLine(arena, sections, color)
+                else
+                    try server_app.digest.text(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet),
+                .html => try server_app.digest.html(arena, sections, day, all_route.width, all_route.height, all_route.quiet),
+                .json => try server_app.digest.json(arena, sections, day),
+            };
+            try respond(request, body, format, .ok, commonHeaders());
         },
         .game => |game_route| {
             const league = core.leagues.find(game_route.league) orelse {
@@ -278,6 +331,45 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
     }
 }
 
+/// `/all?0`: every game in the digest, one per line, across leagues.
+/// Same per-game shape as `render.homeOneLine`; idle/unavailable leagues
+/// emit nothing; empty digest is a single `No games scheduled.` line.
+fn allOneLine(arena: std.mem.Allocator, sections: []const server_app.digest.DigestSection, color: bool) ![]u8 {
+    _ = color;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    var any = false;
+    for (sections) |section| {
+        const board = section.board orelse continue;
+        for (board.games) |game| {
+            const first = if (game.participants.len >= 1) game.participants[0] else null;
+            const second = if (game.participants.len >= 2) game.participants[1] else null;
+            if (first != null and second != null) {
+                const away, const home_team = if (std.mem.eql(u8, second.?.home_away orelse "", "home"))
+                    .{ first.?, second.? }
+                else
+                    .{ second.?, first.? };
+                if (away.score.len > 0 or home_team.score.len > 0) {
+                    try out.writer.print("{s} {s} {s} @ {s} {s}  {s}\n", .{
+                        section.league.slug, board.date, away.abbreviation, away.score, home_team.abbreviation, home_team.score,
+                    });
+                } else {
+                    try out.writer.print("{s} {s} {s} @ {s}  {s}\n", .{
+                        section.league.slug, board.date, away.abbreviation, home_team.abbreviation, game.status,
+                    });
+                }
+            } else if (game.name.len > 0) {
+                try out.writer.print("{s} {s} {s}  {s}\n", .{ section.league.slug, board.date, game.name, game.status });
+            } else {
+                continue;
+            }
+            any = true;
+        }
+    }
+    if (!any) try out.writer.writeAll("No games scheduled.\n");
+    return out.toOwnedSlice();
+}
+
 /// Compact route label for the per-request log line. Boards, details, and
 /// teams carry their cache-key components so hits/stales are attributable.
 fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
@@ -290,6 +382,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .not_found => arena.dupe(u8, "not_found"),
         .help => arena.dupe(u8, "help"),
         .scoreboard => |r| std.fmt.allocPrint(arena, "board/{s}/{s}", .{ r.league, r.date orelse "today" }),
+        .all => |r| std.fmt.allocPrint(arena, "all/{s}", .{r.date orelse "today"}),
         .game => |r| std.fmt.allocPrint(arena, "detail/{s}/{s}", .{ r.league, r.id }),
         .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}", .{ r.league, r.abbr }),
     };

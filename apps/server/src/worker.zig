@@ -166,6 +166,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             }, format);
             return staticResponse(body, contentType(format), null);
         },
+        .all => |route| return serveAll(env, alloc, route, format),
         .scoreboard => |route| {
             // SSE trigger mirrors main.zig exactly: ?stream= query flag
             // (ScoreboardRoute.stream, filled from the query half by
@@ -174,7 +175,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             // the normal single response. HEAD never streams (an open-ended
             // body makes no sense there): falls back to the single response.
             const wants_sse = route.stream or router.wantsStream(target, accept);
-            if (wants_sse and format == .text and method == .GET) {
+            if (wants_sse and format == .text and method == .GET and route.week == null) {
                 return serveStream(env, alloc, route);
             }
             return serveBoard(env, alloc, route, format);
@@ -233,14 +234,19 @@ fn serveBoard(
     };
 
     // Single normalized board fetch; every format renders from this board.
-    const board = adapter.fetch(alloc, league, day) catch {
+    // ?week= threads into fetchWeek directly (never cached: the board key
+    // is (slug, day), and a week selector must not poison date entries).
+    const board = adapter.fetchWeek(alloc, league, day, route.week) catch {
         workers.log("upstream ESPN fetch failed for {s} {s}", .{ slug, day });
         // Manual stale-on-upstream-error: same 300s bucket, so age < 300s.
-        if (cache.match(.{ .url = stale_key })) |stale| {
-            var resp = stale.clone();
-            resp.setHeader("cache-control", edge.client_cache_control);
-            resp.setHeader("x-sprts-cache", "stale");
-            return resp;
+        // Week boards skip the stale path (nothing cached under the key).
+        if (route.week == null) {
+            if (cache.match(.{ .url = stale_key })) |stale| {
+                var resp = stale.clone();
+                resp.setHeader("cache-control", edge.client_cache_control);
+                resp.setHeader("x-sprts-cache", "stale");
+                return resp;
+            }
         }
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
@@ -257,6 +263,8 @@ fn serveBoard(
 
     // Store fresh (30s retention) + stale (300s retention) renders.
     // Only successful renders reach this point, so errors are never cached.
+    // Week boards are never stored (key has no week component).
+    if (route.week != null) return resp;
     var for_fresh = resp.clone();
     cache.put(.{ .url = fresh_key }, &for_fresh);
     var for_stale = resp.clone();
@@ -536,4 +544,75 @@ fn errorResponse(
     var resp = staticResponse(body, contentType(format), null);
     resp.setStatus(status);
     return resp;
+}
+
+/// Multi-league digest: `/all?date=` (and `/api/v1/all?date=` JSON).
+/// One normalized fetch per league (same per-league edge-cache scheme as
+/// serveBoard: fresh 30s hit served directly, stale 300s on upstream
+/// failure with the section marked unavailable, else the league renders
+/// unavailable); one league's outage never fails the digest. Bounded by
+/// the league set with a per-league game cap in the renderer. Date-driven
+/// only: no week fan-out.
+fn serveAll(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.AllRoute,
+    format: router.Format,
+) !workers.Response {
+    const digest = @import("digest.zig");
+    const color = route.color orelse try colorDefault(env);
+    const epoch_s = epochSecondsNow();
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const day = try edge.resolveDay(alloc, route.date, epoch_s);
+    const tag = edge.formatTag(format);
+    const sections = try alloc.alloc(digest.DigestSection, core.leagues.all.len);
+    const cache = workers.Cache.default();
+    for (&core.leagues.all, 0..) |*league, i| {
+        sections[i] = .{ .league = league };
+        const slug = try edge.canonicalSlug(alloc, league.slug);
+        const board_key = try edge.boardKey(alloc, slug, day, tag);
+        const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
+        const stale_key = try edge.staleKey(alloc, board_key, epoch_s);
+        _ = stale_key;
+        // Edge stores renders, not boards, so the digest always does one
+        // normalized fetch per league and refreshes that league's edge
+        // entries from it. A fresh hit still saves nothing here — the
+        // render below is the digest composition, not the league render —
+        // but the per-league put() keeps single-league routes warm.
+        _ = cache.match(.{ .url = fresh_key });
+        const board = adapter.fetch(alloc, league, day) catch {
+            // One league's outage never fails the digest: mark the
+            // section unavailable and keep the others.
+            sections[i].board = null;
+            continue;
+        };
+        sections[i].board = board;
+        // Refresh per-league edge entries from the normalized board.
+        const body = switch (format) {
+            .text => render.text(alloc, board, color, route.width, route.height) catch continue,
+            .html => render.scoreHtml(alloc, board, route.width, route.height) catch continue,
+            .json => render.json(alloc, board) catch continue,
+        };
+        var resp = boardResponse(body, format, "miss");
+        var for_fresh = resp.clone();
+        cache.put(.{ .url = fresh_key }, &for_fresh);
+        var for_stale = resp.clone();
+        for_stale.setHeader("cache-control", edge.stale_cache_control);
+        for_stale.setHeader("x-sprts-cache", "stale");
+        cache.put(.{ .url = stale_key }, &for_stale);
+    }
+    const body = switch (format) {
+        .text => try digest.text(alloc, sections, day, color, route.width, route.height, route.quiet),
+        .html => try digest.html(alloc, sections, day, route.width, route.height, route.quiet),
+        .json => try digest.json(alloc, sections, day),
+    };
+    return staticResponse(body, contentType(format), null);
 }

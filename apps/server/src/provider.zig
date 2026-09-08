@@ -24,10 +24,18 @@ pub const EspnAdapter = struct {
         return core.date.todayFromEpoch(arena, self.clock(self.io));
     }
 
+    /// `week` threads into the ESPN `week=` query param (football honors
+    /// it; most sports ignore it). Null is the default date-driven board
+    /// and preserves the historical call shape.
     pub fn fetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) !core.domain.Scoreboard {
+        return self.fetchWeek(arena, league, day, null);
+    }
+
+    pub fn fetchWeek(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, week: ?u16) !core.domain.Scoreboard {
         const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
         const compact_day = try core.date.compact(arena, day);
-        const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, null, null, null);
+        const week_int: ?i64 = if (week) |w| @intCast(w) else null;
+        const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, week_int, null, null);
         var status: std.http.Status = undefined;
         var body: []const u8 = undefined;
         if (self.transport) |transport| {
@@ -355,6 +363,31 @@ test "EspnAdapter accepts injected transport and clock" {
     try std.testing.expectEqualStrings("mlb", board.league);
     try std.testing.expectEqualStrings(
         "https://example.test/base/sports/baseball/mlb/scoreboard?dates=20260906",
+        fake.seen_url.?,
+    );
+}
+
+test "fetchWeek threads week into the scoreboard URL, null preserves behavior" {
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = EspnAdapter{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", 2);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906&week=2",
+        fake.seen_url.?,
+    );
+    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", null);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906",
         fake.seen_url.?,
     );
 }
