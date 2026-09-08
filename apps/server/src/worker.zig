@@ -38,6 +38,7 @@ const espn = @import("espn_client");
 
 const router = @import("router.zig");
 const render = @import("render.zig");
+const help = @import("help.zig");
 const detail_view = @import("detail_view.zig");
 const team_view = @import("team_view.zig");
 const spec = @import("spec.zig");
@@ -156,6 +157,15 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         },
         .bad_date => return errorResponse(alloc, "date must be YYYY-MM-DD", format, .bad_request),
         .not_found => return errorResponse(alloc, "route not found", format, .not_found),
+        .help => |help_route| {
+            const color = help_route.color orelse try colorDefault(env);
+            const body = try help.renderHelp(alloc, .{
+                .color = color,
+                .quiet = help_route.quiet,
+                .oneline = help_route.oneline,
+            }, format);
+            return staticResponse(body, contentType(format), null);
+        },
         .scoreboard => |route| {
             // SSE trigger mirrors main.zig exactly: ?stream= query flag
             // (ScoreboardRoute.stream, filled from the query half by
@@ -235,7 +245,10 @@ fn serveBoard(
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
     const body = switch (format) {
-        .text => try render.text(alloc, board, color, route.width, route.height),
+        .text => if (route.oneline)
+            try help.scoreOneLine(alloc, board, color, route.quiet)
+        else
+            try render.text(alloc, board, color, route.width, route.height),
         .html => try render.scoreHtml(alloc, board, route.width, route.height),
         .json => try render.json(alloc, board),
     };

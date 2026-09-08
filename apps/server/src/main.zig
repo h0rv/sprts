@@ -136,6 +136,15 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .not_found;
             try respondError(arena, request, "route not found", format, .not_found);
         },
+        .help => |help_route| {
+            status = .ok;
+            const body = try server_app.help.renderHelp(arena, .{
+                .color = help_route.color orelse color_default,
+                .quiet = help_route.quiet,
+                .oneline = help_route.oneline,
+            }, format);
+            try respond(request, body, format, .ok, commonHeaders());
+        },
         .scoreboard => |score_route| {
             const league = core.leagues.find(score_route.league) orelse {
                 status = .not_found;
@@ -181,7 +190,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             const board = cached.data.board;
             const body = switch (format) {
-                .text => try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
+                .text => if (score_route.oneline)
+                    try server_app.help.scoreOneLine(arena, board, score_route.color orelse color_default, score_route.quiet)
+                else
+                    try server_app.render.text(arena, board, score_route.color orelse color_default, score_route.width, score_route.height),
                 .html => try server_app.render.scoreHtml(arena, board, score_route.width, score_route.height),
                 .json => try server_app.render.json(arena, board),
             };
@@ -276,6 +288,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .leagues => arena.dupe(u8, "leagues"),
         .bad_date => arena.dupe(u8, "bad_date"),
         .not_found => arena.dupe(u8, "not_found"),
+        .help => arena.dupe(u8, "help"),
         .scoreboard => |r| std.fmt.allocPrint(arena, "board/{s}/{s}", .{ r.league, r.date orelse "today" }),
         .game => |r| std.fmt.allocPrint(arena, "detail/{s}/{s}", .{ r.league, r.id }),
         .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}", .{ r.league, r.abbr }),
