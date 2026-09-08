@@ -1,11 +1,6 @@
-//! Per-team text/HTML/JSON views built ONLY on render.zig's existing
-//! box primitives (`writeCell`/`writeRow`/`writeRule`/`fit`) via re-export.
-//!
-//! Seam note for the table-stream owner: this module reaches the private
-//! primitives by re-exporting them from render.zig (see the `pub` markers
-//! there). If the refactor moves or renames them, this file breaks at
-//! compile time at the import — grep for `render.write` uses here. It does
-//! not copy any layout logic; alignment rules stay in render.zig.
+//! Per-team text/HTML/JSON views built ONLY on the shared `table.zig`
+//! box primitives (`writeRow`/`writeRule`). Alignment rules live in
+//! `table.zig`; this module holds no layout logic.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -13,6 +8,7 @@ const z = @import("zchema");
 const schedule = core.schedule;
 const render = @import("render.zig");
 const router = @import("router.zig");
+const table = @import("table.zig");
 
 /// Text view: header (name, record, standing), LIVE row when present, last
 /// result, then the next games capped by `height` (null/0 = all, but at
@@ -23,11 +19,11 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try render.writeRule(w, .top, inner);
+    try table.writeRule(w, .top, inner);
     {
         const header = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
         defer allocator.free(header);
-        try render.writeRow(w, header, inner - 2, null, color);
+        try table.writeRow(w, header, inner - 2, null, color);
     }
     if (view.team.record_summary) |record| {
         const line = if (view.team.standing_summary) |standing|
@@ -35,50 +31,50 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         else
             try std.fmt.allocPrint(allocator, "{s}", .{record});
         defer allocator.free(line);
-        try render.writeRow(w, line, inner - 2, "2", color);
+        try table.writeRow(w, line, inner - 2, "2", color);
     } else if (view.team.standing_summary) |standing| {
-        try render.writeRow(w, standing, inner - 2, "2", color);
+        try table.writeRow(w, standing, inner - 2, "2", color);
     }
     if (view.live) |live| {
-        try render.writeRule(w, .mid, inner);
-        try render.writeRow(w, "LIVE NOW", inner - 2, "1;31", color);
+        try table.writeRule(w, .mid, inner);
+        try table.writeRow(w, "LIVE NOW", inner - 2, "1;31", color);
         const live_line = try gameLine(allocator, live);
         defer allocator.free(live_line);
-        try render.writeRow(w, live_line, inner - 2, "1;31", color);
+        try table.writeRow(w, live_line, inner - 2, "1;31", color);
     }
     if (view.last) |last| {
-        try render.writeRule(w, .mid, inner);
+        try table.writeRule(w, .mid, inner);
         const last_head = try std.fmt.allocPrint(allocator, "Last: {s}", .{last.result});
         defer allocator.free(last_head);
-        try render.writeRow(w, last_head, inner - 2, null, color);
+        try table.writeRow(w, last_head, inner - 2, null, color);
         const last_line = try gameLine(allocator, last);
         defer allocator.free(last_line);
-        try render.writeRow(w, last_line, inner - 2, "2", color);
+        try table.writeRow(w, last_line, inner - 2, "2", color);
     }
     if (upcoming.len > 0) {
-        try render.writeRule(w, .mid, inner);
-        try render.writeRow(w, "Next:", inner - 2, null, color);
+        try table.writeRule(w, .mid, inner);
+        try table.writeRow(w, "Next:", inner - 2, null, color);
         for (upcoming) |game| {
             const next_line = try gameLine(allocator, game);
             defer allocator.free(next_line);
-            try render.writeRow(w, next_line, inner - 2, null, color);
+            try table.writeRow(w, next_line, inner - 2, null, color);
             if (game.probable.len > 0) {
                 const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
                 defer allocator.free(line);
-                try render.writeRow(w, line, inner - 2, "2", color);
+                try table.writeRow(w, line, inner - 2, "2", color);
             }
         }
         if (upcoming.len < view.next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
             defer allocator.free(more);
-            try render.writeRule(w, .mid, inner);
-            try render.writeRow(w, more, inner - 2, "2", color);
+            try table.writeRule(w, .mid, inner);
+            try table.writeRow(w, more, inner - 2, "2", color);
         }
     } else if (view.last == null and view.live == null) {
-        try render.writeRule(w, .mid, inner);
-        try render.writeRow(w, "No games scheduled.", inner - 2, null, color);
+        try table.writeRule(w, .mid, inner);
+        try table.writeRow(w, "No games scheduled.", inner - 2, null, color);
     }
-    try render.writeRule(w, .bottom, inner);
+    try table.writeRule(w, .bottom, inner);
     return out.toOwnedSlice();
 }
 

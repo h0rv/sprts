@@ -6,6 +6,21 @@ const leagues = core.leagues;
 const dates = core.date;
 const router = @import("router.zig");
 const provider = @import("provider.zig");
+const table = @import("table.zig");
+
+/// Box-table surface, re-exported from the shared `table` module so views
+/// that reached these through `render` (e.g. `team_view`) keep compiling
+/// during the migration. New code should import `table.zig` directly.
+pub const Rule = table.Rule;
+pub const Table = table.Table;
+pub const writeCell = table.writeCell;
+pub const writeCellRight = table.writeCellRight;
+pub const writeRow = table.writeRow;
+pub const writeRule = table.writeRule;
+pub const fit = table.fit;
+pub const countCells = table.countCells;
+pub const writeArtRow = table.writeArtRow;
+pub const writeGameMarks = table.writeGameMarks;
 
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
@@ -59,33 +74,33 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    const table = Table{ .writer = w, .inner = inner, .color = color };
-    try table.rule(.top);
+    const t = Table{ .writer = w, .inner = inner, .color = color };
+    try t.rule(.top);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
     defer allocator.free(heading);
-    try table.row(heading, "2");
+    try t.row(heading, "2");
     if (board.games.len == 0) {
-        try table.rule(.mid);
-        try table.row("No games scheduled.", null);
+        try t.rule(.mid);
+        try t.row("No games scheduled.", null);
     }
     for (board.games[0..shown]) |game| {
-        try table.rule(.mid);
-        try table.row(game.status, statusColor(game.state));
+        try t.rule(.mid);
+        try t.row(game.status, statusColor(game.state));
         try writeGameMarks(w, allocator, board.league, &game, inner, color);
         if (game.participants.len == 0) {
-            try table.row(game.name, null);
+            try t.row(game.name, null);
         }
         for (game.participants) |participant| {
-            try table.participantRow(participant);
+            try t.participantRow(participant);
         }
     }
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
         defer allocator.free(more);
-        try table.rule(.mid);
-        try table.row(more, "2");
+        try t.rule(.mid);
+        try t.row(more, "2");
     }
-    try table.rule(.bottom);
+    try t.rule(.bottom);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -103,233 +118,6 @@ fn statusColor(state: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, state, "in")) return "1;31";
     if (std.mem.eql(u8, state, "pre")) return "33";
     return null;
-}
-
-/// Both teams' marks side by side at `.xs`: a horizontal card instead of
-/// a tall stacked block. A side with no mark is skipped; if the pair is
-/// wider than the box, the marks stack vertically. When `color` is set and
-/// a team has a color sidecar, the colored mark renders; otherwise (or
-/// with color=false) the mono mark renders, so `?color=0` strips ALL color.
-fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []const u8, game: *const domain.Game, inner: usize, color: bool) !void {
-    var marks: [2][]const u8 = undefined;
-    var n: usize = 0;
-    for (game.participants) |p| {
-        if (n == marks.len) break;
-        const mark = if (color)
-            core.art.teamArtColor(league, p.abbreviation, .xs) orelse
-                core.art.teamArt(league, p.abbreviation, .xs)
-        else
-            core.art.teamArt(league, p.abbreviation, .xs);
-        if (mark) |m| {
-            marks[n] = m;
-            n += 1;
-        }
-    }
-    if (n == 0) return;
-
-    var rows: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
-    defer for (rows[0..n]) |*r| r.deinit(allocator);
-    var widths: [2]usize = .{ 0, 0 };
-    for (marks[0..n], 0..) |mark, i| {
-        var lines = std.mem.splitScalar(u8, mark, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            widths[i] = @max(widths[i], countVisibleCells(line));
-            try rows[i].append(allocator, line);
-        }
-    }
-
-    const gap: usize = 2;
-    if (n < 2 or widths[0] + gap + widths[1] > inner - 2) {
-        for (marks[0..n]) |mark| {
-            var lines = std.mem.splitScalar(u8, mark, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                try writeArtRow(w, line, inner);
-            }
-        }
-        return;
-    }
-    const height = @max(rows[0].items.len, rows[1].items.len);
-    for (0..height) |r| {
-        try w.writeAll("│ ");
-        for (0..2) |i| {
-            if (i == 1) {
-                var g: usize = 0;
-                while (g < gap) : (g += 1) try w.writeByte(' ');
-            }
-            const line = if (r < rows[i].items.len) rows[i].items[r] else "";
-            try w.writeAll(line);
-            var pad: usize = widths[i] - countVisibleCells(line);
-            while (pad > 0) : (pad -= 1) try w.writeByte(' ');
-        }
-        var fill: usize = inner - 2 - (widths[0] + gap + widths[1]);
-        while (fill > 0) : (fill -= 1) try w.writeByte(' ');
-        try w.writeAll(" │\n");
-    }
-}
-
-/// Terminal cells in a line. The tool guarantees single-cell glyphs, so
-/// code points are cells; on invalid UTF-8 fall back to bytes. SGR
-/// escapes (colored marks) are zero-width and skipped.
-fn countCells(line: []const u8) usize {
-    return countVisibleCells(line);
-}
-
-fn countVisibleCells(line: []const u8) usize {
-    var cells: usize = 0;
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
-            var j = i + 2;
-            while (j < line.len and line[j] != 'm') : (j += 1) {}
-            i = if (j < line.len) j + 1 else line.len;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
-            cells += 1;
-            i += 1;
-            continue;
-        };
-        cells += 1;
-        i += len;
-    }
-    return cells;
-}
-
-/// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
-/// byte-based writeCell would slice glyphs and break the rules. Count code
-/// points instead; the tool guarantees single-cell glyphs.
-fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
-    try w.writeAll("│ ");
-    try w.writeAll(line);
-    var i: usize = countCells(line);
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(" │\n");
-}
-
-fn writeParticipantRow(w: *std.Io.Writer, participant: domain.Participant, color: bool, inner: usize) !void {
-    const table = Table{ .writer = w, .inner = inner, .color = color };
-    try table.participantRow(participant);
-}
-
-pub const Rule = enum { top, mid, bottom };
-
-pub const Table = struct {
-    writer: *std.Io.Writer,
-    inner: usize,
-    color: bool,
-
-    pub fn rule(self: Table, which: Rule) !void {
-        try writeRule(self.writer, which, self.inner);
-    }
-
-    pub fn row(self: Table, line: []const u8, code: ?[]const u8) !void {
-        try writeRow(self.writer, line, self.inner - 2, code, self.color);
-    }
-
-    pub fn participantRow(self: Table, participant: domain.Participant) !void {
-        const mark: ?[]const u8 = if (participant.winner) "32" else null;
-        const w = self.writer;
-        const inner = self.inner;
-        const suffix_len: usize = if (participant.record) |record|
-            2 + countCells(record) + 1
-        else
-            0;
-        try w.writeAll("│ ");
-        // Fixed cells around the name: abbr 4 + spaces 2 + score 4 + check 2.
-        var name_width: usize = undefined;
-        if (participant.abbreviation.len > 0) {
-            try writeCell(w, participant.abbreviation, 4, mark, self.color);
-            try w.writeByte(' ');
-            name_width = inner - 2 - 12;
-        } else {
-            // Athlete identities carry no abbreviation: the name absorbs
-            // the abbr cell plus its separator.
-            name_width = inner - 2 - 7;
-        }
-        name_width = name_width -| suffix_len;
-        try writeCell(w, participant.name, name_width, mark, self.color);
-        try w.writeByte(' ');
-        try writeCellRight(w, participant.score, 4, mark, self.color);
-        if (participant.record) |record| {
-            const use_color = self.color and mark != null;
-            if (use_color) try w.print("\x1b[{s}m", .{mark.?});
-            try w.writeAll(" (");
-            try w.writeAll(record);
-            try w.writeByte(')');
-            if (use_color) try w.writeAll("\x1b[0m");
-        }
-        if (participant.winner) {
-            if (self.color) try w.writeAll("\x1b[32m");
-            try w.writeAll(" ✓");
-            if (self.color) try w.writeAll("\x1b[0m");
-        } else {
-            try w.writeAll("  ");
-        }
-        try w.writeAll(" │\n");
-    }
-};
-
-pub fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    try w.writeAll("│ ");
-    try writeCell(w, s, width, code, color);
-    try w.writeAll(" │\n");
-}
-
-pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
-    const left: []const u8 = switch (which) {
-        .top => "┌",
-        .mid => "├",
-        .bottom => "└",
-    };
-    const right: []const u8 = switch (which) {
-        .top => "┐\n",
-        .mid => "┤\n",
-        .bottom => "┘\n",
-    };
-    try w.writeAll(left);
-    var i: usize = 0;
-    while (i < inner) : (i += 1) try w.writeAll("─");
-    try w.writeAll(right);
-}
-
-/// Writes `s` fitted to exactly `width` cells, truncating at a code point
-/// boundary with an ellipsis when too long. Escape bytes are never part of
-/// the width: color wraps the fitted bytes only.
-pub fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = fit(s, width);
-    const use_color = color and code != null;
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-    const n_written: usize = countCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
-    var i: usize = n_written;
-    while (i < width) : (i += 1) try w.writeByte(' ');
-}
-
-fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = fit(s, width);
-    const use_color = color and code != null;
-    const n_written: usize = countCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
-    var spaces: usize = width -| n_written;
-    while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-}
-
-/// Fits `s` into `width` columns, truncating at a code point boundary
-/// with an ellipsis when too long. Unchanged byte-budget truncation:
-/// only the padding in the callers moved from bytes to cells.
-pub fn fit(s: []const u8, width: usize) struct { usize, bool } {
-    if (s.len <= width) return .{ s.len, false };
-    if (width < 4) return .{ 0, true };
-    var end: usize = width - 3;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return .{ end, true };
 }
 
 fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !void {
