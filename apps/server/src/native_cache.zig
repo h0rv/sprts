@@ -264,6 +264,8 @@ fn cloneGameRefOpt(a: std.mem.Allocator, ref: ?core.schedule.GameRef) !?core.sch
 pub fn cloneTeamView(a: std.mem.Allocator, view: core.schedule.TeamView) !core.schedule.TeamView {
     const next = try a.alloc(core.schedule.GameRef, view.next.len);
     for (view.next, 0..) |ref, i| next[i] = try cloneGameRef(a, ref);
+    const last = try a.alloc(core.schedule.GameRef, view.last.len);
+    for (view.last, 0..) |ref, i| last[i] = try cloneGameRef(a, ref);
     return .{
         .schema_version = try a.dupe(u8, view.schema_version),
         .league = try a.dupe(u8, view.league),
@@ -275,7 +277,7 @@ pub fn cloneTeamView(a: std.mem.Allocator, view: core.schedule.TeamView) !core.s
             .record_summary = try dupeOpt(a, view.team.record_summary),
             .standing_summary = try dupeOpt(a, view.team.standing_summary),
         },
-        .last = try cloneGameRefOpt(a, view.last),
+        .last = last,
         .next = next,
         .live = try cloneGameRefOpt(a, view.live),
     };

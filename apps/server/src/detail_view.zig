@@ -123,11 +123,12 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     return out.toOwnedSlice();
 }
 
-/// Minimal browser page: the same detail table as text, never ANSI, with a
-/// back link. Mirrors `render.scoreHtml` (`<pre>` wrap per scoreHtml pattern).
+/// Minimal browser page: section-by-section like the text renderer,
+/// never ANSI, with links. The status row links back to the league
+/// scoreboard; each participant row links to its team view. Colors ride
+/// as spans (live/upcoming/winner) so the web matches the terminal.
 pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: ?u16, height: ?u16) ![]u8 {
-    const body = try renderText(allocator, game, false, width, height);
-    defer allocator.free(body);
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -135,12 +136,194 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
     defer allocator.free(title);
     try pageHead(w, title);
     try w.writeAll("<pre>");
-    try escapeInto(w, body);
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ game.league_name, game.date });
+    defer allocator.free(heading);
+    try htmlRow(allocator, heading, "dim", inner, w, null);
+    const status_href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ game.league, game.date });
+    defer allocator.free(status_href);
+    try htmlRow(allocator, game.status, stateClass(game.state), inner, w, status_href);
+    for (game.participants) |entry| {
+        const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ game.league, entry.abbreviation });
+        defer allocator.free(href);
+        const row = try participantLine(allocator, entry, inner);
+        defer allocator.free(row);
+        try htmlRow(allocator, row, if (entry.winner) "win" else null, inner, w, href);
+    }
+    if (game.venue) |venue| {
+        if (game.attendance) |crowd| {
+            const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
+            defer allocator.free(line);
+            try htmlRow(allocator, line, null, inner, w, null);
+        } else {
+            try htmlRow(allocator, venue, null, inner, w, null);
+        }
+    } else if (game.attendance) |crowd| {
+        const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
+        defer allocator.free(line);
+        try htmlRow(allocator, line, null, inner, w, null);
+    }
+    if (maxPeriod(game) > 0) {
+        const line = try lineScoreLine(allocator, game, inner);
+        defer allocator.free(line);
+        try htmlRow(allocator, line, null, inner, w, null);
+    }
+    if (game.situation) |situation| {
+        const chip = try situationText(allocator, situation);
+        defer allocator.free(chip);
+        try htmlRow(allocator, chip, "live", inner, w, null);
+        if (situation.last_play) |last| try htmlRow(allocator, last, null, inner, w, null);
+    }
+    if (game.decisions.len > 0 or hasProbables(game)) {
+        for (game.decisions) |decision| {
+            const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ decision.outcome, decision.name });
+            defer allocator.free(line);
+            try htmlRow(allocator, line, null, inner, w, null);
+        }
+        for (game.participants) |entry| {
+            if (entry.probable) |starter| {
+                const line = try std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ entry.abbreviation, starter });
+                defer allocator.free(line);
+                try htmlRow(allocator, line, null, inner, w, null);
+            }
+        }
+    }
+    if (game.scoring_plays.len > 0) {
+        try htmlRow(allocator, "Scoring plays", "dim", inner, w, null);
+        const limit: usize = @min(height orelse 5, game.scoring_plays.len);
+        const start = game.scoring_plays.len - limit;
+        for (game.scoring_plays[start..]) |play| {
+            const line = try std.fmt.allocPrint(allocator, "{s} {s}-{s} {s}", .{ play.period, play.away_score, play.home_score, play.text });
+            defer allocator.free(line);
+            try htmlRow(allocator, line, null, inner, w, null);
+        }
+        if (start > 0) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{start});
+            defer allocator.free(more);
+            try htmlRow(allocator, more, "dim", inner, w, null);
+        }
+    }
+    if (game.leaders.len > 0) {
+        try htmlRow(allocator, "Leaders", "dim", inner, w, null);
+        for (game.leaders[0..@min(game.leaders.len, 8)]) |leader| {
+            try htmlRow(allocator, leader, null, inner, w, null);
+        }
+    }
+    if (game.series) |series| {
+        const series_line = try std.fmt.allocPrint(allocator, "Series: {s}", .{series});
+        defer allocator.free(series_line);
+        try htmlRow(allocator, series_line, null, inner, w, null);
+    }
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}?date={s}\">scores</a>", .{ game.league, game.date });
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ game.league, game.id });
     try w.writeAll("</nav></main></body></html>");
     return out.toOwnedSlice();
+}
+
+/// One HTML table row: padded + escaped cell with optional color span
+/// and link. Mirrors render.zig's writeHtmlTable (kept local: those
+/// helpers are private to render.zig, see the module doc).
+fn htmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
+    try w.writeAll("│ ");
+    if (link) |href| {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, inner - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    try escapeCellInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
+    if (link != null) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
+/// box-safe bytes through untouched.
+fn escapeCellInto(w: *std.Io.Writer, cell: []const u8) !void {
+    for (cell) |byte| switch (byte) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(byte),
+    };
+}
+
+/// CSS class matching the ANSI role for a game state.
+fn stateClass(state: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, state, "in")) return "live";
+    if (std.mem.eql(u8, state, "pre")) return "upcoming";
+    return null;
+}
+
+/// Plain-text participant row content (no borders, no ANSI) for the HTML
+/// linker. Mirrors writeDetailParticipantRow layout.
+fn participantLine(allocator: std.mem.Allocator, participant: detail.DetailParticipant, inner: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    try writeCell(w, participant.abbreviation, 4, null, false);
+    try w.writeByte(' ');
+    try writeCell(w, participant.name, inner - 2 - 12, null, false);
+    try w.writeByte(' ');
+    try writeCellRight(w, participant.score, 4, null, false);
+    if (participant.winner) {
+        try w.writeAll(" ✓");
+    } else {
+        try w.writeAll("  ");
+    }
+    return out.toOwnedSlice();
+}
+
+/// Linescore grid as one pre-wrapped block (period columns + R/H/E).
+/// The text renderer emits one row per line; HTML wraps the same lines
+/// in a single cell each so the grid survives escaping.
+fn lineScoreLine(allocator: std.mem.Allocator, game: detail.GameDetail, inner: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const periods = maxPeriod(game);
+    var head: std.Io.Writer.Allocating = .init(allocator);
+    defer head.deinit();
+    try head.writer.writeAll("    ");
+    var p: usize = 1;
+    while (p <= periods) : (p += 1) try head.writer.print("{d:>3}", .{p});
+    try head.writer.writeAll("   R   H   E");
+    const head_text = try head.toOwnedSlice();
+    defer allocator.free(head_text);
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    try body.writer.writeAll(head_text);
+    for (game.participants) |entry| {
+        var line: std.Io.Writer.Allocating = .init(allocator);
+        defer line.deinit();
+        try line.writer.print("{s:<4}", .{entry.abbreviation});
+        var i: usize = 0;
+        while (i < periods) : (i += 1) {
+            const cell: []const u8 = if (i < entry.lines.len) entry.lines[i].display else "-";
+            try line.writer.print("{s:>3}", .{cell});
+        }
+        try line.writer.print("   {s:>3}   {s:>3}   {s:>3}", .{
+            entry.score,
+            entry.hits orelse "-",
+            entry.errors orelse "-",
+        });
+        const text = try line.toOwnedSlice();
+        defer allocator.free(text);
+        try body.writer.writeByte('\n');
+        try body.writer.writeAll(text);
+    }
+    _ = inner;
+    return body.toOwnedSlice();
 }
 
 fn statusColor(state: []const u8) ?[]const u8 {
@@ -494,6 +677,10 @@ test "detail html wraps in pre and links back" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/401816828\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Participant rows link to their team views, status carries no ANSI.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/ATL\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span") != null);
 }
 
 test "detail error bodies reuse the shared error renderer" {

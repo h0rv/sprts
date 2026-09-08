@@ -1551,6 +1551,12 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
     for (split.upcoming[0..@min(split.upcoming.len, 5)]) |event| {
         try next.append(arena, try gameRefFromEvent(arena, event));
     }
+    var last: std.ArrayList(core.schedule.GameRef) = .empty;
+    var i: usize = split.past.len;
+    while (i > 0 and last.items.len < 5) {
+        i -= 1;
+        try last.append(arena, try gameRefFromEvent(arena, split.past[i]));
+    }
 
     var live: ?core.schedule.GameRef = null;
     if (self.fetch(arena, league, today)) |board| {
@@ -1571,7 +1577,7 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         .league = league.slug,
         .league_name = league.name,
         .team = parsed.team,
-        .last = if (split.past.len > 0) try gameRefFromEvent(arena, split.past[split.past.len - 1]) else null,
+        .last = try last.toOwnedSlice(arena),
         .next = try next.toOwnedSlice(arena),
         .live = live,
     };
@@ -1650,7 +1656,8 @@ test "fetchTeam resolves abbrev case-insensitively and joins live" {
     try std.testing.expectEqualStrings("Philadelphia Phillies", view.team.name);
     try std.testing.expectEqualStrings("80-63", view.team.record_summary.?);
     try std.testing.expectEqualStrings("2nd in NL East", view.team.standing_summary.?);
-    try std.testing.expectEqualStrings("W 5-3", view.last.?.result);
+    try std.testing.expectEqualStrings("W 5-3", view.last[0].result);
+    try std.testing.expectEqual(@as(usize, 1), view.last.len);
     try std.testing.expectEqual(@as(usize, 2), view.next.len);
     try std.testing.expectEqualStrings("Jesus Luzardo", view.next[0].probable);
     try std.testing.expect(view.live != null);
@@ -1687,7 +1694,7 @@ test "fetchTeam falls back to the previous season when the schedule is empty" {
     try std.testing.expectEqual(@as(usize, 2), fake.schedule_calls);
     try std.testing.expect(std.mem.indexOf(u8, fake.first_schedule_url.?, "season=2026") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.last_schedule_url.?, "season=2025") != null);
-    try std.testing.expect(view.last == null);
+    try std.testing.expectEqual(@as(usize, 0), view.last.len);
     try std.testing.expectEqual(@as(usize, 0), view.next.len);
 }
 
@@ -1703,7 +1710,7 @@ test "fetchTeam still renders when the live board fetch fails" {
     const adapter = teamTestAdapter(&fake);
     const view = try fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
     try std.testing.expect(view.live == null);
-    try std.testing.expect(view.last != null);
+    try std.testing.expectEqual(@as(usize, 1), view.last.len);
 }
 
 const team_fixture_schedule_empty =

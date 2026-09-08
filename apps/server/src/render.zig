@@ -81,7 +81,7 @@ pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool,
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         const game_link = try std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{
-            board.league, game.id, board.league,
+            board.league,                                                             game.id, board.league,
             if (game.participants.len > 0) game.participants[0].abbreviation else "",
         });
         defer allocator.free(game_link);
@@ -153,7 +153,11 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
             var lines = std.mem.splitScalar(u8, mark, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
-                try writeArtRow(w, line, inner);
+                try w.writeAll("│ ");
+                try writeContrastLine(w, line);
+                var i: usize = countVisibleCells(line);
+                while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+                try w.writeAll(" │\n");
             }
         }
         return;
@@ -167,7 +171,7 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
                 while (g < gap) : (g += 1) try w.writeByte(' ');
             }
             const line = if (r < rows[i].items.len) rows[i].items[r] else "";
-            try w.writeAll(line);
+            try writeContrastLine(w, line);
             var pad: usize = widths[i] - countVisibleCells(line);
             while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         }
@@ -182,6 +186,75 @@ fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: []con
 /// escapes (colored marks) are zero-width and skipped.
 fn countCells(line: []const u8) usize {
     return countVisibleCells(line);
+}
+
+/// RGB for an xterm-256 index. Mirrors tools/art_convert.py: indices
+/// 16-231 are the 6x6x6 cube over (0,95,135,175,215,255), 232-255 the
+/// grayscale ramp. Indices 0-15 are terminal-themed; marks never use
+/// them, and they read as dark here so they get filtered.
+fn xtermRgb(idx: u8) [3]u16 {
+    if (idx >= 232) {
+        const v: u16 = 8 + 10 * @as(u16, idx - 232);
+        return .{ v, v, v };
+    }
+    if (idx >= 16) {
+        const levels = [_]u16{ 0, 95, 135, 175, 215, 255 };
+        const k: usize = idx - 16;
+        return .{ levels[k / 36], levels[(k / 6) % 6], levels[k % 6] };
+    }
+    return .{ 0, 0, 0 };
+}
+
+/// True when an xterm color is too dark to read on a dark terminal
+/// background (gruvbox-dark and friends): near-black logo ink rendered
+/// in SGR black is invisible, while the terminal foreground (mono mark)
+/// always reads. Threshold is relative luminance below ~48/255.
+fn isDarkXterm(idx: u8) bool {
+    const rgb = xtermRgb(idx);
+    // Rec. 709 luma, integer math: 2126*R + 7152*G + 722*B < 48*10000.
+    const luma = 2126 * @as(u32, rgb[0]) + 7152 * @as(u32, rgb[1]) + 722 * @as(u32, rgb[2]);
+    return luma < 480000;
+}
+
+/// Copy a (possibly colored) mark line, dropping SGR `38;5;N` runs whose
+/// palette index is unreadably dark and keeping the glyphs. Other runs
+/// (resets) pass through so open spans still close. Keeps logo ink
+/// visible on dark terminals without regenerating the data files.
+fn writeContrastLine(w: *std.Io.Writer, line: []const u8) !void {
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and line[j] != 'm') : (j += 1) {}
+            if (j >= line.len) return;
+            const seq = line[i .. j + 1];
+            if (parseXtermIndex(seq)) |idx| {
+                if (!isDarkXterm(idx)) try w.writeAll(seq);
+            } else {
+                try w.writeAll(seq);
+            }
+            i = j + 1;
+            continue;
+        }
+        try w.writeByte(line[i]);
+        i += 1;
+    }
+}
+
+/// Parse `ESC[38;5;Nm` into N. Null for resets and anything else.
+fn parseXtermIndex(seq: []const u8) ?u8 {
+    const prefix = "\x1b[38;5;";
+    if (seq.len <= prefix.len or !std.mem.startsWith(u8, seq, prefix)) return null;
+    if (seq[seq.len - 1] != 'm') return null;
+    const digits = seq[prefix.len .. seq.len - 1];
+    if (digits.len == 0 or digits.len > 3) return null;
+    var n: u16 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n > 255) return null;
+    return @intCast(n);
 }
 
 fn countVisibleCells(line: []const u8) usize {
@@ -207,10 +280,12 @@ fn countVisibleCells(line: []const u8) usize {
 
 /// Art rows are braille: 3 bytes per glyph but one terminal cell each, so
 /// byte-based writeCell would slice glyphs and break the rules. Count code
-/// points instead; the tool guarantees single-cell glyphs.
-fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
+/// points instead; the tool guarantees single-cell glyphs. Dark SGR runs
+/// are filtered for contrast (see writeContrastLine). Re-exported for the
+/// team view logo (see the `pub` markers above).
+pub fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     try w.writeAll("│ ");
-    try w.writeAll(line);
+    try writeContrastLine(w, line);
     var i: usize = countCells(line);
     while (i < inner - 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
@@ -472,9 +547,11 @@ fn gameIsLive(game: domain.Game) bool {
     return std.mem.eql(u8, game.state, "in");
 }
 
-/// Live games first, then the rest of today, then idle leagues as links.
-/// Leagues with no board (fetch failed) count as idle: the page never
-/// fails because of one league.
+/// Live games first, then one section per league with games today
+/// (league header links to the league page in HTML), then idle leagues
+/// as links. Leagues with no board (fetch failed) count as idle: the
+/// page never fails because of one league. A blank spacer row separates
+/// each section so dense days stay scannable.
 fn homeSections(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -484,7 +561,6 @@ fn homeSections(
     day: []const u8,
 ) !void {
     var live = false;
-    var today = false;
     for (boards) |result| {
         const board = result.board orelse continue;
         for (board.games) |game| {
@@ -492,30 +568,52 @@ fn homeSections(
                 if (!live) {
                     live = true;
                     try writeRule(w, .mid, default_inner_width);
-                    try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color and !html);
+                    if (html) {
+                        try writeHtmlRow(allocator, "LIVE NOW", "live", default_inner_width, w, null);
+                    } else {
+                        try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color);
+                    }
                 }
-                try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+                try homeGameLine(allocator, w, result.league, game, color and !html, html);
             }
         }
     }
+    var first_section = true;
     for (boards) |result| {
         const board = result.board orelse continue;
-        var shown = false;
+        var has_today = false;
+        for (board.games) |game| {
+            if (!gameIsLive(game)) {
+                has_today = true;
+                break;
+            }
+        }
+        if (!has_today) continue;
+        if (!first_section) try spacerRow(w);
+        try writeRule(w, .mid, default_inner_width);
+        // League header: whole line links to the league page in HTML.
+        const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, day });
+        defer allocator.free(header);
+        if (html) {
+            const href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ result.league.slug, day });
+            defer allocator.free(href);
+            try writeHtmlRow(allocator, header, "dim", default_inner_width, w, href);
+        } else {
+            try writeRow(w, header, default_inner_width - 2, "2", color);
+        }
         for (board.games) |game| {
             if (gameIsLive(game)) continue;
-            if (!shown) {
-                if (!today) {
-                    today = true;
-                    try writeRule(w, .mid, default_inner_width);
-                    try writeRow(w, "TODAY", default_inner_width - 2, "2", color and !html);
-                }
-                shown = true;
-            }
-            try homeGameLine(allocator, w, result.league, game, day, color and !html, html);
+            try homeGameLine(allocator, w, result.league, game, color and !html, html);
         }
+        first_section = false;
     }
+    if (!first_section) try spacerRow(w);
     try writeRule(w, .mid, default_inner_width);
-    try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color and !html);
+    if (html) {
+        try writeHtmlRow(allocator, "ALL LEAGUES", "dim", default_inner_width, w, null);
+    } else {
+        try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color);
+    }
     for (boards) |result| {
         const board = result.board;
         if (board != null and board.?.games.len > 0) continue;
@@ -529,21 +627,80 @@ fn homeSections(
     }
 }
 
+/// A blank spacer row: `│` borders with nothing between, so sections
+/// breathe without breaking the table frame. Callers place one between
+/// sections, never after the last line before a rule.
+fn spacerRow(w: *std.Io.Writer) !void {
+    try w.writeAll("│ ");
+    var i: usize = 0;
+    while (i < default_inner_width - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(" │\n");
+}
+
 fn homeGameLine(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     league: *const leagues.League,
     game: domain.Game,
-    day: []const u8,
     color: bool,
     html: bool,
 ) !void {
     const line = try gameLine(allocator, league, game) orelse return;
     defer allocator.free(line);
+    if (html) {
+        // Whole line links to the game view; the status word is colored.
+        const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, game.id });
+        defer allocator.free(href);
+        try writeHtmlGameLine(allocator, line, game, w, href);
+        return;
+    }
     try w.writeAll("│ ");
-    if (html) try w.print("<a href=\"/{s}?date={s}\">", .{ league.slug, day });
     try writeCell(w, line, 48, statusColor(game.state), color);
-    if (html) try w.writeAll("</a>");
+    try w.writeAll(" │\n");
+}
+
+/// HTML home game line: `│ <a>line</a> │` where the status word carries
+/// its live/upcoming color span inside the link. Padding and escaping
+/// reuse writeHtmlTable; the span wraps the whole cell (simple, valid)
+/// when the game is live or upcoming, plain otherwise.
+fn writeHtmlGameLine(allocator: std.mem.Allocator, line: []const u8, game: domain.Game, w: *std.Io.Writer, href: []const u8) !void {
+    try w.writeAll("│ ");
+    try w.writeAll("<a href=\"");
+    try escapeInto(w, href);
+    try w.writeAll("\">");
+    try writeHtmlCell(allocator, line, stateClass(game.state), w);
+    try w.writeAll("</a> │\n");
+}
+
+/// Padded + escaped cell with optional color span, without borders or
+/// link. Shared by home game lines; scoreHtml rows use writeHtmlTable.
+fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, w: *std.Io.Writer) !void {
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, default_inner_width - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    try escapeCellInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
+}
+
+/// Section header row for the HTML home renderer (league names, LIVE
+/// NOW, ALL LEAGUES): padded cell with optional span and link.
+fn writeHtmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
+    _ = inner;
+    try w.writeAll("│ ");
+    if (link) |href| {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    try writeHtmlCell(allocator, s, css, w);
+    if (link != null) try w.writeAll("</a>");
     try w.writeAll(" │\n");
 }
 
@@ -638,7 +795,7 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
     try w.writeAll("<pre>");
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ board.league_name, board.date });
     defer allocator.free(heading);
-    try writeHtmlTable(allocator, heading, null, inner, w, null);
+    try writeHtmlTable(allocator, heading, "dim", inner, w, null);
     if (board.games.len == 0) {
         try writeHtmlTable(allocator, "No games scheduled.", null, inner, w, null);
     }
@@ -646,14 +803,14 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
         // Status row links to the game view.
         const status_link = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ board.league, game.id });
         defer allocator.free(status_link);
-        try writeHtmlTable(allocator, game.status, statusColor(game.state), inner, w, status_link);
+        try writeHtmlTable(allocator, game.status, stateClass(game.state), inner, w, status_link);
         // Participant rows link to their team views.
         for (game.participants) |participant| {
             const team_link = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ board.league, participant.abbreviation });
             defer allocator.free(team_link);
             const row = try participantText(allocator, participant, inner);
             defer allocator.free(row);
-            try writeHtmlTable(allocator, row, if (participant.winner) "32" else null, inner, w, team_link);
+            try writeHtmlTable(allocator, row, if (participant.winner) "win" else null, inner, w, team_link);
         }
         if (game.participants.len == 0 and game.name.len > 0) {
             try writeHtmlTable(allocator, game.name, null, inner, w, null);
@@ -662,7 +819,7 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
         defer allocator.free(more);
-        try writeHtmlTable(allocator, more, "2", inner, w, null);
+        try writeHtmlTable(allocator, more, "dim", inner, w, null);
     }
     try w.writeAll("</pre>");
     const previous = try dates.shift(allocator, board.date, -1);
@@ -681,13 +838,18 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
 /// One table row as HTML: `│ <a href>cell</a> │` with the cell padded to
 /// `inner - 2` columns and escaped. Either link may be null for a plain
 /// row. Cell content is escaped so status text like `Final <OT>` cannot
-/// break the page.
-fn writeHtmlTable(allocator: std.mem.Allocator, s: []const u8, code: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
-    _ = code;
+/// break the page. `css` wraps the cell in a span for the same roles the
+/// text renderer colors with ANSI (live/upcoming/winner/dim).
+fn writeHtmlTable(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
     try w.writeAll("│ ");
     if (link) |href| {
         try w.writeAll("<a href=\"");
         try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
         try w.writeAll("\">");
     }
     var cell: std.Io.Writer.Allocating = .init(allocator);
@@ -696,6 +858,7 @@ fn writeHtmlTable(allocator: std.mem.Allocator, s: []const u8, code: ?[]const u8
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     try escapeCellInto(w, padded);
+    if (css != null) try w.writeAll("</span>");
     if (link != null) try w.writeAll("</a>");
     try w.writeAll(" │\n");
 }
@@ -824,8 +987,16 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}nav{margin-top:14px;display:flex;gap:16px;font:14px ui-monospace,monospace}a{color:#6fd3a0}</style>
+    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}nav{margin-top:14px;display:flex;gap:16px;font:14px ui-monospace,monospace}a{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}</style>
 ;
+
+/// CSS class matching the ANSI role for a game state: live games glow
+/// red, upcoming games read yellow, finished games stay plain.
+fn stateClass(state: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, state, "in")) return "live";
+    if (std.mem.eql(u8, state, "pre")) return "upcoming";
+    return null;
+}
 
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
     return validatedJson(leagues.LeagueList, allocator, .{ .leagues = &leagues.all });
@@ -1085,10 +1256,10 @@ test "home groups live games, then today, then idle leagues" {
     const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(output);
     const live_at = std.mem.indexOf(u8, output, "LIVE NOW").?;
-    const today_at = std.mem.indexOf(u8, output, "TODAY").?;
+    const nba_at = std.mem.indexOf(u8, output, "NBA").?;
     const leagues_at = std.mem.indexOf(u8, output, "ALL LEAGUES").?;
-    try std.testing.expect(live_at < today_at);
-    try std.testing.expect(today_at < leagues_at);
+    try std.testing.expect(live_at < nba_at);
+    try std.testing.expect(nba_at < leagues_at);
     try std.testing.expect(std.mem.indexOf(u8, output, "mlb  AWY 0 @ HME 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "nba  TRD @ FRT  7:05 PM ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "nfl") != null);
@@ -1096,10 +1267,13 @@ test "home groups live games, then today, then idle leagues" {
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/api/v1/leagues") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, repo_url) != null);
     try expectAlignedTable(output);
+    // Whitespace: a blank spacer row separates each section.
+    try std.testing.expect(std.mem.indexOf(u8, output, "│                                                  │\n") != null);
 
     const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
     defer std.testing.allocator.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nba?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "github") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
@@ -1135,6 +1309,22 @@ test "scoreboard table rows align with the frame" {
     const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
     try expectAlignedTable(output);
+}
+
+test "dark logo ink is filtered for terminal contrast" {
+    // Padres-style near-black (xterm 16) is dropped, readable red kept,
+    // resets pass through so spans still close.
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeContrastLine(&out.writer, "\x1b[38;5;16m██\x1b[0m \x1b[38;5;196m██\x1b[0m");
+    const got = try out.toOwnedSlice();
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("██\x1b[0m \x1b[38;5;196m██\x1b[0m", got);
+    try std.testing.expect(isDarkXterm(16));
+    try std.testing.expect(!isDarkXterm(196));
+    try std.testing.expect(!isDarkXterm(226));
+    try std.testing.expectEqual(@as(?u8, 196), parseXtermIndex("\x1b[38;5;196m"));
+    try std.testing.expect(parseXtermIndex("\x1b[0m") == null);
 }
 
 test "text renderer prints both marks side by side" {
