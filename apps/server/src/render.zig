@@ -1233,7 +1233,9 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
 /// Home page mark: the pixel-S favicon displayed above the table (outside
 /// `<pre>`, so visible-text tests never see it). Fixed size, cached with
 /// the favicon itself.
-pub const home_logo_mark = "<img src=\"/favicon.svg\" alt=\"sprts\" width=\"40\" height=\"40\">\n";
+pub const home_logo_mark =
+    "<span class=\"logo-dark\">" ++ logo_dark_svg ++ "</span>" ++
+    "<span class=\"logo-light\">" ++ logo_light_svg ++ "</span>\n";
 
 pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1330,7 +1332,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}</style>
+    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:inline}}</style>
 ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -1338,9 +1340,21 @@ const page_style =
 /// palette. Served verbatim at `/favicon.svg` and linked from every
 /// page head; no script, no external assets, no font dependency.
 pub const favicon_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><g fill="#e6ebe7" shape-rendering="crispEdges"><rect x="14" y="8" width="6" height="6"/><rect x="20" y="8" width="6" height="6"/><rect x="26" y="8" width="6" height="6"/><rect x="32" y="8" width="6" height="6"/><rect x="38" y="8" width="6" height="6"/><rect x="44" y="8" width="6" height="6"/><rect x="8" y="14" width="6" height="6"/><rect x="14" y="14" width="6" height="6"/><rect x="8" y="20" width="6" height="6"/><rect x="14" y="20" width="6" height="6"/><rect x="14" y="26" width="6" height="6"/><rect x="20" y="26" width="6" height="6"/><rect x="26" y="26" width="6" height="6"/><rect x="32" y="26" width="6" height="6"/><rect x="38" y="26" width="6" height="6"/><rect x="44" y="26" width="6" height="6"/><rect x="44" y="32" width="6" height="6"/><rect x="50" y="32" width="6" height="6"/><rect x="44" y="38" width="6" height="6"/><rect x="50" y="38" width="6" height="6"/><rect x="8" y="44" width="6" height="6"/><rect x="14" y="44" width="6" height="6"/><rect x="44" y="44" width="6" height="6"/><rect x="50" y="44" width="6" height="6"/><rect x="14" y="50" width="6" height="6"/><rect x="20" y="50" width="6" height="6"/><rect x="26" y="50" width="6" height="6"/><rect x="32" y="50" width="6" height="6"/><rect x="38" y="50" width="6" height="6"/><rect x="44" y="50" width="6" height="6"/></g></svg>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><g fill="#e6ebe7" shape-rendering="crispEdges"><rect x="14" y="2" width="12" height="12"/><rect x="26" y="2" width="12" height="12"/><rect x="38" y="2" width="12" height="12"/><rect x="14" y="14" width="12" height="12"/><rect x="14" y="26" width="12" height="12"/><rect x="26" y="26" width="12" height="12"/><rect x="38" y="26" width="12" height="12"/><rect x="38" y="38" width="12" height="12"/><rect x="14" y="50" width="12" height="12"/><rect x="26" y="50" width="12" height="12"/><rect x="38" y="50" width="12" height="12"/></g></svg>
 ;
 
+/// Pixel wordmark `sprts` (lowercase, chunky rects like the
+/// favicon): transparent backgrounds so the page shows through.
+/// `logo_dark_svg` carries light ink for dark surfaces,
+/// `logo_light_svg` dark ink for light surfaces; the home page
+/// shows one or the other via the theme-swap classes below.
+pub const logo_dark_svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70"><g fill="#e6ebe7" shape-rendering="crispEdges"><rect x="0" y="0" width="10" height="10"/><rect x="10" y="0" width="10" height="10"/><rect x="20" y="0" width="10" height="10"/><rect x="0" y="10" width="10" height="10"/><rect x="0" y="20" width="10" height="10"/><rect x="10" y="20" width="10" height="10"/><rect x="20" y="20" width="10" height="10"/><rect x="20" y="30" width="10" height="10"/><rect x="0" y="40" width="10" height="10"/><rect x="10" y="40" width="10" height="10"/><rect x="20" y="40" width="10" height="10"/><rect x="40" y="0" width="10" height="10"/><rect x="50" y="0" width="10" height="10"/><rect x="40" y="10" width="10" height="10"/><rect x="60" y="10" width="10" height="10"/><rect x="40" y="20" width="10" height="10"/><rect x="50" y="20" width="10" height="10"/><rect x="40" y="30" width="10" height="10"/><rect x="40" y="40" width="10" height="10"/><rect x="80" y="0" width="10" height="10"/><rect x="80" y="10" width="10" height="10"/><rect x="90" y="10" width="10" height="10"/><rect x="80" y="20" width="10" height="10"/><rect x="80" y="30" width="10" height="10"/><rect x="80" y="40" width="10" height="10"/><rect x="120" y="0" width="10" height="10"/><rect x="130" y="0" width="10" height="10"/><rect x="140" y="0" width="10" height="10"/><rect x="130" y="10" width="10" height="10"/><rect x="130" y="20" width="10" height="10"/><rect x="130" y="30" width="10" height="10"/><rect x="130" y="40" width="10" height="10"/><rect x="160" y="0" width="10" height="10"/><rect x="170" y="0" width="10" height="10"/><rect x="180" y="0" width="10" height="10"/><rect x="160" y="10" width="10" height="10"/><rect x="160" y="20" width="10" height="10"/><rect x="170" y="20" width="10" height="10"/><rect x="180" y="20" width="10" height="10"/><rect x="180" y="30" width="10" height="10"/><rect x="160" y="40" width="10" height="10"/><rect x="170" y="40" width="10" height="10"/><rect x="180" y="40" width="10" height="10"/></g></svg>
+;
+
+pub const logo_light_svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70"><g fill="#1c2420" shape-rendering="crispEdges"><rect x="0" y="0" width="10" height="10"/><rect x="10" y="0" width="10" height="10"/><rect x="20" y="0" width="10" height="10"/><rect x="0" y="10" width="10" height="10"/><rect x="0" y="20" width="10" height="10"/><rect x="10" y="20" width="10" height="10"/><rect x="20" y="20" width="10" height="10"/><rect x="20" y="30" width="10" height="10"/><rect x="0" y="40" width="10" height="10"/><rect x="10" y="40" width="10" height="10"/><rect x="20" y="40" width="10" height="10"/><rect x="40" y="0" width="10" height="10"/><rect x="50" y="0" width="10" height="10"/><rect x="40" y="10" width="10" height="10"/><rect x="60" y="10" width="10" height="10"/><rect x="40" y="20" width="10" height="10"/><rect x="50" y="20" width="10" height="10"/><rect x="40" y="30" width="10" height="10"/><rect x="40" y="40" width="10" height="10"/><rect x="80" y="0" width="10" height="10"/><rect x="80" y="10" width="10" height="10"/><rect x="90" y="10" width="10" height="10"/><rect x="80" y="20" width="10" height="10"/><rect x="80" y="30" width="10" height="10"/><rect x="80" y="40" width="10" height="10"/><rect x="120" y="0" width="10" height="10"/><rect x="130" y="0" width="10" height="10"/><rect x="140" y="0" width="10" height="10"/><rect x="130" y="10" width="10" height="10"/><rect x="130" y="20" width="10" height="10"/><rect x="130" y="30" width="10" height="10"/><rect x="130" y="40" width="10" height="10"/><rect x="160" y="0" width="10" height="10"/><rect x="170" y="0" width="10" height="10"/><rect x="180" y="0" width="10" height="10"/><rect x="160" y="10" width="10" height="10"/><rect x="160" y="20" width="10" height="10"/><rect x="170" y="20" width="10" height="10"/><rect x="180" y="20" width="10" height="10"/><rect x="180" y="30" width="10" height="10"/><rect x="160" y="40" width="10" height="10"/><rect x="170" y="40" width="10" height="10"/><rect x="180" y="40" width="10" height="10"/></g></svg>
+;
 /// Footer theme toggle: a single localStorage key persists the choice;
 /// without one the OS preference wins (matchMedia before first paint, so
 /// there is no dark flash either way). The footer link flips `data-theme`
@@ -1562,8 +1576,11 @@ test "HTML pages link and never carry ANSI" {
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);
-    // Pixel mark above the table, outside the plaintext block.
+    // Pixel mark above the table, outside the plaintext block: both
+    // theme variants ride along, CSS shows exactly one.
     try std.testing.expect(std.mem.indexOf(u8, homepage, home_logo_mark) != null);
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "logo-dark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "logo-light") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/mlb\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/docs\">docs</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/openapi.json\">spec</a>") != null);
@@ -1813,6 +1830,14 @@ test "footer nav ends with the theme toggle on every page" {
     // Pixel mark, not a font glyph: chunky rects with crisp edges.
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "shape-rendering=\"crispEdges\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<text") == null);
+    // Wordmark variants: dark surfaces get light ink and vice versa, no
+    // fonts anywhere, theme swap rides the data-theme CSS classes.
+    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "#e6ebe7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "#1c2420") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "viewBox=\"-10 -10 210 70\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "font") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-light") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-dark") != null);
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
