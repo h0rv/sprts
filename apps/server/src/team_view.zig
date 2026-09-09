@@ -14,8 +14,8 @@ const tz = @import("tz.zig");
 
 /// Text view: logo mark, header (name, record, standing), LIVE row when
 /// present, last results (up to 5), then the next games (up to 5). `height`
-/// caps the next tail (`+N more`); last games always show all five so the
-/// recent form reads at a glance. Empty when nothing is scheduled.
+/// caps the next tail (`+N more (?height=M)`); last games always show all
+/// five so the recent form reads at a glance. Empty when nothing is scheduled.
 pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     const upcoming = view.next[0..@min(view.next.len, height orelse view.next.len)];
@@ -89,7 +89,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
             }
         }
         if (upcoming.len < view.next.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.next.len - upcoming.len, view.next.len });
             defer allocator.free(more);
             try table.writeLine(w, more, cols, "2", color);
         }
@@ -98,8 +98,8 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
     // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
-    // absent). Each side shows up to `height orelse 5` rows with a `+N more`
-    // trailer, mirroring the Next tail. Earlier continues Last newest-first;
+    // absent). Each side shows up to `height orelse 5` rows with a
+    // `+N more (?height=M)` trailer, mirroring the Next tail. Earlier continues Last newest-first;
     // Later continues Next chronological, with probable starters like Next.
     if (view.extra_past.len > 0) {
         try w.writeByte('\n');
@@ -111,7 +111,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
             try table.writeLine(w, line, cols, null, color);
         }
         if (shown_past.len < view.extra_past.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.extra_past.len - shown_past.len, view.extra_past.len });
             defer allocator.free(more);
             try table.writeLine(w, more, cols, "2", color);
         }
@@ -131,7 +131,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
             }
         }
         if (shown_next.len < view.extra_next.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.extra_next.len - shown_next.len, view.extra_next.len });
             defer allocator.free(more);
             try table.writeLine(w, more, cols, "2", color);
         }
@@ -276,7 +276,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
             }
         }
         if (upcoming.len < view.next.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.next.len - upcoming.len, view.next.len });
             defer allocator.free(more);
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
@@ -292,7 +292,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
         for (shown_past) |game| try teamGameHtml(allocator, w, league_slug, game, null, cols);
         if (shown_past.len < view.extra_past.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.extra_past.len - shown_past.len, view.extra_past.len });
             defer allocator.free(more);
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
@@ -310,7 +310,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
             }
         }
         if (shown_next.len < view.extra_next.len) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.extra_next.len - shown_next.len, view.extra_next.len });
             defer allocator.free(more);
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
@@ -343,7 +343,6 @@ fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const
     if (game.id.len > 0) try w.writeAll("</a>");
     try w.writeByte('\n');
 }
-
 
 /// One-byte HTML escaper for `table.writeArtLineHtml`: escape `&<>"'`,
 /// pass glyph bytes through. Mirrors `render.escapeInto` per byte.
@@ -447,7 +446,7 @@ test "team text shows header, live, last, and next with probables" {
 test "team text honors height and colors live rows" {
     const capped = try renderText(std.testing.allocator, testView(), false, null, 1);
     defer std.testing.allocator.free(capped);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more (?height=2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, capped, "09-08") == null);
     try std.testing.expect(std.mem.indexOf(u8, capped, "09-07") != null);
 
@@ -569,16 +568,25 @@ pub fn renderTextOneLine(arena: std.mem.Allocator, view: schedule.TeamView, colo
         try w.writeAll(" | ");
     }
     try w.writeAll("Last: ");
-    try writeResults(w, view.last);
+    try writeResults(w, arena, view.last);
     try w.writeAll(" | Next: ");
-    try writeResults(w, view.next);
+    try writeResults(w, arena, view.next);
     if (view.live) |live| {
         try w.writeAll(" | Live: ");
-        const s: []const u8 = if (live.result.len > 0) live.result else live.status;
-        if (color) {
-            try w.print("\x1b[1;31m{s}\x1b[0m", .{s});
+        if (live.result.len > 0) {
+            if (color) {
+                try w.print("\x1b[1;31m{s}\x1b[0m", .{live.result});
+            } else {
+                try w.writeAll(live.result);
+            }
         } else {
-            try w.writeAll(s);
+            const s = try tz.normalizeEastern(arena, live.status);
+            defer arena.free(s);
+            if (color) {
+                try w.print("\x1b[1;31m{s}\x1b[0m", .{s});
+            } else {
+                try w.writeAll(s);
+            }
         }
     }
     try w.writeByte('\n');
@@ -586,7 +594,9 @@ pub fn renderTextOneLine(arena: std.mem.Allocator, view: schedule.TeamView, colo
 }
 
 // one-line: comma-joined `result` (else `status`) list, or `none`.
-fn writeResults(w: *std.Io.Writer, games: []const schedule.GameRef) !void {
+// Empty results fall back to the ESPN status, folded to the generic ET
+// convention like every other displayed row time.
+fn writeResults(w: *std.Io.Writer, arena: std.mem.Allocator, games: []const schedule.GameRef) !void {
     if (games.len == 0) {
         try w.writeAll("none");
         return;
@@ -596,7 +606,9 @@ fn writeResults(w: *std.Io.Writer, games: []const schedule.GameRef) !void {
         if (game.result.len > 0) {
             try w.writeAll(game.result);
         } else {
-            try w.writeAll(game.status);
+            const status = try tz.normalizeEastern(arena, game.status);
+            defer arena.free(status);
+            try w.writeAll(status);
         }
     }
 }
@@ -780,7 +792,7 @@ test "team depth overflow honors height with trailers" {
     try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f1") != null);
     try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f2") != null);
     try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f3") == null);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more (?height=3)") != null);
     _ = try std.unicode.Utf8View.init(capped);
 }
 
@@ -824,3 +836,28 @@ test "team depth overflow rides the json wire format additively" {
     try std.testing.expectEqual(@as(usize, 0), legacy.extra_next.len);
 }
 
+test "team trailers hint at ?height= and empty results read ET" {
+    // Capped Next tail names the height that lists everything.
+    const capped = try renderText(std.testing.allocator, testView(), false, null, 1);
+    defer std.testing.allocator.free(capped);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more (?height=2)") != null);
+    const page = try teamHtml(std.testing.allocator, testView(), "mlb", null, 1);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "+1 more (?height=2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Empty results fall back to the ESPN status, folded to generic ET.
+    var view = testView();
+    var next = [_]schedule.GameRef{ view.next[0], view.next[1] };
+    next[0].result = "";
+    next[0].status = "9/7 - 1:05 PM EDT";
+    next[1].result = "";
+    next[1].status = "1/15 - 7:00 PM EST";
+    view.next = &next;
+    view.last = &.{};
+    view.live = null;
+    const quiet = try renderTextOneLine(std.testing.allocator, view, false, true);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "9/7 - 1:05 PM ET, 1/15 - 7:00 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "EDT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "EST") == null);
+}
