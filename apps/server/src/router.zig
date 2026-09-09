@@ -178,7 +178,7 @@ pub fn parse(target: []const u8) Route {
     }
 
     const day = queryValue(query, "date");
-    if (day) |value| if (!dates.validate(value)) return .bad_date;
+    if (day) |value| if (!dates.validate(value) and !dates.isRelativeToken(value)) return .bad_date;
     if (std.mem.eql(u8, slug, "all")) return .{ .all = .{
         .date = day,
         .color = display.color,
@@ -464,16 +464,55 @@ test "all route parses date and display flags, never a league" {
     const sized = parse("/all?width=80&height=3").all;
     try std.testing.expect(sized.width.? == 80);
     try std.testing.expect(sized.height.? == 3);
-    try std.testing.expect(parse("/all?date=tomorrow") == .bad_date);
-    try std.testing.expect(parse("/api/v1/all?date=tomorrow") == .bad_date);
+    try std.testing.expect(parse("/all?date=Tomorrow") == .bad_date);
+    try std.testing.expect(parse("/api/v1/all?date=Tomorrow") == .bad_date);
     // A league literally named "all" is unreachable; the digest owns /all.
     try std.testing.expect(parse("/all") != .scoreboard);
 }
 
 test "bad dates and unknown shapes still route" {
-    try std.testing.expect(parse("/mlb?date=tomorrow") == .bad_date);
+    try std.testing.expect(parse("/mlb?date=2026-13-40") == .bad_date);
     try std.testing.expect(parse("/mlb/a/b") == .not_found);
-    try std.testing.expect(parse("/api/v1/mlb?date=tomorrow") == .bad_date);
+    try std.testing.expect(parse("/api/v1/mlb?date=2026-13-40") == .bad_date);
+    // Relative tokens are lowercase-exact; any other casing stays strict.
+    try std.testing.expect(parse("/mlb?date=Tomorrow") == .bad_date);
+    try std.testing.expect(parse("/mlb?date=TODAY") == .bad_date);
+    try std.testing.expect(parse("/mlb?date= tomorrow") == .bad_date);
+}
+
+test "relative date tokens parse on scoreboard and all routes" {
+    // Raw tokens ride through verbatim; the serve path resolves them via
+    // core.date.resolveDate(arena, raw, request_day).
+    for ([_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "/mlb?date=today", .want = "today" },
+        .{ .path = "/mlb?date=tomorrow", .want = "tomorrow" },
+        .{ .path = "/mlb?date=yesterday", .want = "yesterday" },
+    }) |case| {
+        const route = parse(case.path);
+        try std.testing.expect(route == .scoreboard);
+        try std.testing.expectEqualStrings(case.want, route.scoreboard.date.?);
+    }
+    for ([_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "/all?date=today", .want = "today" },
+        .{ .path = "/all?date=tomorrow", .want = "tomorrow" },
+        .{ .path = "/all?date=yesterday", .want = "yesterday" },
+    }) |case| {
+        const route = parse(case.path);
+        try std.testing.expect(route == .all);
+        try std.testing.expectEqualStrings(case.want, route.all.date.?);
+    }
+    // /api/v1/ twins parse the same tokens (JSON by address).
+    const api_board = parse("/api/v1/mlb?date=tomorrow");
+    try std.testing.expect(api_board == .scoreboard);
+    try std.testing.expectEqualStrings("tomorrow", api_board.scoreboard.date.?);
+    try std.testing.expect(isJsonTarget("/api/v1/mlb?date=tomorrow"));
+    const api_all = parse("/api/v1/all?date=yesterday");
+    try std.testing.expect(api_all == .all);
+    try std.testing.expectEqualStrings("yesterday", api_all.all.date.?);
+    // Tokens compose with display params.
+    const composed = parse("/mlb?date=today&width=80").scoreboard;
+    try std.testing.expectEqualStrings("today", composed.date.?);
+    try std.testing.expect(composed.width.? == 80);
 }
 
 test "single-letter aliases combine and separate" {
