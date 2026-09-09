@@ -258,7 +258,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             const color = all_route.color orelse color_default;
             const body = switch (format) {
                 .text => if (all_route.oneline)
-                    try allOneLine(arena, sections, color)
+                    try allOneLine(arena, sections, color, all_route.quiet, zone)
                 else
                     try server_app.digest.textWithZone(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet, zone),
                 .html => try server_app.digest.htmlWithZone(arena, sections, day, all_route.width, all_route.height, all_route.quiet, zone),
@@ -390,42 +390,28 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
 }
 
 /// `/all?0`: every game in the digest, one per line, across leagues.
-/// Same per-game shape as `render.homeOneLine`; idle/unavailable leagues
-/// emit nothing; empty digest is a single `No games scheduled.` line.
-fn allOneLine(arena: std.mem.Allocator, sections: []const server_app.digest.DigestSection, color: bool) ![]u8 {
-    _ = color;
-    var out: std.Io.Writer.Allocating = .init(arena);
-    errdefer out.deinit();
-    var any = false;
-    for (sections) |section| {
-        const board = section.board orelse continue;
-        for (board.games) |game| {
-            const first = if (game.participants.len >= 1) game.participants[0] else null;
-            const second = if (game.participants.len >= 2) game.participants[1] else null;
-            if (first != null and second != null) {
-                const away, const home_team = if (std.mem.eql(u8, second.?.home_away orelse "", "home"))
-                    .{ first.?, second.? }
-                else
-                    .{ second.?, first.? };
-                if (away.score.len > 0 or home_team.score.len > 0) {
-                    try out.writer.print("{s} {s} {s} @ {s} {s}  {s}\n", .{
-                        section.league.slug, board.date, away.abbreviation, away.score, home_team.abbreviation, home_team.score,
-                    });
-                } else {
-                    try out.writer.print("{s} {s} {s} @ {s}  {s}\n", .{
-                        section.league.slug, board.date, away.abbreviation, home_team.abbreviation, game.status,
-                    });
-                }
-            } else if (game.name.len > 0) {
-                try out.writer.print("{s} {s} {s}  {s}\n", .{ section.league.slug, board.date, game.name, game.status });
-            } else {
-                continue;
-            }
-            any = true;
-        }
-    }
-    if (!any) try out.writer.writeAll("No games scheduled.\n");
-    return out.toOwnedSlice();
+///
+/// Shared composer: digest sections adapt trivially to
+/// `provider.LeagueResult` (same `league` + `board` fields) and render
+/// through `render.homeOneLineWithZone` — the exact composer the worker
+/// `serveAll` one-line branch uses, so both serve paths emit byte-identical
+/// lines: homeOneLine per-game shape, `M/D ZONE` labels, status plus winner
+/// check on scored duels, both-sides home/away resolution. `?0` carries no
+/// header/footer by construction (same as `/?0`), so `quiet` selects
+/// nothing and both modes render identically. Idle/unavailable leagues emit
+/// nothing; an empty digest is a single `No games scheduled.` line.
+fn allOneLine(
+    arena: std.mem.Allocator,
+    sections: []const server_app.digest.DigestSection,
+    color: bool,
+    quiet: bool,
+    zone: server_app.tz.Zone,
+) ![]u8 {
+    _ = quiet;
+    const results = try arena.alloc(server_app.provider.LeagueResult, sections.len);
+    defer arena.free(results);
+    for (sections, 0..) |section, i| results[i] = .{ .league = section.league, .board = section.board };
+    return server_app.render.homeOneLineWithZone(arena, results, color, zone);
 }
 
 /// Compact route label for the per-request log line. Boards, details, and
@@ -692,4 +678,160 @@ fn commonHeaders() []const std.http.Header {
         .{ .name = "vary", .value = "accept" },
         .{ .name = "x-content-type-options", .value = "nosniff" },
     };
+}
+
+test "all?0 shares the home one-line shape with zone labels" {
+    const arena = std.testing.allocator;
+    const mlb = core.leagues.find("mlb").?;
+    const sections = [_]server_app.digest.DigestSection{.{
+        .league = mlb,
+        .board = .{
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .source = "test",
+            .games = &.{
+                .{
+                    .id = "1",
+                    .name = "",
+                    .starts_at = "2026-09-06T17:00Z",
+                    .state = "post",
+                    .status = "Final",
+                    .participants = &.{
+                        .{ .id = "a", .name = "Away Club", .abbreviation = "AWY", .score = "2", .winner = false, .home_away = "away" },
+                        .{ .id = "h", .name = "Home Club", .abbreviation = "HME", .score = "5", .winner = true, .home_away = "home" },
+                    },
+                },
+            },
+        },
+    }};
+    const lines = try allOneLine(arena, &sections, false, false, .et);
+    defer arena.free(lines);
+    // M/D ZONE label, never the raw board date; status plus the winner
+    // check survive on a scored duel.
+    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 9/6 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "2026-09-06") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "Final AWY 2 @ HME 5 ✓") != null);
+
+    const utc = try allOneLine(arena, &sections, false, false, .utc);
+    defer arena.free(utc);
+    try std.testing.expect(std.mem.indexOf(u8, utc, "mlb 9/6 UTC") != null);
+}
+
+test "all?0 resolves home and away checking both sides" {
+    const arena = std.testing.allocator;
+    const mlb = core.leagues.find("mlb").?;
+    const sections = [_]server_app.digest.DigestSection{.{
+        .league = mlb,
+        .board = .{
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .source = "test",
+            .games = &.{
+                .{
+                    .id = "1",
+                    .name = "",
+                    .starts_at = "2026-09-06T17:00Z",
+                    .state = "post",
+                    .status = "Final",
+                    .participants = &.{
+                        .{ .id = "a", .name = "Away Club", .abbreviation = "AWY", .score = "2", .winner = false, .home_away = "away" },
+                        .{ .id = "h", .name = "Home Club", .abbreviation = "HME", .score = "5", .winner = true },
+                    },
+                },
+            },
+        },
+    }};
+    // Away marked first, home side unmarked: checking only the second side
+    // flips the duel to `HME 5 @ AWY 2`.
+    const lines = try allOneLine(arena, &sections, false, false, .et);
+    defer arena.free(lines);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "AWY 2 @ HME 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "HME 5 @ AWY 2") == null);
+}
+
+test "all?0 counts every game it prints" {
+    const arena = std.testing.allocator;
+    const mlb = core.leagues.find("mlb").?;
+    const sections = [_]server_app.digest.DigestSection{.{
+        .league = mlb,
+        .board = .{
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .source = "test",
+            .games = &.{
+                .{
+                    .id = "1",
+                    .name = "",
+                    .starts_at = "2026-09-06T17:00Z",
+                    .state = "pre",
+                    .status = "Scheduled",
+                    .participants = &.{
+                        .{ .id = "s", .name = "Solo Club", .abbreviation = "SOLO", .score = "", .winner = false },
+                    },
+                },
+            },
+        },
+    }};
+    // A one-participant, nameless game fell into the old trailing
+    // else-continue without setting the shown flag and printed a false
+    // `No games scheduled.` for a non-empty digest.
+    const lines = try allOneLine(arena, &sections, false, false, .et);
+    defer arena.free(lines);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "SOLO") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "No games scheduled.") == null);
+}
+
+test "all?0 quiet is moot and color toggles ANSI" {
+    const arena = std.testing.allocator;
+    const mlb = core.leagues.find("mlb").?;
+    const sections = [_]server_app.digest.DigestSection{.{
+        .league = mlb,
+        .board = .{
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .source = "test",
+            .games = &.{
+                .{
+                    .id = "1",
+                    .name = "",
+                    .starts_at = "2026-09-06T17:00Z",
+                    .state = "in",
+                    .status = "Top 7th",
+                    .participants = &.{
+                        .{ .id = "a", .name = "Away Club", .abbreviation = "AWY", .score = "0", .winner = false, .home_away = "away" },
+                        .{ .id = "h", .name = "Home Club", .abbreviation = "HME", .score = "3", .winner = false, .home_away = "home" },
+                    },
+                },
+            },
+        },
+    }};
+    // ?0 carries no header/footer (/?0 parity), so quiet selects nothing:
+    // both modes render byte-identically.
+    const loud = try allOneLine(arena, &sections, false, false, .et);
+    defer arena.free(loud);
+    const hushed = try allOneLine(arena, &sections, false, true, .et);
+    defer arena.free(hushed);
+    try std.testing.expectEqualStrings(loud, hushed);
+    try std.testing.expect(std.mem.indexOf(u8, loud, "\x1b[") == null);
+    const colored = try allOneLine(arena, &sections, true, false, .et);
+    defer arena.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[") != null);
+}
+
+test "all?0 empty digest and idle leagues" {
+    const arena = std.testing.allocator;
+    const mlb = core.leagues.find("mlb").?;
+    const empty = try allOneLine(arena, &[_]server_app.digest.DigestSection{}, false, false, .et);
+    defer arena.free(empty);
+    try std.testing.expectEqualStrings("No games scheduled.\n", empty);
+    // Unavailable leagues (null board) emit nothing but still land on the
+    // empty line instead of a blank body.
+    const idle = [_]server_app.digest.DigestSection{.{ .league = mlb }};
+    const idle_lines = try allOneLine(arena, &idle, false, false, .et);
+    defer arena.free(idle_lines);
+    try std.testing.expectEqualStrings("No games scheduled.\n", idle_lines);
 }
