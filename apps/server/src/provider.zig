@@ -883,15 +883,20 @@ fn summarySeries(arena: std.mem.Allocator, response: SummaryResponse, game_id: [
     const total: i64 = if (series.totalCompetitions > 0) series.totalCompetitions else @intCast(series.events.len);
     // One game is not a series (and zero games is no information at all).
     if (total <= 1) return null;
+    // ESPN-verbatim playoff summaries can echo the view's own prefix
+    // ("Series tied 1-1" renders as "Series: Series tied 1-1"). Strip
+    // one leading "series "/"series: " (case-insensitive) so the render
+    // stays single; mid-string wording ("X leads series ...") is untouched.
+    const summary = stripSeriesPrefix(series.summary);
     const cleaned: []const u8 = if (from_season)
-        try seasonSeriesText(arena, series.summary)
-    else if (std.mem.indexOf(u8, series.summary, " leads series ")) |at|
+        try seasonSeriesText(arena, summary)
+    else if (std.mem.indexOf(u8, summary, " leads series ")) |at|
         try std.fmt.allocPrint(arena, "{s} leads {s}", .{
-            series.summary[0..at],
-            series.summary[at + " leads series ".len ..],
+            summary[0..at],
+            summary[at + " leads series ".len ..],
         })
     else
-        series.summary;
+        summary;
     var position: ?usize = null;
     for (series.events, 0..) |event, index| if (std.mem.eql(u8, event.id, game_id)) {
         position = index + 1;
@@ -901,6 +906,22 @@ fn summarySeries(arena: std.mem.Allocator, response: SummaryResponse, game_id: [
         return try std.fmt.allocPrint(arena, "{s} (game {d} of {d})", .{ cleaned, n, total });
     }
     return cleaned;
+}
+
+/// One leading "series "/"series: " (any case) is the view's own prefix
+/// echoed back by ESPN verbatim ("Series tied 1-1"); anything else —
+/// including a bare "Series" with no trailing separator — passes through.
+fn stripSeriesPrefix(text: []const u8) []const u8 {
+    if (text.len > 7 and std.ascii.eqlIgnoreCase(text[0..7], "series:")) {
+        const rest = std.mem.trimStart(u8, text[7..], " ");
+        if (rest.len > 0) return rest;
+        return text;
+    }
+    if (text.len > 7 and std.ascii.eqlIgnoreCase(text[0..6], "series") and text[6] == ' ') {
+        const rest = text[7..];
+        if (rest.len > 0) return rest;
+    }
+    return text;
 }
 
 /// Regular-season series phrasing: "ATL leads series 2-1" becomes
@@ -1569,6 +1590,10 @@ const ScheduleCompetition = struct {
     // live: every 2026 NFL future game; every completed 2025 game `true`).
     // Absent on older/sparser payloads, which means available.
     boxscoreAvailable: ?bool = null,
+    // ESPN flags kickoffs with no set time yet (`false` with a midnight
+    // placeholder date; schema: "Whether the game time is valid").
+    // Absent on older/sparser payloads, which means a real time.
+    timeValid: ?bool = null,
 };
 const ScheduleCompetitor = struct {
     id: []const u8 = "",
@@ -1594,6 +1619,9 @@ const ScheduleAthlete = struct {
 const ParsedSchedule = struct {
     team: core.schedule.TeamInfo,
     events: []core.schedule.ScheduleEvent,
+    /// Ids whose kickoff ESPN marks unknown (`timeValid: false`): their
+    /// dates are midnight placeholders, rendered as TBD downstream.
+    unknown_time: []const []const u8,
 };
 
 fn resolveTeamId(body: []const u8, arena: std.mem.Allocator, abbrev: []const u8) !?[]const u8 {
@@ -1653,11 +1681,20 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
     const header = response.team orelse ScheduleTeam{};
     const ours_id = header.id;
     var events: std.ArrayList(core.schedule.ScheduleEvent) = .empty;
+    var unknown_time: std.ArrayList([]const u8) = .empty;
     for (response.events) |event| {
         if (event.competitions.len == 0) continue;
         // Event-level status is always null; the competition level is
         // authoritative (same rule as the scoreboard path).
         const competition = event.competitions[0];
+        const event_id = if (competition.id.len > 0) competition.id else event.id;
+        // Only an explicit `false` marks the time unknown: a missing flag
+        // (older or sparser payloads) keeps the historical
+        // format-the-timestamp behavior, so unannotated leagues never
+        // lose their kickoff times.
+        if (competition.timeValid) |valid| {
+            if (!valid) try unknown_time.append(arena, event_id);
+        }
         const status_type: StatusType = if (competition.status) |status| status.type else StatusType{};
         var ours: ?ScheduleCompetitor = null;
         var opp: ?ScheduleCompetitor = null;
@@ -1684,7 +1721,7 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
             }
         }
         try events.append(arena, .{
-            .id = if (competition.id.len > 0) competition.id else event.id,
+            .id = event_id,
             .date = if (competition.date.len > 0) competition.date else event.date,
             .opponent_abbrev = opp_team.abbreviation,
             .opponent_name = opp_team.displayName,
@@ -1710,15 +1747,23 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
             .standing_summary = header.standingSummary,
         },
         .events = try events.toOwnedSlice(arena),
+        .unknown_time = try unknown_time.toOwnedSlice(arena),
     };
 }
 
 /// Upcoming display: `"vs ATL 5:05 PM"` / `"at NYM 7:15 PM"` (US Eastern,
 /// converted from the UTC ISO timestamp via `core.date`, EDT/EST by the rule
-/// at the game instant). Falls back to the raw UTC wall time when the
-/// timestamp shape is unknown, and to the calendar date when no time parses.
-fn upcomingResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) ![]u8 {
+/// at the game instant). Kickoffs ESPN marks unknown (`timeValid: false`,
+/// threaded in as `time_unknown`) render `"vs ILL TBD"`: the payload date
+/// is a midnight placeholder, so formatting it would invent a 12:00 AM
+/// kickoff (seen live: ncaaf/OSU 09-26 vs ILL). Falls back to the raw UTC
+/// wall time when the timestamp shape is unknown, and to the calendar date
+/// when no time parses.
+fn upcomingResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent, time_unknown: bool) ![]u8 {
     const versus = if (std.mem.eql(u8, event.home_away, "away")) "at" else "vs";
+    if (time_unknown) {
+        return std.fmt.allocPrint(arena, "{s} {s} TBD", .{ versus, event.opponent_abbrev });
+    }
     if (event.date.len >= 16 and event.date[13] == ':') {
         var hour = std.fmt.parseInt(u8, event.date[11..13], 10) catch {
             return std.fmt.allocPrint(arena, "{s} {s} {s}", .{ versus, event.opponent_abbrev, event.date });
@@ -1762,7 +1807,15 @@ fn finalResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) ![]
     return std.fmt.allocPrint(arena, "F {s}-{s}", .{ event.our_score, event.opp_score });
 }
 
-fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) !core.schedule.GameRef {
+/// Ids ESPN flagged with unknown kickoffs (`timeValid: false`, collected
+/// at parse) still carry their schedule ids downstream, so the upcoming
+/// formatter can tell placeholder midnights from real ones.
+fn timeUnknown(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |known| if (std.mem.eql(u8, known, id)) return true;
+    return false;
+}
+
+fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent, unknown_time: []const []const u8) !core.schedule.GameRef {
     const result = if (std.mem.eql(u8, event.state, "post"))
         try finalResult(arena, event)
     else if (std.mem.eql(u8, event.state, "in"))
@@ -1770,7 +1823,7 @@ fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent
         // must not repeat the opponent the way upcoming results do.
         try liveScheduleResult(arena, event)
     else
-        try upcomingResult(arena, event);
+        try upcomingResult(arena, event, timeUnknown(unknown_time, event.id));
     return .{
         // No detail upstream (explicit `boxscoreAvailable: false`) means
         // no link: an empty id renders as plain text in every team view
@@ -1861,13 +1914,13 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
     const split = try core.schedule.splitSchedule(arena, parsed.events, today);
     var next: std.ArrayList(core.schedule.GameRef) = .empty;
     for (split.upcoming[0..@min(split.upcoming.len, 5)]) |event| {
-        try next.append(arena, try gameRefFromEvent(arena, event));
+        try next.append(arena, try gameRefFromEvent(arena, event, parsed.unknown_time));
     }
     var last: std.ArrayList(core.schedule.GameRef) = .empty;
     var i: usize = split.past.len;
     while (i > 0 and last.items.len < 5) {
         i -= 1;
-        try last.append(arena, try gameRefFromEvent(arena, split.past[i]));
+        try last.append(arena, try gameRefFromEvent(arena, split.past[i], parsed.unknown_time));
     }
 
     var live: ?core.schedule.GameRef = null;
@@ -1895,13 +1948,13 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         var j: usize = split.past.len - last.items.len;
         while (j > 0) {
             j -= 1;
-            try extra_past.append(arena, try gameRefFromEvent(arena, split.past[j]));
+            try extra_past.append(arena, try gameRefFromEvent(arena, split.past[j], parsed.unknown_time));
         }
     }
     var extra_next: std.ArrayList(core.schedule.GameRef) = .empty;
     if (split.upcoming.len > next.items.len) {
         for (split.upcoming[next.items.len..]) |event| {
-            try extra_next.append(arena, try gameRefFromEvent(arena, event));
+            try extra_next.append(arena, try gameRefFromEvent(arena, event, parsed.unknown_time));
         }
     }
 
@@ -2558,21 +2611,21 @@ test "upcoming times read Eastern, not UTC" {
     // The reported NFL kickoff: Sept 13 8:20 PM ET is 09-14T00:20Z.
     var sept = base;
     sept.date = "2026-09-14T00:20Z";
-    try std.testing.expectEqualStrings("vs DAL 8:20 PM", try upcomingResult(arena, sept));
+    try std.testing.expectEqualStrings("vs DAL 8:20 PM", try upcomingResult(arena, sept, false));
     // Away sides and the EDT offset likewise shift back four hours.
     var away = base;
     away.home_away = "away";
     away.opponent_abbrev = "PHI";
     away.date = "2026-09-08T22:40Z";
-    try std.testing.expectEqualStrings("at PHI 6:40 PM", try upcomingResult(arena, away));
+    try std.testing.expectEqualStrings("at PHI 6:40 PM", try upcomingResult(arena, away, false));
     // January reads EST: 02:30Z is 9:30 PM the evening before.
     var jan = base;
     jan.date = "2026-01-15T02:30Z";
-    try std.testing.expectEqualStrings("vs DAL 9:30 PM", try upcomingResult(arena, jan));
+    try std.testing.expectEqualStrings("vs DAL 9:30 PM", try upcomingResult(arena, jan, false));
     // Unparsable timestamps keep the old fallbacks, never an error.
     var bad = base;
     bad.date = "sometime";
-    try std.testing.expectEqualStrings("vs DAL sometime", try upcomingResult(arena, bad));
+    try std.testing.expectEqualStrings("vs DAL sometime", try upcomingResult(arena, bad, false));
 }
 
 test "live schedule rows carry no opponent repeat in the result" {
@@ -2581,11 +2634,11 @@ test "live schedule rows carry no opponent repeat in the result" {
     const arena = arena_state.allocator();
     var live = schedEvent("in", "2", "3", null);
     live.status = "Top 9th";
-    const with_scores = try gameRefFromEvent(arena, live);
+    const with_scores = try gameRefFromEvent(arena, live, &.{});
     try std.testing.expectEqualStrings("2-3 Top 9th", with_scores.result);
     var unscored = schedEvent("in", "", "", null);
     unscored.status = "Top 9th";
-    const bare = try gameRefFromEvent(arena, unscored);
+    const bare = try gameRefFromEvent(arena, unscored, &.{});
     try std.testing.expectEqualStrings("Top 9th", bare.result);
 }
 
@@ -2901,4 +2954,50 @@ test "humanizeStatKey spaces camel humps" {
     try std.testing.expectEqualStrings("Completions/passing attempts", try humanizeStatKey(arena, "completions/passingAttempts"));
     try std.testing.expectEqualStrings("Passing yards", try humanizeStatKey(arena, "passingYards"));
     try std.testing.expectEqualStrings("H-AB", try humanizeStatKey(arena, "H-AB"));
+}
+
+test "fetchTeam renders TBD for timeValid-false kickoffs" {
+    // The reported ncaaf/OSU 09-26 vs ILL shape: ESPN carries a midnight
+    // placeholder with an explicit `timeValid: false`, which used to
+    // render as a literal 12:00 AM. The flag (never the clock) decides:
+    // a genuine midnight ET kickoff with a valid flag still formats.
+    const tbd_schedule =
+        \\{"team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"},"events":[
+        \\{"id":"tbd1","date":"2026-09-26T04:00Z","competitions":[{"id":"tbd1","date":"2026-09-26T04:00Z","timeValid":false,"status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"},"probables":[]},{"homeAway":"away","team":{"id":"21","abbreviation":"ILL","displayName":"Illinois Fighting Illini"},"probables":[]}]}]},
+        \\{"id":"real1","date":"2026-09-27T04:00Z","competitions":[{"id":"real1","date":"2026-09-27T04:00Z","timeValid":true,"status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"away","team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"},"probables":[]},{"homeAway":"home","team":{"id":"99","abbreviation":"XYZ","displayName":"X Y Zed"},"probables":[]}]}]}
+        \\]}
+    ;
+    var fake = TeamFixtureState{
+        .teams_body = ncaaf_teams_two_osu,
+        .schedule_body = tbd_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true, // schedule-only; live join off.
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    try std.testing.expectEqual(@as(usize, 2), view.next.len);
+    try std.testing.expectEqualStrings("vs ILL TBD", view.next[0].result);
+    try std.testing.expectEqualStrings("at XYZ 12:00 AM", view.next[1].result);
+}
+
+test "stripSeriesPrefix drops one echoed view prefix" {
+    try std.testing.expectEqualStrings("tied 1-1", stripSeriesPrefix("Series tied 1-1"));
+    try std.testing.expectEqualStrings("tied 1-1", stripSeriesPrefix("Series: tied 1-1"));
+    try std.testing.expectEqualStrings("tied 1-1", stripSeriesPrefix("series tied 1-1"));
+    try std.testing.expectEqualStrings("BOS wins series 4-2", stripSeriesPrefix("BOS wins series 4-2"));
+    try std.testing.expectEqualStrings("Series", stripSeriesPrefix("Series"));
+}
+
+test "playoff verbatim series renders without a doubled prefix" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"g7","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"series":[{"summary":"Series tied 1-1","completed":false,"totalCompetitions":4,"events":[{"id":"g5"},{"id":"g6"},{"id":"g7"},{"id":"g8"}]}],"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = series_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g7");
+    try std.testing.expectEqualStrings("tied 1-1 (game 3 of 4)", detail.series.?);
+    // Answered from the summary: no schedule derivation fetches.
+    try std.testing.expectEqual(@as(usize, 0), fake.sched_calls);
 }
