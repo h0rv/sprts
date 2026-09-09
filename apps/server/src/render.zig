@@ -1234,15 +1234,15 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
 /// `<pre>`, so visible-text tests never see it). Fixed size, cached with
 /// the favicon itself.
 pub const home_logo_mark =
+    "<a class=\"logo-home\" href=\"/\">" ++
     "<span class=\"logo-dark\">" ++ logo_dark_svg ++ "</span>" ++
-    "<span class=\"logo-light\">" ++ logo_light_svg ++ "</span>\n";
+    "<span class=\"logo-light\">" ++ logo_light_svg ++ "</span></a>\n";
 
 pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     try pageHead(w, "sprts");
-    try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>");
     try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
@@ -1285,7 +1285,6 @@ pub fn homeHtmlLive(
     const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
     defer allocator.free(heading);
     try pageHead(w, heading);
-    try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>\n");
     try homeSections(allocator, w, boards, false, true, day);
     if (!quiet) {
@@ -1311,7 +1310,7 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
         "<title>");
     try escapeInto(w, title);
-    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>");
+    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>" ++ home_logo_mark);
 }
 
 /// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
@@ -1340,7 +1339,7 @@ const page_style =
 /// palette. Served verbatim at `/favicon.svg` and linked from every
 /// page head; no script, no external assets, no font dependency.
 pub const favicon_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><g fill="#e6ebe7" shape-rendering="crispEdges"><rect x="14" y="2" width="12" height="12"/><rect x="26" y="2" width="12" height="12"/><rect x="38" y="2" width="12" height="12"/><rect x="14" y="14" width="12" height="12"/><rect x="14" y="26" width="12" height="12"/><rect x="26" y="26" width="12" height="12"/><rect x="38" y="26" width="12" height="12"/><rect x="38" y="38" width="12" height="12"/><rect x="14" y="50" width="12" height="12"/><rect x="26" y="50" width="12" height="12"/><rect x="38" y="50" width="12" height="12"/></g></svg>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges" fill="#e6ebe7"><rect width="64" height="64" fill="#10140f"/><polygon points="2,2 42,2 42,22 2,22" /><polygon points="2,22 62,22 62,42 2,42" /><polygon points="22,42 62,42 62,62 22,62" /></svg>
 ;
 
 /// Pixel wordmark `sprts` (lowercase, chunky rects like the
@@ -1573,6 +1572,8 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<OT>") == null);
     // Visible text still matches the unlinked table byte for byte.
     try expectVisiblePreText(page, board, null, null);
+    // Every page carries the clickable brand: logo links back home.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a class=\"logo-home\" href=\"/\">") != null);
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);
@@ -1827,8 +1828,11 @@ test "footer nav ends with the theme toggle on every page" {
     try std.testing.expect(std.mem.startsWith(u8, favicon_svg, "<svg "));
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "</svg>") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<script") == null);
-    // Pixel mark, not a font glyph: chunky rects with crisp edges.
+    // Pixel mark, not a font glyph: chunky polygons with crisp edges.
+    // The favicon carries the wordmark's notched `s` on a sharp dark tile.
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "shape-rendering=\"crispEdges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<polygon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<rect") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<text") == null);
     // Wordmark variants: dark surfaces get light ink and vice versa, no
     // fonts anywhere, theme swap rides the data-theme CSS classes.
