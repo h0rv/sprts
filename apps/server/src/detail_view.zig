@@ -296,6 +296,13 @@ fn maxPeriod(game: detail.GameDetail) usize {
     return n;
 }
 
+/// Baseball keeps the R/H/E linescore; every other sport gets periods +
+/// Total. Unknown slugs keep the baseball shape as the safe default.
+fn isBaseball(league_slug: []const u8) bool {
+    const league = core.leagues.find(league_slug) orelse return true;
+    return std.mem.eql(u8, league.sport, "Baseball");
+}
+
 fn situationText(allocator: std.mem.Allocator, situation: detail.Situation) ![]u8 {
     var runners: std.Io.Writer.Allocating = .init(allocator);
     defer runners.deinit();
@@ -443,10 +450,14 @@ fn participantLines(allocator: std.mem.Allocator, participants: []const detail.D
 
 /// Linescore grid as plain strings: header, one row per team, then a
 /// combined records line (`PHI 81-63 · HOU 73-71`, absent when no team
-/// carries one). One composer for text and HTML so the grid can never
-/// drift between them (the old HTML path collapsed it to one line and
-/// dropped the records entirely).
+/// carries one). Baseball keeps periods + R/H/E; every other sport shows
+/// periods + a single Total column (no H/E placeholders). The sport keys
+/// off `core.leagues.find(game.league)`; an unknown slug keeps the
+/// baseball shape as the safe default. One composer for text and HTML so
+/// the grid can never drift between them (the old HTML path collapsed it
+/// to one line and dropped the records entirely).
 fn lineScoreLines(allocator: std.mem.Allocator, game: detail.GameDetail) ![][]u8 {
+    const baseball = isBaseball(game.league);
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |line| allocator.free(line);
@@ -458,7 +469,11 @@ fn lineScoreLines(allocator: std.mem.Allocator, game: detail.GameDetail) ![][]u8
     try head.writer.writeAll("    ");
     var p: usize = 1;
     while (p <= periods) : (p += 1) try head.writer.print("{d:>3}", .{p});
-    try head.writer.writeAll("   R   H   E");
+    if (baseball) {
+        try head.writer.writeAll("   R   H   E");
+    } else {
+        try head.writer.writeAll("   Total");
+    }
     try out.append(allocator, try head.toOwnedSlice());
     for (game.participants) |entry| {
         var line: std.Io.Writer.Allocating = .init(allocator);
@@ -469,11 +484,15 @@ fn lineScoreLines(allocator: std.mem.Allocator, game: detail.GameDetail) ![][]u8
             const cell: []const u8 = if (i < entry.lines.len) entry.lines[i].display else "-";
             try line.writer.print("{s:>3}", .{cell});
         }
-        try line.writer.print("   {s:>3}   {s:>3}   {s:>3}", .{
-            entry.score,
-            entry.hits orelse "-",
-            entry.errors orelse "-",
-        });
+        if (baseball) {
+            try line.writer.print("   {s:>3}   {s:>3}   {s:>3}", .{
+                entry.score,
+                entry.hits orelse "-",
+                entry.errors orelse "-",
+            });
+        } else {
+            try line.writer.print("   {s:>5}", .{entry.score});
+        }
         try out.append(allocator, try line.toOwnedSlice());
     }
     var recs: std.Io.Writer.Allocating = .init(allocator);
@@ -891,3 +910,143 @@ test "detail depth team stats ride the json wire format additively" {
     try std.testing.expectEqual(@as(usize, 0), legacy.team_stats.len);
 }
 
+// per-sport linescore: baseball keeps periods + R/H/E, every other sport
+// shows periods + a single Total column (no H/E placeholders). The NBA
+// fixture carries hits/errors on purpose to lock that the sport — not
+// the presence of hits/errors — keys the decision.
+fn testNbaDetail() detail.GameDetail {
+    return .{
+        .id = "401584672",
+        .league = "nba",
+        .league_name = "NBA",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{
+            .{
+                .id = "2",
+                .name = "Boston Celtics",
+                .abbreviation = "BOS",
+                .score = "112",
+                .winner = true,
+                .home_away = "away",
+                .lines = &.{
+                    .{ .period = 1, .display = "28" },
+                    .{ .period = 2, .display = "25" },
+                    .{ .period = 3, .display = "30" },
+                    .{ .period = 4, .display = "29" },
+                },
+                .hits = "HITS",
+                .errors = "ERRS",
+                .record = "45-20",
+            },
+            .{
+                .id = "14",
+                .name = "Los Angeles Lakers",
+                .abbreviation = "LAL",
+                .score = "108",
+                .winner = false,
+                .home_away = "home",
+                .lines = &.{
+                    .{ .period = 1, .display = "27" },
+                    .{ .period = 2, .display = "26" },
+                    .{ .period = 3, .display = "28" },
+                    .{ .period = 4, .display = "27" },
+                },
+                .hits = "HITS",
+                .errors = "ERRS",
+                .record = "40-25",
+            },
+        },
+    };
+}
+
+fn testNcaamDetail() detail.GameDetail {
+    return .{
+        .id = "401638291",
+        .league = "ncaam",
+        .league_name = "NCAA Men's Basketball",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{
+            .{
+                .id = "150",
+                .name = "Duke Blue Devils",
+                .abbreviation = "DUKE",
+                .score = "77",
+                .winner = true,
+                .home_away = "away",
+                .lines = &.{
+                    .{ .period = 1, .display = "35" },
+                    .{ .period = 2, .display = "42" },
+                },
+                .record = "28-5",
+            },
+            .{
+                .id = "153",
+                .name = "North Carolina Tar Heels",
+                .abbreviation = "UNC",
+                .score = "73",
+                .winner = false,
+                .home_away = "home",
+                .lines = &.{
+                    .{ .period = 1, .display = "33" },
+                    .{ .period = 2, .display = "40" },
+                },
+                .record = "26-7",
+            },
+        },
+    };
+}
+
+test "detail linescore shows Total instead of R/H/E for NBA quarters" {
+    const output = try renderText(std.testing.allocator, testNbaDetail(), false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "R   H   E") == null);
+    // Hits/errors ride along on the fixture but never render: the sport
+    // keys the shape, not the fields.
+    try std.testing.expect(std.mem.indexOf(u8, output, "HITS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ERRS") == null);
+    // Quarter columns plus the total still render per team.
+    try std.testing.expect(std.mem.indexOf(u8, output, "28") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "112") != null);
+    // Records line and winner check survive the new shape.
+    try std.testing.expect(std.mem.indexOf(u8, output, "BOS 45-20 · LAL 40-25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
+    _ = try std.unicode.Utf8View.init(output);
+
+    const colored = try renderText(std.testing.allocator, testNbaDetail(), true, null, null);
+    defer std.testing.allocator.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[32m") != null);
+
+    const page = try detailHtml(std.testing.allocator, testNbaDetail(), null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "R   H   E") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "HITS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "ERRS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "BOS 45-20 · LAL 40-25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "detail linescore shows Total instead of R/H/E for NCAAM halves" {
+    const output = try renderText(std.testing.allocator, testNcaamDetail(), false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "R   H   E") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "DUKE 28-5 · UNC 26-7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
+    _ = try std.unicode.Utf8View.init(output);
+
+    const page = try detailHtml(std.testing.allocator, testNcaamDetail(), null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "R   H   E") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "DUKE 28-5 · UNC 26-7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+}
