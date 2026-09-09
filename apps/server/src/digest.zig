@@ -7,7 +7,8 @@
 //!
 //! Failure semantics: one league's upstream failure never fails the digest.
 //! A league whose board is missing renders an `unavailable` section (text)
-//! or a zero-game board entry (JSON) and the rest render normally.
+//! or a zero-game board entry plus its slug in `DigestJson.degraded` (JSON)
+//! and the rest render normally.
 //! Native path goes through `NativeCache.getOrFetch` per league (same
 //! fresh/stale windows as single boards); the worker path reuses
 //! `serveBoard`-style per-league fetch+render. `week` is NOT fanned out:
@@ -31,12 +32,24 @@ pub const DigestSection = struct {
 };
 
 /// JSON shape for `/api/v1/all`: reuse `domain.Scoreboard` verbatim per
-/// league (no new field names); unavailable leagues are zero-game boards
-/// with the league/date/source identity intact.
+/// league, plus one additive outage signal. Unavailable leagues are
+/// zero-game boards with the league/date/source identity intact, and their
+/// slugs are listed in `degraded`: zero games plus absent-from-`degraded`
+/// means off-day, zero games plus present means outage (retry later).
+/// Nothing was renamed or removed; `degraded` is always emitted
+/// (possibly `[]`).
 pub const DigestJson = struct {
     schema_version: []const u8 = "1",
     date: []const u8,
     leagues: []const core.domain.Scoreboard,
+    degraded: []const []const u8 = &.{},
+
+    pub const jsonschema = .{
+        .name = "DigestJson",
+        .fields = .{
+            .degraded = .{ .description = "Slugs of leagues whose upstream fetch failed for this digest; their entries are zero-game boards. Empty means every league answered, so zero games is an off-day." },
+        },
+    };
 };
 
 /// Text digest: one `render.text` section per league, capped at
@@ -106,7 +119,7 @@ pub fn text(
 
 /// JSON digest: one `domain.Scoreboard` per league in `core.leagues.all`
 /// order; missing boards become zero-game boards so the league set is
-/// stable and the shape reuses existing field names only.
+/// stable, and their slugs land in `DigestJson.degraded` (see `json`).
 pub fn jsonBoards(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8) ![]core.domain.Scoreboard {
     const boards = try allocator.alloc(core.domain.Scoreboard, sections.len);
     for (sections, 0..) |section, i| {
@@ -133,7 +146,27 @@ pub fn json(allocator: std.mem.Allocator, sections: []const DigestSection, day: 
     return render.validatedJson(DigestJson, allocator, .{
         .date = day,
         .leagues = try jsonBoards(tmp.allocator(), sections, day),
+        .degraded = try degradedSlugs(tmp.allocator(), sections),
     });
+}
+
+/// Slugs of sections with no board: the additive outage signal carried on
+/// `DigestJson.degraded`. Stringify scratch like `jsonBoards` (see `json`);
+/// slugs are static league identities, so no dupe is needed.
+fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) ![]const []const u8 {
+    var count: usize = 0;
+    for (sections) |section| {
+        if (section.board == null) count += 1;
+    }
+    const slugs = try allocator.alloc([]const u8, count);
+    var i: usize = 0;
+    for (sections) |section| {
+        if (section.board == null) {
+            slugs[i] = section.league.slug;
+            i += 1;
+        }
+    }
+    return slugs;
 }
 
 /// HTML digest: the text digest (uncolored) in a `<pre>` block with nav.
@@ -253,10 +286,60 @@ test "digest json reuses Scoreboard shapes with stable league set" {
     };
     const output = try json(std.testing.allocator, &sections, "2026-09-06");
     defer std.testing.allocator.free(output);
-    // No new field names: Scoreboard + DigestJson envelope only.
+    // Per-league shape is Scoreboard verbatim; the envelope adds only the
+    // additive `degraded` outage signal (see DigestJson).
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"league\": \"mlb\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"games\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"degraded\": [\n    \"mlb\"\n  ]") != null);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "digest json distinguishes outage from off-day" {
+    // Off-day (present board, zero games) and outage (missing board) look
+    // identical per league; only the envelope `degraded` list tells them
+    // apart. Parse the wire body and assert the distinction survives.
+    const off_day: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "site.api.espn.com",
+        .games = &.{},
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = off_day },
+        .{ .league = core.leagues.find("nfl").?, .board = null },
+    };
+    const output = try json(std.testing.allocator, &sections, "2026-09-06");
+    defer std.testing.allocator.free(output);
+    const parsed = try std.json.parseFromSlice(DigestJson, std.testing.allocator, output, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("2026-09-06", parsed.value.date);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.leagues.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.leagues[0].games.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.leagues[1].games.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.degraded.len);
+    try std.testing.expectEqualStrings("nfl", parsed.value.degraded[0]);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "digest json omits degraded when every league answers" {
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "site.api.espn.com",
+        .games = &.{},
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = board },
+    };
+    const output = try json(std.testing.allocator, &sections, "2026-09-06");
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"degraded\": []") != null);
     _ = try std.unicode.Utf8View.init(output);
 }
 
