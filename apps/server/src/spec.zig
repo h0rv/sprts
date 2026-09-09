@@ -219,6 +219,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
+            "  curl localhost:8080/mlb/PHI/today\n" ++
             "  curl localhost:8080/openapi.json\n" ++
             "\n" ++
             "LEAGUES\n" ++

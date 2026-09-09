@@ -141,6 +141,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  /{league}?week=N               football week only, ignored elsewhere
         \\  /{league}/{id}                 one game (all digits = game, else team)
         \\  /{league}/{abbr}               one team, e.g. /mlb/phi
+        \\  /{league}/{abbr}/today        today's game, redirects to it
         \\  /{league}/standings            current table, no date
         \\  /api/v1/leagues                leagues as JSON
         \\  /api/v1/{league}[/{id|abbr}]   same shapes as JSON

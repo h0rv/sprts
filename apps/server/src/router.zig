@@ -37,6 +37,18 @@ pub const TeamRoute = struct {
     oneline: bool = false,
 };
 
+/// Human shortcut: `/{league}/{abbr}/today` jumps to the team's game
+/// today (or falls back to its team page when none). The game id stays
+/// canonical — this redirects, never renders — so bookmarks and the JSON
+/// API keep one address per game. `api` preserves the address family on
+/// redirect (`/api/v1/` twins stay API addresses). Display flags are
+/// meaningless on a redirect and stay unset.
+pub const TodayRoute = struct {
+    league: []const u8,
+    abbr: []const u8,
+    api: bool,
+};
+
 /// Standings tab (`/{league}/standings`, plaintextsports parity with the
 /// Schedule/Standings/Teams tabs). No date or week: the endpoint is the
 /// current table only. Display flags ride along like every human route.
@@ -79,6 +91,7 @@ pub const Route = union(enum) {
     scoreboard: ScoreboardRoute,
     game: GameRoute,
     team: TeamRoute,
+    today: TodayRoute,
     standings: StandingsRoute,
     help: HelpRoute,
     openapi,
@@ -129,13 +142,30 @@ pub fn parse(target: []const u8) Route {
     else
         return .not_found;
     if (slug.len == 0) return .not_found;
-    // Two-segment addresses: /{league}/{id} (all digits) is a game view,
-    // /{league}/{abbr} is a team view. Deeper paths are not routes.
+    // Human shortcut: /{league}/{abbr}/today redirects to the team's game
+    // today (team page fallback when none). Caught before the game/team
+    // split, which only sees two segments; anything deeper or different
+    // stays not_found.
     if (std.mem.indexOfScalar(u8, slug, '/')) |slash| {
         const league = slug[0..slash];
         const segment = slug[slash + 1 ..];
-        if (league.len == 0 or segment.len == 0 or
-            std.mem.indexOfScalar(u8, segment, '/') != null) return .not_found;
+        if (league.len == 0 or segment.len == 0) return .not_found;
+        // Three-segment human shortcut (see TodayRoute): anything deeper
+        // or different stays not_found.
+        if (std.mem.indexOfScalar(u8, segment, '/')) |slash2| {
+            const seg2 = segment[0..slash2];
+            const seg3 = segment[slash2 + 1 ..];
+            if (seg2.len > 0 and std.mem.eql(u8, seg3, "today") and
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2))
+            {
+                return .{ .today = .{
+                    .league = league,
+                    .abbr = seg2,
+                    .api = std.mem.startsWith(u8, path, api_prefix),
+                } };
+            }
+            return .not_found;
+        }
         if (isHelpSegment(segment)) return .{ .help = .{
             .color = display.color,
             .quiet = display.quiet,
@@ -582,6 +612,25 @@ test "second segment splits game ids from team abbrevs" {
     try std.testing.expect(api_team.width.? == 90);
     try std.testing.expect(parse("/mlb/") == .not_found);
     try std.testing.expect(parse("//phi") == .not_found);
+}
+
+test "today shortcut parses team scope with address family" {
+    const short = parse("/mlb/PHI/today").today;
+    try std.testing.expectEqualStrings("mlb", short.league);
+    try std.testing.expectEqualStrings("PHI", short.abbr);
+    try std.testing.expect(!short.api);
+    const api = parse("/api/v1/mlb/PHI/today").today;
+    try std.testing.expect(api.api);
+    try std.testing.expectEqualStrings("PHI", api.abbr);
+    // Deeper paths, wrong tails, and reserved words stay not_found.
+    try std.testing.expect(parse("/mlb/PHI/today/x") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/yesterday") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/") == .not_found);
+    try std.testing.expect(parse("/mlb//today") == .not_found);
+    try std.testing.expect(parse("/mlb/help/today") == .not_found);
+    try std.testing.expect(parse("/mlb/standings/today") == .not_found);
+    // Query strings ride along ignored (redirects carry no query).
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/today?color=0").today.abbr);
 }
 
 test "stream flag parses query values and Accept header" {

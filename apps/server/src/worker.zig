@@ -215,6 +215,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         },
         .game => |route| return serveDetail(env, alloc, route, format, zone),
         .team => |route| return serveTeam(env, alloc, route, format, zone),
+        .today => |route| return serveToday(env, alloc, route, format),
         .standings => |route| return serveStandings(env, alloc, route, format, zone),
     }
 }
@@ -568,6 +569,54 @@ fn staticResponse(body: []const u8, content_type: []const u8, cache_state: ?[]co
 
 fn boardResponse(body: []const u8, format: router.Format, cache_state: []const u8) workers.Response {
     return staticResponse(body, contentType(format), cache_state);
+}
+
+/// Human shortcut `/{league}/{abbr}/today`: resolve the team's game
+/// today and redirect to its canonical address (game id, or the team
+/// page when none). Fresh-only, no-store; the game id stays canonical
+/// so bookmarks and the JSON API keep one address per game.
+fn serveToday(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TodayRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
+        if (err == error.TeamNotFound) {
+            return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN team fetch failed for {s} {s}", .{ league.slug, route.abbr });
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const target = if (core.schedule.findTodayGame(view)) |game|
+        if (route.api)
+            try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+        else
+            try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id })
+    else if (route.api)
+        try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, route.abbr })
+    else
+        try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, route.abbr });
+    const body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var resp = workers.Response.new();
+    resp.setStatus(.found);
+    resp.setHeader("location", target);
+    resp.setHeader("cache-control", "no-store");
+    resp.setHeader("x-content-type-options", "nosniff");
+    resp.setBody(body);
+    return resp;
 }
 
 /// Team view through the edge cache. Mirrors `serveBoard` with the team

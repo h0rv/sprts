@@ -318,6 +318,48 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             const extra = cacheHeaders(cache_state);
             try respond(request, body, format, .ok, &extra);
         },
+        .today => |today_route| {
+            // Human shortcut: resolve the team's game today, then redirect
+            // to its canonical address (game id, or the team page when no
+            // game today). Fresh-only, no-store, no query carried over.
+            const league = core.leagues.find(today_route.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const view = server_app.provider.fetchTeam(adapter, arena, league, today_route.abbr) catch |err| switch (err) {
+                error.TeamNotFound => {
+                    status = .not_found;
+                    try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
+                    return;
+                },
+                else => {
+                    status = .bad_gateway;
+                    std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, today_route.abbr, err });
+                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                    return;
+                },
+            };
+            const dest = if (core.schedule.findTodayGame(view)) |game|
+                if (today_route.api)
+                    try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+                else
+                    try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id })
+            else if (today_route.api)
+                try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, today_route.abbr })
+            else
+                try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, today_route.abbr });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
         .team => |team_route| {
             const league = core.leagues.find(team_route.league) orelse {
                 status = .not_found;
@@ -442,6 +484,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .all => |r| std.fmt.allocPrint(arena, "all/{s}", .{r.date orelse "today"}),
         .game => |r| std.fmt.allocPrint(arena, "detail/{s}/{s}", .{ r.league, r.id }),
         .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}", .{ r.league, r.abbr }),
+        .today => |r| std.fmt.allocPrint(arena, "today/{s}/{s}", .{ r.league, r.abbr }),
         .standings => |r| std.fmt.allocPrint(arena, "standings/{s}", .{r.league}),
     };
 }

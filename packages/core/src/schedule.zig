@@ -37,12 +37,17 @@ pub const GameRef = struct {
     opp_score: []const u8 = "",
     result: []const u8 = "",
     probable: []const u8 = "",
+    /// True when this upcoming game falls on today's Eastern calendar
+    /// day: renderers surface these rows in a top-center Today section
+    /// instead of only inside Next 5. Additive; defaults false.
+    today: bool = false,
 
     pub const jsonschema = .{
         .name = "ScheduleGameRef",
         .description = "One schedule row from the viewed team's perspective.",
         .fields = .{
             .date = .{ .format = "date-time" },
+            .today = .{ .description = "Upcoming game on today's Eastern day; render top-center." },
         },
     };
 };
@@ -75,11 +80,7 @@ pub const TeamView = struct {
 
 /// Raw schedule row used by the pure helpers below. The provider builds
 /// these from the ESPN schedule payload (competition level) before mapping
-/// to `GameRef`s. `has_detail` is false only when ESPN explicitly marks
-/// the competition `boxscoreAvailable: false` (e.g. a scheduled NFL game
-/// with no summary yet); a missing flag means available, preserving the
-/// historical link-everything behavior. Rows without detail render as
-/// plain text (their `GameRef.id` is cleared at mapping time).
+/// to `GameRef`s.
 pub const ScheduleEvent = struct {
     id: []const u8,
     date: []const u8,
@@ -92,13 +93,22 @@ pub const ScheduleEvent = struct {
     opp_score: []const u8 = "",
     won: ?bool = null,
     probable: []const u8 = "",
-    has_detail: bool = true,
 };
 
 pub const Split = struct {
     past: []ScheduleEvent,
     upcoming: []ScheduleEvent,
 };
+
+/// First live game, else first flagged upcoming row (next then extras):
+/// backing for `/{league}/{abbr}/today`. Null when the team has no game
+/// today. Pure scan; the provider flags rows, views render them.
+pub fn findTodayGame(view: TeamView) ?GameRef {
+    if (view.live) |live| return live;
+    for (view.next) |game| if (game.today) return game;
+    for (view.extra_next) |game| if (game.today) return game;
+    return null;
+}
 
 fn datePrefix(date: []const u8) []const u8 {
     return if (date.len >= 10) date[0..10] else date;
@@ -270,4 +280,26 @@ test "seriesFor finds the contiguous block and counts wins" {
     try std.testing.expectEqual(@as(usize, 1), later.games.len);
 
     try std.testing.expect(seriesFor(&events, "nope") == null);
+}
+
+test "findTodayGame prefers live, then flagged upcoming" {
+    const live = GameRef{ .id = "l", .date = "2026-09-06T19:05Z", .opponent_abbrev = "A", .opponent_name = "A", .home_away = "home", .status = "Top 7th", .state = "in", .result = "1-0 Top 7th" };
+    const base = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .next = &.{
+            .{ .id = "t", .date = "2026-09-06T23:10Z", .opponent_abbrev = "B", .opponent_name = "B", .home_away = "away", .status = "Scheduled", .state = "pre", .result = "at B", .today = true },
+            .{ .id = "f", .date = "2026-09-08T19:05Z", .opponent_abbrev = "C", .opponent_name = "C", .home_away = "home", .status = "Scheduled", .state = "pre", .result = "vs C" },
+        },
+    };
+    // Live outranks flagged upcoming.
+    var with_live = base;
+    with_live.live = live;
+    try std.testing.expectEqualStrings("l", findTodayGame(with_live).?.id);
+    // Otherwise the first flagged row wins; unflagged views have none.
+    try std.testing.expectEqualStrings("t", findTodayGame(base).?.id);
+    var bare = base;
+    bare.next = &.{base.next[1]};
+    try std.testing.expect(findTodayGame(bare) == null);
 }

@@ -1811,10 +1811,6 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
             .opp_score = opp_score,
             .won = our_side.winner,
             .probable = probable,
-            // Only an explicit `false` clears detail: absent flags (older
-            // or sparser payloads) keep the historical link-everything
-            // behavior, so leagues ESPN does not annotate never lose links.
-            .has_detail = if (competition.boxscoreAvailable) |available| available else true,
         });
     }
     return .{
@@ -1904,11 +1900,10 @@ fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent
     else
         try upcomingResult(arena, event, timeUnknown(unknown_time, event.id));
     return .{
-        // No detail upstream (explicit `boxscoreAvailable: false`) means
-        // no link: an empty id renders as plain text in every team view
-        // (verified: gameLineFull/teamGameHtml skip empty ids) and keeps
-        // the JSON shape stable. The row itself still displays.
-        .id = if (event.has_detail) event.id else "",
+        // Game ids always link: detail renders board-backed previews for
+        // games without a summary yet and 404s gracefully only for truly
+        // unknown ids, so scheduled games stay navigable (Next 5 links).
+        .id = event.id,
         .date = event.date,
         .opponent_abbrev = event.opponent_abbrev,
         .opponent_name = event.opponent_name,
@@ -1920,6 +1915,21 @@ fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent
         .result = result,
         .probable = event.probable,
     };
+}
+
+/// Flag upcoming rows falling on today's Eastern calendar day (`pre`
+/// only): renderers surface them in a top-center Today section instead
+/// of only inside Next 5. A midnight-UTC timestamp still flags when its
+/// Eastern day is today (evening games), and vice versa. Unparseable
+/// dates simply stay unflagged.
+fn markTodayGames(arena: std.mem.Allocator, games: []core.schedule.GameRef, today_et: []const u8) !void {
+    for (games) |*game| {
+        if (!std.mem.eql(u8, game.state, "pre")) continue;
+        const epoch = core.date.parseTimestampUTC(game.date) orelse continue;
+        const et_day = try core.date.todayInTz(arena, epoch, core.date.etOffsetMinutes(epoch));
+        defer arena.free(et_day);
+        game.today = std.mem.eql(u8, et_day, today_et);
+    }
 }
 
 /// Live display from schedule scores alone: `"{our}-{opp} {status}"` (the
@@ -2036,6 +2046,14 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
             try extra_next.append(arena, try gameRefFromEvent(arena, event, parsed.unknown_time));
         }
     }
+    // Flag today's upcoming rows top-center: Eastern calendar day derived
+    // from each event's timestamp (evening UTC stamps land on the played
+    // day), `pre` only so finals stay in Last and live rows under LIVE
+    // NOW. Renderers surface flagged rows in a Today section and skip
+    // them in Next/Later below; arrays keep schedule order regardless.
+    const today_et = try core.date.todayET(arena, self.clock(self.io));
+    try markTodayGames(arena, next.items, today_et);
+    try markTodayGames(arena, extra_next.items, today_et);
 
     return .{
         .league = league.slug,
@@ -2829,7 +2847,7 @@ test "fetchTeam resolves numeric ids with abbrev fallback" {
     );
 }
 
-test "fetchTeam clears ids ESPN marks boxscore-unavailable" {
+test "fetchTeam keeps ids linkable for pre-summary games" {
     var fake = TeamFixtureState{
         .teams_body = ncaaf_teams_two_osu,
         .schedule_body = ncaaf_osu_schedule,
@@ -2839,13 +2857,40 @@ test "fetchTeam clears ids ESPN marks boxscore-unavailable" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
-    // Completed game keeps its link; the scheduled future without a summary
-    // renders as plain text (empty id, full display otherwise).
+    // Completed game keeps its link; the scheduled future keeps its id too:
+    // detail renders board-backed previews for games without a summary
+    // yet and 404s gracefully only for truly unknown ids, so upcoming
+    // games stay navigable (Next 5 links).
     try std.testing.expectEqualStrings("401858432", view.last[0].id);
     try std.testing.expectEqual(@as(usize, 1), view.next.len);
-    try std.testing.expectEqualStrings("", view.next[0].id);
+    try std.testing.expectEqualStrings("401858500", view.next[0].id);
     try std.testing.expectEqualStrings("at XYZ 3:30 PM", view.next[0].result);
     try std.testing.expectEqualStrings("XYZ", view.next[0].opponent_abbrev);
+}
+
+test "fetchTeam flags today's upcoming rows Eastern" {
+    // Fake today is 2026-09-07T00:00Z: Eastern Sep 6. The 19:05Z row and
+    // the 02:00Z row both fall on Sep 6 ET (the evening edge); 15:00Z is
+    // Sep 7 ET. The completed row never flags, whatever its date.
+    const sched =
+        \\{"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"events":[{"id":"done","date":"2026-09-06T15:00Z","competitions":[{"id":"done","date":"2026-09-06T15:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"score":{"displayValue":"5"},"winner":true},{"homeAway":"away","team":{"id":"1","abbreviation":"NYM","displayName":"New York Mets"},"score":{"displayValue":"3"},"winner":false}]}]},{"id":"t1","date":"2026-09-06T19:05Z","competitions":[{"id":"t1","date":"2026-09-06T19:05Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"}},{"homeAway":"away","team":{"id":"1","abbreviation":"NYM","displayName":"New York Mets"}}]}]},{"id":"t2","date":"2026-09-07T02:00Z","competitions":[{"id":"t2","date":"2026-09-07T02:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"}},{"homeAway":"away","team":{"id":"1","abbreviation":"NYM","displayName":"New York Mets"}}]}]},{"id":"t3","date":"2026-09-07T15:00Z","competitions":[{"id":"t3","date":"2026-09-07T15:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"}},{"homeAway":"away","team":{"id":"1","abbreviation":"NYM","displayName":"New York Mets"}}]}]}]}
+    ;
+
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = sched,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    try std.testing.expectEqual(@as(usize, 1), view.last.len);
+    try std.testing.expect(!view.last[0].today);
+    try std.testing.expectEqual(@as(usize, 3), view.next.len);
+    try std.testing.expect(view.next[0].today);
+    try std.testing.expect(view.next[1].today);
+    try std.testing.expect(!view.next[2].today);
 }
 
 test "junk team-stats filter pins the exact generic counters" {
