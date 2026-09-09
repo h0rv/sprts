@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise install
+      - run: mise run check
+
+  container-publish:
+    # Builds the Docker image and pushes it to ghcr.io.
+    # Required secret: none beyond the automatic GITHUB_TOKEN (granted
+    # packages: write below, so no manual secret setup is needed).
+    # Green-everywhere guards: the job only runs on pushes (never on pull
+    # requests, so forks stay green), and login/push additionally honor a
+    # token-presence flag so secret-less runs still build the image without
+    # pushing instead of failing. (The flag is staged through job-level env
+    # because the secrets context is not readable in `if` conditions.)
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_PUSH: ${{ secrets.GITHUB_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        if: env.GHCR_PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ env.GHCR_PUSH == 'true' }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
