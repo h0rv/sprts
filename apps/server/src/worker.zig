@@ -149,6 +149,10 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             const body = try spec.docsHtml(alloc);
             return staticResponse(body, contentType(.html), null);
         },
+        .llms => {
+            const body = try spec.llmsTxt(alloc);
+            return staticResponse(body, contentType(.text), null);
+        },
         .home => |home_route| {
             var transport_state = WorkerTransport{};
             const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;

@@ -155,6 +155,66 @@ pub fn openApiJson(allocator: std.mem.Allocator) ![]u8 {
 
 /// API reference page (Scalar UI via zchema's docs module, spec served
 /// from `/openapi.json`). Linked from every page footer as `docs`.
+/// Agent-first API surface at `/llms.txt`. Plain text, never ANSI.
+pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(
+        "sprts - scores in your terminal\n" ++
+            "Provider-neutral sports scores and schedules, ESPN-backed.\n" ++
+            "Plain text by default, HTML with ?format=html, JSON under /api/v1/.\n" ++
+            "\n" ++
+            "Base URL: this host (local http://localhost:8080). Same paths on prod.\n" ++
+            "\n" ++
+            "DOCS\n" ++
+            "  /openapi.json - full API spec, single source of truth\n" ++
+            "  /docs - human API reference\n" ++
+            "  /llms.txt - this file\n" ++
+            "\n" ++
+            "JSON API\n" ++
+            "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
+            "  GET /api/v1/all - Scores for all leagues and date. params: date. (getAll)\n" ++
+            "  GET /api/v1/league - Scores for one league and date. params: date, week football-only. (getScoreboard)\n" ++
+            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. (getGame)\n" ++
+            "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
+            "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
+            "\n" ++
+            "DIGITS RULE\n" ++
+            "  Second segment all digits is a game: /mlb/401816828.\n" ++
+            "  Anything else is a team: /mlb/PHI.\n" ++
+            "\n" ++
+            "TEXT HTML JSON\n" ++
+            "  Text default: curl localhost:8080/mlb\n" ++
+            "  HTML: curl localhost:8080/mlb?format=html\n" ++
+            "  JSON: curl localhost:8080/api/v1/mlb\n" ++
+            "\n" ++
+            "FLAGS text and HTML only, JSON ignores display flags\n" ++
+            "  ?date=YYYY-MM-DD scoreboard day, default today\n" ++
+            "  ?week=N football-only week selector, ignored elsewhere\n" ++
+            "  ?color=0 color off, ?color=1 color on\n" ++
+            "  ?width=N ?height=N terminal size cap\n" ++
+            "  ?0 one-line per game, text-only\n" ++
+            "\n" ++
+            "EXAMPLES\n" ++
+            "  curl localhost:8080/mlb\n" ++
+            "  curl localhost:8080/mlb?date=2026-09-06\n" ++
+            "  curl localhost:8080/mlb?format=html\n" ++
+            "  curl localhost:8080/api/v1/\n" ++
+            "  curl localhost:8080/api/v1/leagues\n" ++
+            "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
+            "  curl localhost:8080/mlb/401816828?0\n" ++
+            "  curl localhost:8080/openapi.json\n" ++
+            "\n" ++
+            "LEAGUES\n" ++
+            "  ",
+    );
+    for (core.leagues.all, 0..) |league, i| {
+        if (i > 0) try out.writer.writeByte(' ');
+        try out.writer.writeAll(league.slug);
+    }
+    try out.writer.writeAll("\n");
+    return out.toOwnedSlice();
+}
 pub fn docsHtml(allocator: std.mem.Allocator) ![]u8 {
     return z.docsHtml(allocator, .{
         .title = "sprts API",
@@ -181,6 +241,21 @@ test "spec emits all five JSON operations" {
     for ([_][]const u8{ "\"date\"", "\"leagues\"", "\"schema_version\"" }) |field| {
         try std.testing.expect(std.mem.indexOf(u8, doc, field) != null);
     }
+}
+
+test "llms.txt is plain agent surface with every operation" {
+    const doc = try llmsTxt(std.testing.allocator);
+    defer std.testing.allocator.free(doc);
+    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings" }) |id| {
+        try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
+    }
+    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "digits", "mlb", "nfl", "Base URL" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, doc, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\x1b") == null);
+    _ = try std.unicode.Utf8View.init(doc);
+    try std.testing.expect(router.parse("/llms.txt") == .llms);
+    try std.testing.expect(router.parse("/llms.txt?color=0") == .llms);
 }
 
 test "docs page serves the Scalar UI pointed at the spec" {

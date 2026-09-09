@@ -83,6 +83,7 @@ pub const Route = union(enum) {
     help: HelpRoute,
     openapi,
     docs,
+    llms,
     health,
     not_found,
     bad_date,
@@ -102,6 +103,7 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/docs")) return .docs;
+    if (std.mem.eql(u8, path, "/llms.txt")) return .llms;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
 
     // Help page (wttr.in `:help` style): global `/:help`, `/help` plus the
@@ -661,4 +663,15 @@ test "game detail dispatch honors one-line for text only" {
     const api = parse("/api/v1/mlb/401816856?0").game;
     try std.testing.expect(!gameOneLine(api, formatFor("/api/v1/mlb/401816856?0", "*/*")));
     try std.testing.expect(!gameOneLine(alias, formatFor("/mlb/401816856?0", "application/json")));
+}
+
+test "llms.txt parses exact with query ignored" {
+    try std.testing.expect(parse("/llms.txt") == .llms);
+    try std.testing.expect(parse("/llms.txt?foo=bar") == .llms);
+    try std.testing.expect(parse("/llms.txt?color=0") == .llms);
+    try std.testing.expect(!isJsonTarget("/llms.txt"));
+    try std.testing.expect(!isJsonTarget("/llms.txt?foo=bar"));
+    // Near misses are not the agent page.
+    try std.testing.expect(parse("/llms.txt/") == .not_found);
+    try std.testing.expect(parse("/llms") == .scoreboard);
 }
