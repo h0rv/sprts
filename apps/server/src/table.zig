@@ -258,7 +258,7 @@ pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
 pub fn spacerRow(w: *std.Io.Writer, inner: usize) !void {
     try w.writeAll("│ ");
     var i: usize = 0;
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    while (i < inner -| 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
 }
 
@@ -272,7 +272,7 @@ pub const Table = struct {
     }
 
     pub fn row(self: Table, line: []const u8, code: ?[]const u8) !void {
-        try writeRow(self.writer, line, self.inner - 2, code, self.color);
+        try writeRow(self.writer, line, self.inner -| 2, code, self.color);
     }
 
     pub fn participantRow(self: Table, participant: domain.Participant) !void {
@@ -289,11 +289,11 @@ pub const Table = struct {
         if (participant.abbreviation.len > 0) {
             try writeCell(w, participant.abbreviation, 4, mark, self.color);
             try w.writeByte(' ');
-            name_width = inner - 2 - 12;
+            name_width = inner -| 2 -| 12;
         } else {
             // Athlete identities carry no abbreviation: the name absorbs
             // the abbr cell plus its separator.
-            name_width = inner - 2 - 7;
+            name_width = inner -| 2 -| 7;
         }
         name_width = name_width -| suffix_len;
         try writeCell(w, participant.name, name_width, mark, self.color);
@@ -518,7 +518,7 @@ pub fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: [
     }
 
     const gap: usize = 2;
-    if (n < 2 or widths[0] + gap + widths[1] > inner - 2) {
+    if (n < 2 or widths[0] + gap + widths[1] > inner -| 2) {
         for (rows[0..n]) |list| {
             for (list.items) |line| {
                 if (line.len == 0) {
@@ -547,7 +547,7 @@ pub fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: [
             var pad: usize = widths[i] - countCells(line);
             while (pad > 0) : (pad -= 1) try row.writer.writeByte(' ');
         }
-        var fill: usize = inner - 2 - (widths[0] + gap + widths[1]);
+        var fill: usize = (inner -| 2) -| (widths[0] + gap + widths[1]);
         while (fill > 0) : (fill -= 1) try row.writer.writeByte(' ');
         const text = try row.toOwnedSlice();
         defer allocator.free(text);
@@ -1069,3 +1069,19 @@ test "art html band-passes extremes to page ink" {
     _ = try std.unicode.Utf8View.init(got);
 }
 
+
+test "degenerate widths cannot wrap or hang" {
+    // inner < 2 used to wrap `inner - 2` to ~2^64 (giant write / OOM).
+    for ([_]usize{ 0, 1 }) |inner| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var table = Table{ .writer = &out.writer, .inner = inner, .color = false };
+        try spacerRow(&out.writer, inner);
+        try table.row("Final", null);
+        try table.rule(.top);
+        const got = try out.toOwnedSlice();
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(got.len < 64);
+        _ = try std.unicode.Utf8View.init(got);
+    }
+}
