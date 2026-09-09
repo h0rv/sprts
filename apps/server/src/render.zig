@@ -1339,7 +1339,7 @@ const page_style =
 /// palette. Served verbatim at `/favicon.svg` and linked from every
 /// page head; no script, no external assets, no font dependency.
 pub const favicon_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges" fill="#e6ebe7"><rect width="64" height="64" fill="#10140f"/><polygon points="2,2 42,2 42,22 2,22" /><polygon points="2,22 62,22 62,42 2,42" /><polygon points="22,42 62,42 62,62 22,62" /></svg>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges"><rect width="64" height="64" fill="#10140f"/><g transform="translate(2,24) scale(0.3158)" fill="#e6ebe7"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></g></svg>
 ;
 
 /// Pixel wordmark `sprts` (lowercase, chunky rects like the
