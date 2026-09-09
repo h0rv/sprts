@@ -21,6 +21,14 @@
 //!
 //! Display: `labelFor` renders `M/D ZONE` (e.g. `9/6 ET`) so date labels
 //! name their zone instead of silently disagreeing with ESPN.
+//!
+//! Convention: US Eastern is always the generic `ET` in headings and row
+//! times. ESPN statuses arrive with the specific offset in force
+//! (`9/8 - 7:40 PM EDT`, `1/15 - 7:00 PM EST`); `normalizeEastern` folds
+//! those to `ET` at display so rows read the same convention as the
+//! headings. `labelFor`/`zoneTag` stay generic (never EDT/EST): the
+//! scoreboard/home suites pin `9/6 ET`, so the specific form must not
+//! leak back into labels.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -116,6 +124,31 @@ pub fn zoneTag(arena: std.mem.Allocator, zone: Zone) ![]u8 {
         .utc => arena.dupe(u8, "UTC"),
         .fixed => |offset| fixedTag(arena, offset),
     };
+}
+
+/// Fold ESPN's specific Eastern suffixes to the generic heading
+/// convention: standalone `EDT`/`EST` tokens become `ET`
+/// (`9/8 - 7:40 PM EDT` -> `9/8 - 7:40 PM ET`). Already-generic `ET`
+/// and non-zone words pass through untouched. Pure string scan, no
+/// time math; team/detail views apply it to displayed statuses so
+/// headings (`... ET`) and rows never mix conventions.
+pub fn normalizeEastern(arena: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < s.len) {
+        const is_zone = i + 4 <= s.len and s[i] == ' ' and
+            (std.mem.eql(u8, s[i + 1 .. i + 4], "EDT") or std.mem.eql(u8, s[i + 1 .. i + 4], "EST")) and
+            (i + 4 == s.len or !std.ascii.isAlphabetic(s[i + 4]));
+        if (is_zone) {
+            try out.writer.writeAll(" ET");
+            i += 4;
+        } else {
+            try out.writer.writeByte(s[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice();
 }
 
 fn fixedTag(arena: std.mem.Allocator, offset_minutes: i16) ![]u8 {
@@ -297,4 +330,24 @@ test "labelFor names the zone" {
     const half = try labelFor(arena, "2026-09-06", .{ .fixed = 330 });
     defer arena.free(half);
     try std.testing.expectEqualStrings("9/6 UTC+5:30", half);
+}
+
+test "normalizeEastern folds EDT/EST rows to the ET heading convention" {
+    const arena = std.testing.allocator;
+    const edt = try normalizeEastern(arena, "9/8 - 7:40 PM EDT");
+    defer arena.free(edt);
+    try std.testing.expectEqualStrings("9/8 - 7:40 PM ET", edt);
+    const est = try normalizeEastern(arena, "1/15 - 7:00 PM EST");
+    defer arena.free(est);
+    try std.testing.expectEqualStrings("1/15 - 7:00 PM ET", est);
+    // Already generic, dateless, and non-zone words pass through.
+    const plain = try normalizeEastern(arena, "7:05 PM ET");
+    defer arena.free(plain);
+    try std.testing.expectEqualStrings("7:05 PM ET", plain);
+    const final = try normalizeEastern(arena, "Final");
+    defer arena.free(final);
+    try std.testing.expectEqualStrings("Final", final);
+    const best = try normalizeEastern(arena, "BEST TEST ESTER");
+    defer arena.free(best);
+    try std.testing.expectEqualStrings("BEST TEST ESTER", best);
 }

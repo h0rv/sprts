@@ -28,7 +28,7 @@ pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
 
 /// `width` is total terminal columns of the document. Never shrinks below
 /// the classic 52-wide page. `height` caps the scoring plays listed
-/// (`+N more` trailer); null/0 = latest 5.
+/// (`+N more (?height=M)` trailer); null/0 = latest 5.
 ///
 /// Pipe-less by design: the page reads as aligned prose with blank lines
 /// between sections (wttr.in-style), not a box grid. Column rows
@@ -39,14 +39,18 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    // one-line: heading gains the zone label via `tz.labelFor` (ET default;
-    // `?tz=` plumbing stays in main/worker, which this task must not touch).
-    const zone_label = try tz.labelFor(allocator, game.date, .et);
-    defer allocator.free(zone_label);
-    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} ({s})", .{ game.league_name, game.date, zone_label });
+    // Heading names league + full date + zone once (`MLB  2026-09-06 ET`,
+    // the board shape): no `M/D` repeat. The status arrives with ESPN's
+    // specific suffix (`... PM EDT`); fold it to the generic heading
+    // convention so rows and headings read one label.
+    const zone_tag = try tz.zoneTag(allocator, .et);
+    defer allocator.free(zone_tag);
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ game.league_name, game.date, zone_tag });
     defer allocator.free(heading);
     try table.writeLine(w, heading, cols, "2", color);
-    try table.writeLine(w, game.status, cols, statusColor(game.state), color);
+    const status = try tz.normalizeEastern(allocator, game.status);
+    defer allocator.free(status);
+    try table.writeLine(w, status, cols, statusColor(game.state), color);
     const plines = try participantLines(allocator, game.participants, cols);
     defer freeLines(allocator, plines);
     for (plines, game.participants) |line, entry| {
@@ -113,7 +117,7 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
             try w.writeByte('\n');
         }
         if (start > 0) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{start});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ start, game.scoring_plays.len });
             defer allocator.free(more);
             try table.writeLine(w, more, cols, "2", color);
         }
@@ -165,15 +169,17 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
     defer allocator.free(title);
     try render.pageHead(w, title);
     try w.writeAll("<pre>");
-    // one-line: heading gains the zone label via `tz.labelFor` (ET default; see renderText).
-    const zone_label = try tz.labelFor(allocator, game.date, .et);
-    defer allocator.free(zone_label);
-    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} ({s})", .{ game.league_name, game.date, zone_label });
+    // Heading names league + full date + zone once (see renderText).
+    const zone_tag = try tz.zoneTag(allocator, .et);
+    defer allocator.free(zone_tag);
+    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ game.league_name, game.date, zone_tag });
     defer allocator.free(heading);
     try render.writeHtmlLine(w, allocator, heading, cols, "dim", null);
     const status_href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ game.league, game.date });
     defer allocator.free(status_href);
-    try render.writeHtmlLine(w, allocator, game.status, cols, stateClass(game.state), status_href);
+    const status = try tz.normalizeEastern(allocator, game.status);
+    defer allocator.free(status);
+    try render.writeHtmlLine(w, allocator, status, cols, stateClass(game.state), status_href);
     const plines = try participantLines(allocator, game.participants, cols);
     defer freeLines(allocator, plines);
     for (plines, game.participants) |line, entry| {
@@ -239,7 +245,7 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         defer freeLines(allocator, rows);
         for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
         if (start > 0) {
-            const more = try std.fmt.allocPrint(allocator, "+{d} more", .{start});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ start, game.scoring_plays.len });
             defer allocator.free(more);
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
@@ -718,13 +724,13 @@ pub fn renderTextOneLine(arena: std.mem.Allocator, game: detail.GameDetail, colo
     errdefer out.deinit();
     const w = &out.writer;
     if (!quiet) {
-        const label = try tz.labelFor(arena, game.date, .et);
-        defer arena.free(label);
-        const heading = try std.fmt.allocPrint(arena, "{s}  {s} ({s})\n", .{ game.league_name, game.date, label });
+        const zone_tag = try tz.zoneTag(arena, .et);
+        defer arena.free(zone_tag);
+        const heading = try std.fmt.allocPrint(arena, "{s}  {s} {s}\n", .{ game.league_name, game.date, zone_tag });
         defer arena.free(heading);
         try oneLineColorize(w, "2", heading, color);
     }
-    try writeDetailOneLine(w, game, color);
+    try writeDetailOneLine(w, arena, game, color);
     if (!quiet) {
         try w.print("/{s}?date={s}\n", .{ game.league, game.date });
     }
@@ -736,12 +742,14 @@ pub fn renderTextOneLine(arena: std.mem.Allocator, game: detail.GameDetail, colo
 // the scoreboard stream and this module owns the detail stream, so a
 // cross-module import would couple the two owners). Adapted: detail has
 // no game `.name`, so non-duels list abbrevs.
-fn writeDetailOneLine(w: *std.Io.Writer, game: detail.GameDetail, color: bool) !void {
+fn writeDetailOneLine(w: *std.Io.Writer, arena: std.mem.Allocator, game: detail.GameDetail, color: bool) !void {
     if (color) try w.print("\x1b[{s}m", .{oneLineStateColor(game.state)});
     try w.writeAll(game.state);
     if (color) try w.writeAll("\x1b[0m");
     try w.writeByte(' ');
-    try w.writeAll(game.status);
+    const status = try tz.normalizeEastern(arena, game.status);
+    defer arena.free(status);
+    try w.writeAll(status);
     if (game.participants.len == 2) {
         const first = game.participants[0];
         const second = game.participants[1];
@@ -817,7 +825,7 @@ test "detail one-line compacts pre-game duels without scores" {
 test "detail one-line honors quiet framing, color, and zone label" {
     const framed = try renderTextOneLine(std.testing.allocator, testDetail(), false, false);
     defer std.testing.allocator.free(framed);
-    try std.testing.expect(std.mem.indexOf(u8, framed, "MLB  2026-09-06 (9/6 ET)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, framed, "MLB  2026-09-06 ET\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, framed, "post Final ATL 5 @ PHI 4 ✓\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, framed, "/mlb?date=2026-09-06\n") != null);
     for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
@@ -840,10 +848,13 @@ test "detail one-line honors quiet framing, color, and zone label" {
 test "detail box headings carry the zone label" {
     const text = try renderText(std.testing.allocator, testDetail(), false, null, null);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "MLB  2026-09-06 (9/6 ET)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "MLB  2026-09-06 ET") != null);
+    // No `M/D` repeat: the full date appears once, the zone beside it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "(9/6") == null);
     const page = try detailHtml(std.testing.allocator, testDetail(), null, null);
     defer std.testing.allocator.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "(9/6 ET)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "2026-09-06 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "(9/6") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
 // depth: box-score team stats section (appended; existing tests above untouched).
@@ -1049,4 +1060,54 @@ test "detail linescore shows Total instead of R/H/E for NCAAM halves" {
     try std.testing.expect(std.mem.indexOf(u8, page, "DUKE 28-5 · UNC 26-7") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(page);
+}
+
+test "detail scoring trailer hints at ?height=" {
+    var game = testDetail();
+    var plays = [_]detail.DetailScoringPlay{
+        .{ .period = "1st Inning", .text = "First run.", .away_score = "1", .home_score = "0" },
+        .{ .period = "2nd Inning", .text = "Second run.", .away_score = "2", .home_score = "0" },
+        .{ .period = "3rd Inning", .text = "Third run.", .away_score = "3", .home_score = "0" },
+        .{ .period = "4th Inning", .text = "Fourth run.", .away_score = "4", .home_score = "0" },
+        .{ .period = "5th Inning", .text = "Fifth run.", .away_score = "5", .home_score = "0" },
+        .{ .period = "6th Inning", .text = "Sixth run.", .away_score = "6", .home_score = "0" },
+        .{ .period = "7th Inning", .text = "Seventh run.", .away_score = "7", .home_score = "0" },
+    };
+    game.scoring_plays = &plays;
+    const text = try renderText(std.testing.allocator, game, false, null, 5);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+2 more (?height=7)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") == null);
+    const page = try detailHtml(std.testing.allocator, game, null, 5);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "+2 more (?height=7)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Full height lists every play with no trailer.
+    const all = try renderText(std.testing.allocator, game, false, null, 7);
+    defer std.testing.allocator.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "more") == null);
+    // JSON carries every play regardless of height (no trailer there).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const wire = try json(arena_state.allocator(), game);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "?height") == null);
+}
+
+test "detail statuses read the generic ET convention" {
+    var game = testDetail();
+    game.state = "pre";
+    game.status = "9/8 - 7:40 PM EDT";
+    const text = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "9/8 - 7:40 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "EDT") == null);
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "9/8 - 7:40 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "EDT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    const line = try renderTextOneLine(std.testing.allocator, game, false, true);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "9/8 - 7:40 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "EDT") == null);
 }
