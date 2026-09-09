@@ -672,6 +672,18 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
     try w.writeByte('\n');
 }
 
+/// True when any participant in the first `shown` games has a color mark.
+/// The score HTML linkifier only reads the color twin on art rows, so a
+/// false here means the twin render can be skipped with identical output.
+fn boardHasColorArt(board: domain.Scoreboard, shown: usize) bool {
+    for (board.games[0..shown]) |game| {
+        for (game.participants) |participant| {
+            if (core.art.teamArtColor(board.league, participant.abbreviation, .xs) != null) return true;
+        }
+    }
+    return false;
+}
+
 /// Minimal browser page: the same table as text, never ANSI, with real
 /// links. Browsers cannot use terminal escapes, so SGR never reaches the
 /// page raw: team marks re-render as rgb spans while the text renderer
@@ -679,10 +691,18 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
 /// The title and the table heading both name the zone
 /// (`MLB scores 2026-09-06 ET`); the date nav stays date-only.
 pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+    const shown_pre: usize = @min(height orelse board.games.len, board.games.len);
     const body = try textWithZone(allocator, board, false, width, height, zone);
     defer allocator.free(body);
-    const color_body = try textWithZone(allocator, board, true, width, height, zone);
-    defer allocator.free(color_body);
+    // Fast path: no shown participant has a color mark, so the linkifier
+    // never reads the color twin (only art rows consult it). Reuse the
+    // mono body instead of rendering the full table twice.
+    var color_owned: ?[]u8 = null;
+    defer if (color_owned) |b| allocator.free(b);
+    if (boardHasColorArt(board, shown_pre)) {
+        color_owned = try textWithZone(allocator, board, true, width, height, zone);
+    }
+    const color_body = color_owned orelse body;
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -696,7 +716,7 @@ pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard,
     defer allocator.free(title);
     try pageHead(w, title);
     try w.writeAll("<pre>");
-    const shown: usize = @min(height orelse board.games.len, board.games.len);
+    const shown: usize = shown_pre;
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
     try w.writeAll("</pre><nav>");
@@ -1427,6 +1447,49 @@ test "scoreHtml art rows stay pos-indexed and unlinked" {
         }
     }
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "scoreHtml skips the color twin when no team has color art" {
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{.{
+            .id = "1",
+            .name = "Away at Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{
+                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+            },
+        }},
+    };
+    // Gate fires: neither fixture abbr ships a color sidecar.
+    try std.testing.expect(!boardHasColorArt(board, board.games.len));
+    // The twin carries nothing the linkifier would read: stripping SGR
+    // from the color render reproduces the mono body, so reusing the
+    // mono body as the twin is byte-identical for this board.
+    const mono = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(mono);
+    const colored = try text(std.testing.allocator, board, true, null, null);
+    defer std.testing.allocator.free(colored);
+    var stripped: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stripped.deinit();
+    try stripAnsi(&stripped.writer, colored);
+    const stripped_slice = try stripped.toOwnedSlice();
+    defer std.testing.allocator.free(stripped_slice);
+    try std.testing.expectEqualStrings(mono, stripped_slice);
+    // Fast-path page: no rgb spans, no escapes, same visible text.
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\" id=\"game-1\">") != null);
     try expectVisiblePreText(page, board, null, null);
     _ = try std.unicode.Utf8View.init(page);
 }
