@@ -69,6 +69,38 @@ pub const DetailDecision = struct {
     };
 };
 
+/// One starter in a batting lineup: order, position, name, and the
+/// hitting line. Baseball-first in spirit (batOrder/positions come from
+/// the provider's batting stat group); other sports leave `lineups` empty.
+pub const DetailLineupEntry = struct {
+    order: i64 = 0,
+    position: []const u8 = "",
+    name: []const u8 = "",
+    hitting: []const u8 = "",
+    runs: []const u8 = "",
+    rbis: []const u8 = "",
+    walks: []const u8 = "",
+    strikeouts: []const u8 = "",
+    average: []const u8 = "",
+
+    pub const jsonschema = .{
+        .name = "DetailLineupEntry",
+        .description = "One starter: batting order, position, name, hitting line.",
+    };
+};
+
+/// One side's starting lineup plus the side's hitting total (H-AB).
+pub const DetailLineup = struct {
+    team: []const u8 = "",
+    total: []const u8 = "",
+    entries: []const DetailLineupEntry = &.{},
+
+    pub const jsonschema = .{
+        .name = "DetailLineup",
+        .description = "One side's starting lineup in batting order.",
+    };
+};
+
 pub const DetailScoringPlay = struct {
     period: []const u8,
     text: []const u8,
@@ -97,6 +129,10 @@ pub const DetailGame = struct {
     decisions: []const DetailDecision = &.{},
     scoring_plays: []const DetailScoringPlay = &.{},
     leaders: []const []const u8 = &.{},
+    // depth: starting lineups in batting order, one side per entry.
+    // Empty when the provider supplies no batting group; renderers
+    // prefer this over leaders for baseball and skip it otherwise.
+    lineups: []const DetailLineup = &.{},
     // depth: box-score team totals, one preformatted line per stat
     // (e.g. "ATL At Bats 35"). Empty when the provider supplies none;
     // renderers skip the section rather than erroring.
@@ -112,6 +148,7 @@ pub const DetailGame = struct {
             .attendance = .{ .description = "Ticketed attendance when the provider supplies it." },
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },
             .leaders = .{ .description = "Short statistical leader strings, e.g. team totals and top performers." },
+            .lineups = .{ .description = "Starting lineups in batting order when the provider supplies a batting group; absent otherwise." },
             .team_stats = .{ .description = "Box-score team total lines when the provider supplies them; absent otherwise." },
         },
     };
@@ -123,6 +160,8 @@ test "detail structs carry jsonschema names" {
     try std.testing.expectEqualStrings("DetailSituation", DetailSituation.jsonschema.name);
     try std.testing.expectEqualStrings("DetailDecision", DetailDecision.jsonschema.name);
     try std.testing.expectEqualStrings("DetailScoringPlay", DetailScoringPlay.jsonschema.name);
+    try std.testing.expectEqualStrings("DetailLineupEntry", DetailLineupEntry.jsonschema.name);
+    try std.testing.expectEqualStrings("DetailLineup", DetailLineup.jsonschema.name);
     try std.testing.expectEqualStrings("DetailGame", DetailGame.jsonschema.name);
 }
 
@@ -142,8 +181,11 @@ test "game detail defaults to empty collections" {
     try std.testing.expectEqual(@as(usize, 0), game_detail.decisions.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.scoring_plays.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.leaders.len);
+    try std.testing.expectEqual(@as(usize, 0), game_detail.lineups.len);
 }
 
+pub const LineupEntry = DetailLineupEntry;
+pub const LineupSide = DetailLineup;
 pub const LineScore = DetailLineScore;
 pub const Situation = DetailSituation;
 pub const Decision = DetailDecision;

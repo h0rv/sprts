@@ -131,7 +131,25 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
             try table.writeLine(w, more, cols, "2", color);
         }
     }
-    if (game.leaders.len > 0) {
+    // Lineups replace leaders when the provider ships a batting group:
+    // nine starters per side beats a redundant top-4 for baseball.
+    if (game.lineups.len > 0) {
+        try w.writeByte('\n');
+        try table.writeLine(w, "Lineups", cols, "2", color);
+        for (game.lineups) |side| {
+            const head = try std.fmt.allocPrint(allocator, "{s} {s}", .{ side.team, side.total });
+            defer allocator.free(head);
+            try table.writeLine(w, head, cols, "2", color);
+            const items = try lineupItems(allocator, side);
+            defer freeLines(allocator, items);
+            const rows = try keyValueLines(allocator, items, cols);
+            defer freeLines(allocator, rows);
+            for (rows) |line| {
+                try w.writeAll(line);
+                try w.writeByte('\n');
+            }
+        }
+    } else if (game.leaders.len > 0) {
         try w.writeByte('\n');
         try table.writeLine(w, "Leaders", cols, "2", color);
         const block = try leadersLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], game.participants, cols);
@@ -267,7 +285,20 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
     }
-    if (game.leaders.len > 0) {
+    if (game.lineups.len > 0) {
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Lineups", cols, "dim", null);
+        for (game.lineups) |side| {
+            const head = try std.fmt.allocPrint(allocator, "{s} {s}", .{ side.team, side.total });
+            defer allocator.free(head);
+            try render.writeHtmlLine(w, allocator, head, cols, "dim", null);
+            const items = try lineupItems(allocator, side);
+            defer freeLines(allocator, items);
+            const rows = try keyValueLines(allocator, items, cols);
+            defer freeLines(allocator, rows);
+            for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        }
+    } else if (game.leaders.len > 0) {
         try w.writeByte('\n');
         try render.writeHtmlLine(w, allocator, "Leaders", cols, "dim", null);
         const block = try leadersLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], game.participants, cols);
@@ -361,6 +392,21 @@ fn situationText(allocator: std.mem.Allocator, situation: detail.Situation) ![]u
 fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     for (lines) |line| allocator.free(line);
     allocator.free(lines);
+}
+
+/// One side's lineup as `keyValueLines` items: `{order}. {pos} {name}
+/// {hitting}`, split on the last space so H-AB shares a right column.
+/// Shared by text and HTML.
+fn lineupItems(allocator: std.mem.Allocator, side: core.detail.LineupSide) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    for (side.entries) |entry| {
+        try out.append(allocator, try std.fmt.allocPrint(allocator, "{d}. {s} {s} {s}", .{ entry.order, entry.position, entry.name, entry.hitting }));
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Free a `LeadersBlock` built by `leadersLines`.
@@ -1314,3 +1360,33 @@ test "detail live situation wraps the matchup instead of truncating" {
         }
     }
 }
+
+test "detail lineups replace leaders when a batting group ships" {
+    var game = testDetail();
+    game.leaders = &.{"ATL H-AB 10-35"};
+    game.lineups = &.{
+        .{
+            .team = "ATL",
+            .total = "10-35",
+            .entries = &.{
+                .{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3", .runs = "1", .average = ".255" },
+                .{ .order = 2, .position = "DH", .name = "Marcell Ozuna", .hitting = "0-4" },
+            },
+        },
+    };
+    const output = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(output);
+    _ = try std.unicode.Utf8View.init(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Lineups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ronald Acuna Jr.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "2-3") != null);
+    // Leaders yield to lineups: no redundant section.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Leaders") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ATL H-AB") == null);
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Ronald Acuna Jr.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Leaders") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+

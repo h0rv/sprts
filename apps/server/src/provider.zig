@@ -678,6 +678,13 @@ const SummaryPlayerStats = struct {
 const SummaryPlayerAthlete = struct {
     athlete: ?SummaryAthleteId = null,
     stats: []const std.json.Value = &.{},
+    batOrder: ?i64 = null,
+    starter: ?bool = null,
+    position: ?SummaryPosition = null,
+};
+
+const SummaryPosition = struct {
+    abbreviation: []const u8 = "",
 };
 
 const SummaryAthleteId = struct {
@@ -1181,6 +1188,67 @@ fn boxscoreLeaders(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *st
     }
 }
 
+/// Starting lineups from the boxscore batting group (keys carrying
+/// `atBats`): starters with a batting order, in payload order, one side
+/// per player group. Groups without a batting group (football shapes)
+/// contribute nothing, so other sports keep empty lineups.
+fn boxscoreLineups(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *std.ArrayList(core.detail.LineupSide)) !void {
+    const groups = boxscore.players[0..@min(boxscore.players.len, 2)];
+    for (groups) |group| {
+        const abbr: []const u8 = if (group.team) |team| team.abbreviation else "?";
+        const batting = for (group.statistics) |stats| {
+            if (statKeyIndex(stats.keys, "atBats") != null) break stats;
+        } else continue;
+        const hab = statKeyIndex(batting.keys, "hits-atBats") orelse 0;
+        const runs = statKeyIndex(batting.keys, "runs");
+        const rbis = statKeyIndex(batting.keys, "RBIs");
+        const walks = statKeyIndex(batting.keys, "walks");
+        const strikeouts = statKeyIndex(batting.keys, "strikeouts");
+        const average = statKeyIndex(batting.keys, "avg");
+        var entries: std.ArrayList(core.detail.LineupEntry) = .empty;
+        for (batting.athletes) |entry| {
+            if ((entry.starter orelse true) == false) continue;
+            const order = entry.batOrder orelse continue;
+            const reference = entry.athlete orelse continue;
+            const name: []const u8 = if (reference.displayName.len > 0)
+                reference.displayName
+            else if (reference.fullName.len > 0)
+                reference.fullName
+            else
+                continue;
+            const pos: []const u8 = if (entry.position) |p| p.abbreviation else "";
+            try entries.append(arena, .{
+                .order = order,
+                .position = pos,
+                .name = name,
+                .hitting = (if (hab < entry.stats.len) try jsonText(arena, entry.stats[hab]) else null) orelse "",
+                .runs = statText(arena, entry.stats, runs) catch "",
+                .rbis = statText(arena, entry.stats, rbis) catch "",
+                .walks = statText(arena, entry.stats, walks) catch "",
+                .strikeouts = statText(arena, entry.stats, strikeouts) catch "",
+                .average = statText(arena, entry.stats, average) catch "",
+            });
+        }
+        if (entries.items.len == 0) continue;
+        try out.append(arena, .{
+            .team = abbr,
+            .total = (if (hab < batting.totals.len) try jsonText(arena, batting.totals[hab]) else null) orelse "",
+            .entries = try entries.toOwnedSlice(arena),
+        });
+    }
+}
+
+fn statKeyIndex(keys: []const []const u8, wanted: []const u8) ?usize {
+    for (keys, 0..) |key, i| if (std.mem.eql(u8, key, wanted)) return i;
+    return null;
+}
+
+fn statText(arena: std.mem.Allocator, stats: []const std.json.Value, index: ?usize) ![]const u8 {
+    const i = index orelse return "";
+    if (i >= stats.len) return "";
+    return (try jsonText(arena, stats[i])) orelse "";
+}
+
 /// "completions/passingAttempts" -> "Completions/passing attempts": a
 /// space before each camel hump (an uppercase following a lowercase or
 /// digit, lowercased), first letter capitalized. Acronym runs ("H-AB")
@@ -1373,6 +1441,12 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         series = try seriesFromSchedules(self, arena, endpoint, hit.day[0..4], competition, game.id);
     }
 
+    // depth: starting lineups from the batting group (baseball).
+    var lineups: std.ArrayList(core.detail.LineupSide) = .empty;
+    if (response.boxscore) |boxscore| {
+        try boxscoreLineups(arena, boxscore, &lineups);
+    }
+
     // depth: box-score team totals ride the already-fetched summary payload.
     const team_stats = try boxTeamStats(arena, response.boxscore);
 
@@ -1391,6 +1465,7 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .decisions = try decisions.toOwnedSlice(arena),
         .scoring_plays = try scoring_plays.toOwnedSlice(arena),
         .leaders = try leaders.toOwnedSlice(arena),
+        .lineups = try lineups.toOwnedSlice(arena),
         // depth: box-score team totals (optional; empty when not supplied).
         .team_stats = team_stats,
     };
@@ -3124,4 +3199,57 @@ test "playoff verbatim series renders without a doubled prefix" {
     try std.testing.expectEqualStrings("tied 1-1 (game 3 of 4)", detail.series.?);
     // Answered from the summary: no schedule derivation fetches.
     try std.testing.expectEqual(@as(usize, 0), fake.sched_calls);
+}
+
+test "boxscoreLineups keeps starters in order with positions" {
+    const boxscore: SummaryBoxscore = .{
+        .players = &.{
+            .{
+                .team = .{ .abbreviation = "ATL" },
+                .statistics = &.{
+                    .{
+                        .names = &.{ "H-AB", "AB", "R", "AVG" },
+                        .keys = &.{ "hits-atBats", "atBats", "runs", "avg" },
+                        .totals = &.{ .{ .string = "10-35" }, .{ .string = "35" }, .{ .string = "5" }, .{ .string = "" } },
+                        .athletes = &.{
+                            .{
+                                .athlete = .{ .displayName = "Ronald Acuna Jr." },
+                                .stats = &.{ .{ .string = "2-3" }, .{ .string = "3" }, .{ .string = "1" }, .{ .string = ".255" } },
+                                .batOrder = 2,
+                                .starter = true,
+                                .position = .{ .abbreviation = "RF" },
+                            },
+                            .{
+                                .athlete = .{ .displayName = "Bench Bat" },
+                                .stats = &.{.{ .string = "1-1" }},
+                                .batOrder = null,
+                                .starter = false,
+                                .position = .{ .abbreviation = "PH" },
+                            },
+                        },
+                    },
+                    .{
+                        .names = &.{"IP"},
+                        .keys = &.{"inningsPitched"},
+                        .athletes = &.{},
+                    },
+                },
+            },
+        },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var out: std.ArrayList(core.detail.LineupSide) = .empty;
+    try boxscoreLineups(arena_state.allocator(), boxscore, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("ATL", out.items[0].team);
+    try std.testing.expectEqualStrings("10-35", out.items[0].total);
+    try std.testing.expectEqual(@as(usize, 1), out.items[0].entries.len);
+    const leadoff = out.items[0].entries[0];
+    try std.testing.expectEqual(@as(i64, 2), leadoff.order);
+    try std.testing.expectEqualStrings("RF", leadoff.position);
+    try std.testing.expectEqualStrings("Ronald Acuna Jr.", leadoff.name);
+    try std.testing.expectEqualStrings("2-3", leadoff.hitting);
+    try std.testing.expectEqualStrings("1", leadoff.runs);
+    try std.testing.expectEqualStrings(".255", leadoff.average);
 }
