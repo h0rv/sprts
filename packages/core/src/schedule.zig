@@ -75,7 +75,11 @@ pub const TeamView = struct {
 
 /// Raw schedule row used by the pure helpers below. The provider builds
 /// these from the ESPN schedule payload (competition level) before mapping
-/// to `GameRef`s.
+/// to `GameRef`s. `has_detail` is false only when ESPN explicitly marks
+/// the competition `boxscoreAvailable: false` (e.g. a scheduled NFL game
+/// with no summary yet); a missing flag means available, preserving the
+/// historical link-everything behavior. Rows without detail render as
+/// plain text (their `GameRef.id` is cleared at mapping time).
 pub const ScheduleEvent = struct {
     id: []const u8,
     date: []const u8,
@@ -88,6 +92,7 @@ pub const ScheduleEvent = struct {
     opp_score: []const u8 = "",
     won: ?bool = null,
     probable: []const u8 = "",
+    has_detail: bool = true,
 };
 
 pub const Split = struct {

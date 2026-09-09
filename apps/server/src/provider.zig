@@ -476,9 +476,16 @@ test "fetchAll degrades to null boards instead of failing" {
 const SummaryResponse = struct {
     header: ?SummaryHeader = null,
     plays: ?[]const SummaryPlay = null,
+    // Football (NCAAF/NFL) ships scoring plays here instead of `plays`:
+    // every entry is a scoring play, `period` carries `number` only.
+    scoringPlays: ?[]const SummaryScoringPlay = null,
     boxscore: ?SummaryBoxscore = null,
     gameInfo: ?SummaryGameInfo = null,
     seasonseries: ?[]const SummarySeries = null,
+    // Football-style top-level leaders (per-team categories with display
+    // values, e.g. "21/25, 320 YDS, 3 TD"). Preferred over the boxscore
+    // fallback when present; the wire shape (`leaders: []string`) is same.
+    leaders: ?[]const SummaryTopTeam = null,
 };
 
 const SummaryHeader = struct {
@@ -576,6 +583,8 @@ const SummaryPlay = struct {
 
 const SummaryPeriod = struct {
     displayValue: []const u8 = "",
+    // Football `scoringPlays` periods carry only this (1-4 = quarters).
+    number: ?i64 = null,
 };
 
 const SummaryCount = struct {
@@ -590,6 +599,30 @@ const SummaryPlayParticipant = struct {
 
 const SummaryIdRef = struct {
     id: std.json.Value = .null,
+};
+
+const SummaryScoringPlay = struct {
+    text: []const u8 = "",
+    awayScore: std.json.Value = .null,
+    homeScore: std.json.Value = .null,
+    period: ?SummaryPeriod = null,
+};
+
+const SummaryTopTeam = struct {
+    team: ?SummaryTeam = null,
+    leaders: []const SummaryTopCategory = &.{},
+};
+
+const SummaryTopCategory = struct {
+    name: []const u8 = "",
+    displayName: []const u8 = "",
+    leaders: []const SummaryTopEntry = &.{},
+};
+
+const SummaryTopEntry = struct {
+    displayValue: std.json.Value = .null,
+    value: std.json.Value = .null,
+    athlete: ?SummaryAthlete = null,
 };
 
 fn refId(ref: ?SummaryIdRef) ?[]const u8 {
@@ -613,7 +646,12 @@ const SummaryBoxTeam = struct {
 const SummaryTeamStats = struct {
     name: []const u8 = "",
     displayName: []const u8 = "",
+    // Grouped shape (baseball-style): per-stat rows live in `stats`.
     stats: []const SummaryTeamStat = &.{},
+    // Flat shape (football-style): this entry IS one stat; the label is
+    // `label`, falling back to `displayName`/`name`.
+    label: []const u8 = "",
+    displayValue: std.json.Value = .null,
 };
 
 const SummaryTeamStat = struct {
@@ -629,6 +667,10 @@ const SummaryPlayerGroup = struct {
 
 const SummaryPlayerStats = struct {
     names: []const []const u8 = &.{},
+    // Football groups omit `names` and key columns by stat id instead
+    // (e.g. "completions/passingAttempts"); the totals label falls back
+    // to a humanized first key.
+    keys: []const []const u8 = &.{},
     totals: []const std.json.Value = &.{},
     athletes: []const SummaryPlayerAthlete = &.{},
 };
@@ -816,27 +858,37 @@ fn deriveSituation(
     };
 }
 
-/// "ATL leads series 2-1" -> "ATL leads 2-1", plus " (game N of M)" when the
-/// current game is one of the series events. Prefers top-level seasonseries,
-/// falls back to the header competition series.
+/// Series line. Regular-season (`seasonseries`) wording stays modest —
+/// "X leads season series W-L" / "X won season series W-L" / "Season
+/// series tied W-L" — because "wins series" overstates a 4-game set.
+/// Playoff (`header.competitions[].series`) wording keeps the historical
+/// shape ("X leads W-L", anything else verbatim). Either source is
+/// suppressed when it is not a series at all (one or zero total games:
+/// "game 1 of 1"), yielding null. Prefers top-level seasonseries, falls
+/// back to the header competition series.
 fn summarySeries(arena: std.mem.Allocator, response: SummaryResponse, game_id: []const u8) !?[]const u8 {
     const seasonseries: []const SummarySeries = response.seasonseries orelse &.{};
     const comp_series: []const SummarySeries = if (response.header) |header|
         (if (header.competitions.len > 0) (header.competitions[0].series orelse &.{}) else &.{})
     else
         &.{};
-    const source: ?SummarySeries = if (seasonseries.len > 0 and seasonseries[0].summary.len > 0)
+    const from_season: bool = seasonseries.len > 0 and seasonseries[0].summary.len > 0;
+    const source: ?SummarySeries = if (from_season)
         seasonseries[0]
     else if (comp_series.len > 0 and comp_series[0].summary.len > 0)
         comp_series[0]
     else
         null;
     const series = source orelse return null;
-    const needle = " leads series ";
-    const cleaned: []const u8 = if (std.mem.indexOf(u8, series.summary, needle)) |at|
+    const total: i64 = if (series.totalCompetitions > 0) series.totalCompetitions else @intCast(series.events.len);
+    // One game is not a series (and zero games is no information at all).
+    if (total <= 1) return null;
+    const cleaned: []const u8 = if (from_season)
+        try seasonSeriesText(arena, series.summary)
+    else if (std.mem.indexOf(u8, series.summary, " leads series ")) |at|
         try std.fmt.allocPrint(arena, "{s} leads {s}", .{
             series.summary[0..at],
-            series.summary[at + needle.len ..],
+            series.summary[at + " leads series ".len ..],
         })
     else
         series.summary;
@@ -845,11 +897,36 @@ fn summarySeries(arena: std.mem.Allocator, response: SummaryResponse, game_id: [
         position = index + 1;
         break;
     };
-    const total: i64 = if (series.totalCompetitions > 0) series.totalCompetitions else @intCast(series.events.len);
     if (position) |n| {
-        if (total > 0) return try std.fmt.allocPrint(arena, "{s} (game {d} of {d})", .{ cleaned, n, total });
+        return try std.fmt.allocPrint(arena, "{s} (game {d} of {d})", .{ cleaned, n, total });
     }
     return cleaned;
+}
+
+/// Regular-season series phrasing: "ATL leads series 2-1" becomes
+/// "ATL leads season series 2-1", "BOS wins series 3-1" becomes
+/// "BOS won season series 3-1" (a completed set, not a playoff win).
+/// Anything else passes through verbatim.
+fn seasonSeriesText(arena: std.mem.Allocator, summary: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, summary, " leads series ")) |at| {
+        return std.fmt.allocPrint(arena, "{s} leads season series {s}", .{
+            summary[0..at],
+            summary[at + " leads series ".len ..],
+        });
+    }
+    if (std.mem.indexOf(u8, summary, " wins series ")) |at| {
+        return std.fmt.allocPrint(arena, "{s} won season series {s}", .{
+            summary[0..at],
+            summary[at + " wins series ".len ..],
+        });
+    }
+    if (std.mem.indexOf(u8, summary, " won series ")) |at| {
+        return std.fmt.allocPrint(arena, "{s} won season series {s}", .{
+            summary[0..at],
+            summary[at + " won series ".len ..],
+        });
+    }
+    return summary;
 }
 
 fn scheduleOpponentIds(event: SeriesScheduleEvent, team_id: []const u8) ?[]const u8 {
@@ -943,13 +1020,16 @@ fn seriesFromSchedules(
         }
         const total: i64 = @intCast(end - start + 1);
         const n: i64 = @intCast(at - start + 1);
+        // A lone game is a matchup, not a series; the summary path makes
+        // the same call, so both builders agree.
+        if (total <= 1) return null;
         if (self_wins == other_wins) {
-            return try std.fmt.allocPrint(arena, "Tied {d}-{d} (game {d} of {d})", .{ self_wins, other_wins, n, total });
+            return try std.fmt.allocPrint(arena, "Season series tied {d}-{d} (game {d} of {d})", .{ self_wins, other_wins, n, total });
         }
         const leader = if (self_wins > other_wins) team_abbrs[side] else team_abbrs[1 - side];
         const wins = @max(self_wins, other_wins);
         const losses = @min(self_wins, other_wins);
-        return try std.fmt.allocPrint(arena, "{s} leads {d}-{d} (game {d} of {d})", .{ leader, wins, losses, n, total });
+        return try std.fmt.allocPrint(arena, "{s} leads season series {d}-{d} (game {d} of {d})", .{ leader, wins, losses, n, total });
     }
     return null;
 }
@@ -959,8 +1039,23 @@ fn seriesFromSchedules(
 // ESPN already ships `boxscore.teams[].statistics[]` in the summary payload
 // this path fetches; it was simply never threaded through. Formats up to 4
 // stats per side (first 2 teams) as "{ABBR} {label} {value}" so both sides
-// stay visible under the renderer's 8-line cap. A null boxscore or empty
-// statistics yield an empty list (section skipped, never an error).
+// stay visible under the renderer's 8-line cap. Both ESPN shapes are
+// mapped: grouped (`statistics[].stats[]`, baseball-style) and flat
+// (`statistics[]` carrying `label`/`displayValue` directly,
+// football-style). Generic participation counters ("Games Played",
+// "Team Games Played" — the only exact generic counters observed across
+// live baseball/football payloads) are filtered so JSON and text stay in
+// parity; the list is pinned by test. A null boxscore or empty statistics
+// yield an empty list (section skipped, never an error).
+const junk_team_stats = [_][]const u8{ "Games Played", "Team Games Played" };
+
+fn isJunkTeamStat(name: []const u8, display_name: []const u8, label: []const u8) bool {
+    for (junk_team_stats) |junk| {
+        if (std.mem.eql(u8, name, junk) or std.mem.eql(u8, display_name, junk) or std.mem.eql(u8, label, junk)) return true;
+    }
+    return false;
+}
+
 fn boxTeamStats(arena: std.mem.Allocator, boxscore: ?SummaryBoxscore) ![]const []const u8 {
     const box = boxscore orelse return &.{};
     var out: std.ArrayList([]const u8) = .empty;
@@ -968,18 +1063,123 @@ fn boxTeamStats(arena: std.mem.Allocator, boxscore: ?SummaryBoxscore) ![]const [
         const abbr: []const u8 = if (side.team) |team| team.abbreviation else "?";
         var taken: usize = 0;
         outer: for (side.statistics) |group| {
-            for (group.stats) |stat| {
-                if (taken >= 4) break :outer;
-                const value = (try jsonText(arena, stat.displayValue)) orelse continue;
-                if (value.len == 0) continue;
-                const label: []const u8 = if (stat.displayName.len > 0) stat.displayName else stat.name;
-                if (label.len == 0) continue;
-                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, value }));
-                taken += 1;
+            if (group.stats.len > 0) {
+                for (group.stats) |stat| {
+                    if (taken >= 4) break :outer;
+                    const value = (try jsonText(arena, stat.displayValue)) orelse continue;
+                    if (value.len == 0) continue;
+                    const label: []const u8 = if (stat.displayName.len > 0) stat.displayName else stat.name;
+                    if (label.len == 0) continue;
+                    if (isJunkTeamStat(stat.name, stat.displayName, "")) continue;
+                    try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, value }));
+                    taken += 1;
+                }
+                continue;
             }
+            // Flat shape: one stat per entry.
+            if (taken >= 4) break :outer;
+            const value = (try jsonText(arena, group.displayValue)) orelse continue;
+            if (value.len == 0) continue;
+            const label: []const u8 = if (group.label.len > 0) group.label else if (group.displayName.len > 0) group.displayName else group.name;
+            if (label.len == 0) continue;
+            if (isJunkTeamStat(group.name, group.displayName, group.label)) continue;
+            try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, value }));
+            taken += 1;
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+/// Period label for a football `scoringPlays` entry: the display value
+/// when ESPN ships one, otherwise "Q{n}" from the bare quarter number
+/// (football periods never carry display text — verified live NCAAF
+/// 2026-09-05: `period: {"number": 1}`). Empty when neither exists.
+fn scoringPlayPeriod(arena: std.mem.Allocator, period: ?SummaryPeriod) ![]const u8 {
+    const p = period orelse return "";
+    if (p.displayValue.len > 0) return p.displayValue;
+    if (p.number) |n| return try std.fmt.allocPrint(arena, "Q{d}", .{n});
+    return "";
+}
+
+/// Top-level leaders (football-style): up to 2 teams, 2 categories each,
+/// 2 entries each, as "{name} {displayValue}". The display values are
+/// self-describing ("21/25, 320 YDS, 3 TD"); entries without a name or a
+/// value are skipped.
+fn topLeaders(arena: std.mem.Allocator, groups: ?[]const SummaryTopTeam, out: *std.ArrayList([]const u8)) !void {
+    const list = groups orelse return;
+    for (list[0..@min(list.len, 2)]) |group| {
+        for (group.leaders[0..@min(group.leaders.len, 2)]) |category| {
+            for (category.leaders[0..@min(category.leaders.len, 2)]) |entry| {
+                const name = athleteName(entry.athlete) orelse continue;
+                const display = (try jsonText(arena, entry.displayValue)) orelse (try jsonText(arena, entry.value)) orelse "";
+                if (display.len == 0) continue;
+                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, display }));
+            }
+        }
+    }
+}
+
+/// Boxscore leaders fallback (team totals plus top performers per side).
+/// The totals label is `names[0]`; football groups omit `names` and key
+/// columns by stat id instead, so the label falls back to a humanized
+/// first key ("completions/passingAttempts" -> "Completions/passing
+/// attempts") instead of the bare "total".
+fn boxscoreLeaders(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *std.ArrayList([]const u8)) !void {
+    const groups = boxscore.players[0..@min(boxscore.players.len, 2)];
+    for (groups) |group| {
+        const abbr: []const u8 = if (group.team) |team| team.abbreviation else "?";
+        for (group.statistics[0..@min(group.statistics.len, 1)]) |stats| {
+            if (stats.totals.len > 0) {
+                const total = (try jsonText(arena, stats.totals[0])) orelse "?";
+                const label: []const u8 = if (stats.names.len > 0)
+                    stats.names[0]
+                else if (stats.keys.len > 0)
+                    try humanizeStatKey(arena, stats.keys[0])
+                else
+                    "total";
+                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, total }));
+            }
+            for (stats.athletes[0..@min(stats.athletes.len, 4)]) |entry| {
+                const reference = entry.athlete orelse continue;
+                const name: []const u8 = if (reference.displayName.len > 0)
+                    reference.displayName
+                else if (reference.fullName.len > 0)
+                    reference.fullName
+                else
+                    continue;
+                if (entry.stats.len > 0) {
+                    const head = (try jsonText(arena, entry.stats[0])) orelse "";
+                    if (head.len > 0) {
+                        try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, head }));
+                        continue;
+                    }
+                }
+                try out.append(arena, name);
+            }
+        }
+    }
+}
+
+/// "completions/passingAttempts" -> "Completions/passing attempts": a
+/// space before each camel hump (an uppercase following a lowercase or
+/// digit, lowercased), first letter capitalized. Acronym runs ("H-AB")
+/// pass through untouched. Purely presentational for key-only stat groups.
+fn humanizeStatKey(arena: std.mem.Allocator, key: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    for (key, 0..) |c, i| {
+        const prev: u8 = if (i > 0) key[i - 1] else 0;
+        const prev_lower = (prev >= 'a' and prev <= 'z') or (prev >= '0' and prev <= '9');
+        if (i > 0 and c >= 'A' and c <= 'Z' and prev_lower) {
+            try out.writer.writeByte(' ');
+            try out.writer.writeByte(c + ('a' - 'A'));
+        } else if (i == 0 and c >= 'a' and c <= 'z') {
+            try out.writer.writeByte(c - ('a' - 'A'));
+        } else {
+            try out.writer.writeByte(c);
+        }
+    }
+    return out.toOwnedSlice();
 }
 
 pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
@@ -1068,37 +1268,31 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
             .home_score = home_score,
         });
     }
+    // Football payloads carry scoring plays here instead (every entry
+    // scores; `period` is a bare quarter number). Appended after any
+    // `plays`-derived rows; each source is chronological on its own.
+    const scoring_list = response.scoringPlays orelse &[0]SummaryScoringPlay{};
+    for (scoring_list) |play| {
+        if (play.text.len == 0) continue;
+        const away_score = (try jsonText(arena, play.awayScore)) orelse "";
+        const home_score = (try jsonText(arena, play.homeScore)) orelse "";
+        try scoring_plays.append(arena, .{
+            .period = try scoringPlayPeriod(arena, play.period),
+            .text = play.text,
+            .away_score = away_score,
+            .home_score = home_score,
+        });
+    }
 
-    // Leaders: team totals plus the top performers per side, as plain strings.
+    // Leaders: the top-level `leaders` blocks when ESPN ships them
+    // (football-style: "Julian Sayin 21/25, 320 YDS, 3 TD"); otherwise the
+    // boxscore fallback below (team totals plus top performers per side).
+    // Either way the wire shape is unchanged: plain strings.
     var leaders: std.ArrayList([]const u8) = .empty;
-    if (response.boxscore) |boxscore| {
-        const groups = boxscore.players[0..@min(boxscore.players.len, 2)];
-        for (groups) |group| {
-            const abbr: []const u8 = if (group.team) |team| team.abbreviation else "?";
-            for (group.statistics[0..@min(group.statistics.len, 1)]) |stats| {
-                if (stats.totals.len > 0) {
-                    const total = (try jsonText(arena, stats.totals[0])) orelse "?";
-                    const label: []const u8 = if (stats.names.len > 0) stats.names[0] else "total";
-                    try leaders.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, total }));
-                }
-                for (stats.athletes[0..@min(stats.athletes.len, 4)]) |entry| {
-                    const reference = entry.athlete orelse continue;
-                    const name: []const u8 = if (reference.displayName.len > 0)
-                        reference.displayName
-                    else if (reference.fullName.len > 0)
-                        reference.fullName
-                    else
-                        continue;
-                    if (entry.stats.len > 0) {
-                        const head = (try jsonText(arena, entry.stats[0])) orelse "";
-                        if (head.len > 0) {
-                            try leaders.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, head }));
-                            continue;
-                        }
-                    }
-                    try leaders.append(arena, name);
-                }
-            }
+    try topLeaders(arena, response.leaders, &leaders);
+    if (leaders.items.len == 0) {
+        if (response.boxscore) |boxscore| {
+            try boxscoreLeaders(arena, boxscore, &leaders);
         }
     }
 
@@ -1222,7 +1416,7 @@ test "fetchDetail enriches the board row with summary fields" {
     try std.testing.expectEqualStrings("Final", detail.status);
     try std.testing.expectEqualStrings("Citizens Bank Park", detail.venue.?);
     try std.testing.expectEqual(@as(i64, 42793), detail.attendance.?);
-    try std.testing.expectEqualStrings("ATL leads 2-1 (game 3 of 4)", detail.series.?);
+    try std.testing.expectEqualStrings("ATL leads season series 2-1 (game 3 of 4)", detail.series.?);
     try std.testing.expectEqual(@as(usize, 2), detail.participants.len);
     const home = detail.participants[1];
     try std.testing.expectEqualStrings("PHI", home.abbreviation);
@@ -1289,7 +1483,7 @@ test "fetchDetail derives the series from team schedules when the summary lacks 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "401816828");
-    try std.testing.expectEqualStrings("ATL leads 2-1 (game 3 of 4)", detail.series.?);
+    try std.testing.expectEqualStrings("ATL leads season series 2-1 (game 3 of 4)", detail.series.?);
 }
 
 test "fetchDetail derives live situation from the last play" {
@@ -1371,6 +1565,10 @@ const ScheduleCompetition = struct {
     date: []const u8 = "",
     status: ?Status = null,
     competitors: []const ScheduleCompetitor = &.{},
+    // ESPN marks scheduled games with no summary yet `false` (verified
+    // live: every 2026 NFL future game; every completed 2025 game `true`).
+    // Absent on older/sparser payloads, which means available.
+    boxscoreAvailable: ?bool = null,
 };
 const ScheduleCompetitor = struct {
     id: []const u8 = "",
@@ -1403,16 +1601,21 @@ fn resolveTeamId(body: []const u8, arena: std.mem.Allocator, abbrev: []const u8)
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
+    // Id-based resolution first (numeric route segments like /ncaaf/194),
+    // abbrev fallback second (case-insensitive, first match wins). Both
+    // scan the same list so one fetch serves either spelling.
+    var abbrev_match: ?[]const u8 = null;
     for (response.sports) |sport| {
         for (sport.leagues) |league| {
             for (league.teams) |entry| {
                 if (entry.team) |team| {
-                    if (std.ascii.eqlIgnoreCase(team.abbreviation, abbrev)) return team.id;
+                    if (std.mem.eql(u8, team.id, abbrev)) return team.id;
+                    if (abbrev_match == null and std.ascii.eqlIgnoreCase(team.abbreviation, abbrev)) abbrev_match = team.id;
                 }
             }
         }
     }
-    return null;
+    return abbrev_match;
 }
 
 fn scoreText(arena: std.mem.Allocator, value: ?std.json.Value) ![]const u8 {
@@ -1492,6 +1695,10 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
             .opp_score = opp_score,
             .won = our_side.winner,
             .probable = probable,
+            // Only an explicit `false` clears detail: absent flags (older
+            // or sparser payloads) keep the historical link-everything
+            // behavior, so leagues ESPN does not annotate never lose links.
+            .has_detail = if (competition.boxscoreAvailable) |available| available else true,
         });
     }
     return .{
@@ -1565,7 +1772,11 @@ fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent
     else
         try upcomingResult(arena, event);
     return .{
-        .id = event.id,
+        // No detail upstream (explicit `boxscoreAvailable: false`) means
+        // no link: an empty id renders as plain text in every team view
+        // (verified: gameLineFull/teamGameHtml skip empty ids) and keeps
+        // the JSON shape stable. The row itself still displays.
+        .id = if (event.has_detail) event.id else "",
         .date = event.date,
         .opponent_abbrev = event.opponent_abbrev,
         .opponent_name = event.opponent_name,
@@ -1624,7 +1835,12 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
     const today = try self.today(arena);
     const season = today[0..4];
 
-    const teams_body = try adapterFetchUrl(self, arena, try espn.buildTeamsUrl(arena, self.base_url, endpoint.sport, endpoint.league));
+    // The default teams endpoint pages at 50 entries (verified live:
+    // NCAAF's list omits Ohio State), so college lookups 404. A large
+    // limit returns the whole membership (761 for NCAAF) in one fetch;
+    // pro leagues are unaffected beyond a bigger (cached) body.
+    const teams_url = try std.fmt.allocPrint(arena, "{s}?limit=1000", .{try espn.buildTeamsUrl(arena, self.base_url, endpoint.sport, endpoint.league)});
+    const teams_body = try adapterFetchUrl(self, arena, teams_url);
     const team_id = (try resolveTeamId(teams_body, arena, abbrev)) orelse return error.TeamNotFound;
 
     var parsed = try parseSchedule(arena, try adapterFetchUrl(
@@ -1710,6 +1926,7 @@ const TeamFixtureState = struct {
     schedule_calls: usize = 0,
     first_schedule_url: ?[]const u8 = null,
     last_schedule_url: ?[]const u8 = null,
+    teams_url: ?[]const u8 = null,
 
     fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
         _ = extra_headers;
@@ -1725,6 +1942,7 @@ const TeamFixtureState = struct {
             self.last_schedule_url = seen;
             return .{ .status = .ok, .body = try arena.dupe(u8, self.schedule_body) };
         }
+        self.teams_url = try arena.dupe(u8, url);
         return .{ .status = .ok, .body = try arena.dupe(u8, self.teams_body) };
     }
 
@@ -2289,8 +2507,8 @@ const detail_summary_minimal =
 ;
 
 const detail_board_minimal =
- \\{"events":[{"id":"7","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"7","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"1","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
- ;
+    \\{"events":[{"id":"7","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"7","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"1","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+;
 
 fn schedEvent(state: []const u8, our_score: []const u8, opp_score: []const u8, won: ?bool) core.schedule.ScheduleEvent {
     return .{
@@ -2407,4 +2625,280 @@ test "fetchTeam partitions by completion across interleaved dates" {
     try std.testing.expectEqualStrings("vs ATL 1:05 PM", view.next[2].result);
     try std.testing.expectEqual(@as(usize, 0), view.extra_past.len);
     try std.testing.expectEqual(@as(usize, 0), view.extra_next.len);
+}
+
+// ---- Data-quality lane (appended; existing tests above untouched) ----
+//
+// 1. College teams paginate: the default teams endpoint serves 50 entries
+//    (NCAAF omits Ohio State), so abbrev lookup 404'd. The provider now
+//    requests `?limit=1000` (761 for NCAAF, verified live) and resolves
+//    numeric segments by team id with abbrev fallback.
+// 2. Scheduled games with no summary yet (ESPN `boxscoreAvailable: false`,
+//    verified live: all 2026 NFL futures false, all completed 2025 true)
+//    map to id-less `GameRef`s — plain text in every team view, stable JSON.
+// 3. `boxTeamStats` filters exact generic counters and maps the flat
+//    football shape (`label`/`displayValue` per entry).
+// 4. Season-series wording stays modest; trivial (<=1 game) series omit.
+// 5. NBA schedule payloads carry no record/standing anywhere (verified live
+//    2026-09-09: header and competitors alike) — ESPN-thin, pinned here.
+// 6. Football summaries ship `scoringPlays` (not `plays`) and top-level
+//    `leaders`; boxscore groups key columns by stat id (`keys`, no `names`).
+
+const ncaaf_teams_two_osu =
+    \\{"sports":[{"leagues":[{"teams":[{"team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"}},{"team":{"id":"3161","abbreviation":"OSU","displayName":"Ohio State Newark Titans"}}]}]}]}
+;
+
+const ncaaf_osu_schedule =
+    \\{"team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes","recordSummary":"1-0"},"events":[
+    \\{"id":"401858432","date":"2026-09-05T16:30Z","competitions":[{"id":"401858432","date":"2026-09-05T16:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"boxscoreAvailable":true,"competitors":[{"homeAway":"home","winner":true,"score":{"displayValue":"48"},"team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"},"probables":[]},{"homeAway":"away","winner":false,"score":{"displayValue":"10"},"team":{"id":"2050","abbreviation":"BALL","displayName":"Ball State Cardinals"},"probables":[]}]}]},
+    \\{"id":"401858500","date":"2026-09-12T19:30Z","competitions":[{"id":"401858500","date":"2026-09-12T19:30Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"boxscoreAvailable":false,"competitors":[{"homeAway":"away","team":{"id":"194","abbreviation":"OSU","displayName":"Ohio State Buckeyes"},"probables":[]},{"homeAway":"home","team":{"id":"999","abbreviation":"XYZ","displayName":"X Y Zed"},"probables":[]}]}]}
+    \\]}
+;
+
+test "fetchTeam resolves college abbrevs past the 50-team page" {
+    var fake = TeamFixtureState{
+        .teams_body = ncaaf_teams_two_osu,
+        .schedule_body = ncaaf_osu_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true, // schedule-only; live join off.
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    // Full membership in one fetch, first abbrev match wins.
+    try std.testing.expect(std.mem.indexOf(u8, fake.teams_url.?, "limit=1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.first_schedule_url.?, "/teams/194/") != null);
+    try std.testing.expectEqualStrings("Ohio State Buckeyes", view.team.name);
+    try std.testing.expectEqualStrings("1-0", view.team.record_summary.?);
+    try std.testing.expectEqualStrings("W 48-10", view.last[0].result);
+}
+
+test "fetchTeam resolves numeric ids with abbrev fallback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Numeric segment matches by id even when the abbrev differs.
+    try std.testing.expectEqualStrings("194", (try resolveTeamId(ncaaf_teams_two_osu, arena, "194")).?);
+    // Abbrev still matches (first of the duplicate OSU entries).
+    try std.testing.expectEqualStrings("194", (try resolveTeamId(ncaaf_teams_two_osu, arena, "osu")).?);
+    // Unknown either way stays a 404, never a schedule fetch.
+    try std.testing.expect(try resolveTeamId(ncaaf_teams_two_osu, arena, "9999") == null);
+    var fake = TeamFixtureState{
+        .teams_body = ncaaf_teams_two_osu,
+        .schedule_body = ncaaf_osu_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    const by_id = try fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "194");
+    try std.testing.expectEqualStrings("OSU", by_id.team.abbrev);
+    try std.testing.expectError(
+        error.TeamNotFound,
+        fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "9999"),
+    );
+}
+
+test "fetchTeam clears ids ESPN marks boxscore-unavailable" {
+    var fake = TeamFixtureState{
+        .teams_body = ncaaf_teams_two_osu,
+        .schedule_body = ncaaf_osu_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    // Completed game keeps its link; the scheduled future without a summary
+    // renders as plain text (empty id, full display otherwise).
+    try std.testing.expectEqualStrings("401858432", view.last[0].id);
+    try std.testing.expectEqual(@as(usize, 1), view.next.len);
+    try std.testing.expectEqualStrings("", view.next[0].id);
+    try std.testing.expectEqualStrings("at XYZ 3:30 PM", view.next[0].result);
+    try std.testing.expectEqualStrings("XYZ", view.next[0].opponent_abbrev);
+}
+
+test "junk team-stats filter pins the exact generic counters" {
+    try std.testing.expectEqual(@as(usize, 2), junk_team_stats.len);
+    try std.testing.expectEqualStrings("Games Played", junk_team_stats[0]);
+    try std.testing.expectEqualStrings("Team Games Played", junk_team_stats[1]);
+    try std.testing.expect(isJunkTeamStat("atBats", "At Bats", "") == false);
+    try std.testing.expect(isJunkTeamStat("wins", "Wins", "") == false);
+}
+
+test "detailFetch filters junk counters and maps the flat shape" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"boxscore":{"teams":[{"team":{"id":"a","abbreviation":"AWY"},"statistics":[{"name":"batting","displayName":"Batting","stats":[{"name":"gamesPlayed","displayName":"Games Played","displayValue":"1"},{"name":"atBats","displayName":"At Bats","displayValue":"35"}]}]},{"team":{"id":"h","abbreviation":"HME"},"statistics":[{"name":"gp","displayName":"GP","displayValue":"1","label":"Team Games Played"},{"name":"totalYards","displayValue":"165","label":"Total Yards"}]}]}}
+    ;
+    const board =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"9","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "9");
+    // Grouped junk skipped, grouped legit kept; flat junk skipped by label,
+    // flat legit mapped via label.
+    try std.testing.expectEqual(@as(usize, 2), detail.team_stats.len);
+    try std.testing.expectEqualStrings("AWY At Bats 35", detail.team_stats[0]);
+    try std.testing.expectEqualStrings("HME Total Yards 165", detail.team_stats[1]);
+}
+
+const series_board =
+    \\{"events":[{"id":"g7","name":"Boston at Someone","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"g7","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"homeAway":"home","score":"1","winner":false,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}]}
+;
+
+test "seasonseries wins phrasing stays modest" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"g7","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]},"seasonseries":[{"summary":"BOS wins series 3-1","completed":true,"totalCompetitions":4,"events":[{"id":"g4"},{"id":"g5"},{"id":"g6"},{"id":"g7"}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = series_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g7");
+    try std.testing.expectEqualStrings("BOS won season series 3-1 (game 4 of 4)", detail.series.?);
+    // Answered from the summary: no schedule derivation fetches.
+    try std.testing.expectEqual(@as(usize, 0), fake.sched_calls);
+}
+
+test "trivial series suppress to null in both builders" {
+    // Summary path: a lone game is not a series.
+    const single_summary =
+        \\{"header":{"competitions":[{"id":"g7","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]},"seasonseries":[{"summary":"BOS leads series 1-0","completed":false,"totalCompetitions":1,"events":[{"id":"g7"}]}]}
+    ;
+    // Schedule fallback path: any fetch problem (here 404) also omits.
+    var fake = DetailFake{ .summary_body = single_summary, .board_body = series_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g7");
+    try std.testing.expect(detail.series == null);
+
+    // Schedule-derived path: a one-game block is a matchup, not a series.
+    const bare_summary =
+        \\{"header":{"competitions":[{"id":"solo","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}}
+    ;
+    const solo_board =
+        \\{"events":[{"id":"solo","name":"Boston at Someone","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"solo","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"homeAway":"home","score":"1","winner":false,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}]}
+    ;
+    const solo_sched =
+        \\{"events":[{"id":"solo","competitions":[{"competitors":[{"winner":true,"team":{"id":"a","abbreviation":"BOS"}},{"winner":false,"team":{"id":"h","abbreviation":"SOM"}}]}]}]}
+    ;
+    var fake2 = DetailFake{
+        .summary_body = bare_summary,
+        .board_body = solo_board,
+        .sched_a_id = "/teams/a/",
+        .sched_a_body = solo_sched,
+        .sched_b_body = solo_sched,
+    };
+    const solo = try detailAdapter(&fake2).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "solo");
+    try std.testing.expect(solo.series == null);
+}
+
+test "playoff series wording passes through" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"g7","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"series":[{"summary":"BOS wins series 4-2","completed":true,"totalCompetitions":7,"events":[{"id":"g1"},{"id":"g2"},{"id":"g3"},{"id":"g4"},{"id":"g5"},{"id":"g6"},{"id":"g7"}]}],"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = series_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g7");
+    try std.testing.expectEqualStrings("BOS wins series 4-2 (game 7 of 7)", detail.series.?);
+    try std.testing.expectEqual(@as(usize, 0), fake.sched_calls);
+}
+
+test "schedule-derived series uses season phrasing" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"401816828","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"22","homeAway":"home","winner":false,"score":4,"team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}},{"id":"15","homeAway":"away","winner":true,"score":5,"team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}}]}]},"plays":null}
+    ;
+    const tied_sched =
+        \\{"events":[{"id":"401816798","competitions":[{"competitors":[{"winner":false,"team":{"id":"22","abbreviation":"PHI"}},{"winner":true,"team":{"id":"15","abbreviation":"ATL"}}]}]},{"id":"401816813","competitions":[{"competitors":[{"winner":true,"team":{"id":"22","abbreviation":"PHI"}},{"winner":false,"team":{"id":"15","abbreviation":"ATL"}}]}]},{"id":"401816828","competitions":[{"competitors":[{"winner":false,"team":{"id":"22","abbreviation":"PHI"}},{"winner":true,"team":{"id":"15","abbreviation":"ATL"}}]}]},{"id":"401816843","competitions":[{"competitors":[{"team":{"id":"22","abbreviation":"PHI"}},{"team":{"id":"15","abbreviation":"ATL"}}]}]}]}
+    ;
+    var fake = DetailFake{
+        .summary_body = summary,
+        .board_body = detail_board_fixture,
+        .sched_a_id = "/teams/22/",
+        .sched_a_body = tied_sched,
+        .sched_b_body = tied_sched,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // 2-1 block omits the unplayed finale: leader phrasing, same suffix.
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "401816828");
+    try std.testing.expectEqualStrings("ATL leads season series 2-1 (game 3 of 4)", detail.series.?);
+}
+
+const nba_thin_schedule =
+    \\{"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"},"events":[
+    \\{"id":"401809936","date":"2025-10-22T23:30Z","competitions":[{"id":"401809936","date":"2025-10-22T23:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"home","winner":false,"score":{"value":116,"displayValue":"116"},"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"},"probables":[]},{"homeAway":"away","winner":true,"score":{"value":117,"displayValue":"117"},"team":{"id":"23","abbreviation":"PHI","displayName":"Philadelphia 76ers"},"probables":[]}]}]}
+    \\]}
+;
+
+const nba_thin_teams =
+    \\{"sports":[{"leagues":[{"teams":[{"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"}}]}]}]}
+;
+
+test "fetchTeam renders ESPN-thin NBA payloads without record or standing" {
+    // Live 2026-09-09 shape: the NBA schedule header carries no
+    // recordSummary/standingSummary and competitors carry no records, so
+    // the view builds with nulls rather than failing. ESPN-thin, not a
+    // mapping gap: there is no record field to map.
+    var fake = TeamFixtureState{
+        .teams_body = nba_thin_teams,
+        .schedule_body = nba_thin_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nba").?, "BOS");
+    try std.testing.expect(view.team.record_summary == null);
+    try std.testing.expect(view.team.standing_summary == null);
+    try std.testing.expectEqual(@as(usize, 1), view.last.len);
+    try std.testing.expectEqualStrings("L 116-117", view.last[0].result);
+}
+
+const ncaaf_detail_summary =
+    \\{"header":{"competitions":[{"id":"401858432","date":"2026-09-05T16:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"2050","homeAway":"away","winner":false,"score":10,"team":{"id":"2050","displayName":"Ball State Cardinals","abbreviation":"BALL"}},{"id":"194","homeAway":"home","winner":true,"score":48,"team":{"id":"194","displayName":"Ohio State Buckeyes","abbreviation":"OSU"}}]}]},"scoringPlays":[{"text":"Jeremiah Smith 48 Yd pass from Julian Sayin (Connor Hawkins Kick)","awayScore":0,"homeScore":7,"period":{"number":1}},{"text":"Brody Boehm 54 Yd Field Goal","awayScore":3,"homeScore":21,"period":{"number":2}}],"leaders":[{"team":{"id":"194","abbreviation":"OSU"},"leaders":[{"name":"passingYards","displayName":"Passing Yards","leaders":[{"displayValue":"21/25, 320 YDS, 3 TD","athlete":{"displayName":"Julian Sayin","fullName":"Julian Sayin"}}]}]},{"team":{"id":"2050","abbreviation":"BALL"},"leaders":[{"name":"passingYards","displayName":"Passing Yards","leaders":[{"displayValue":"18/33, 89 YDS","athlete":{"displayName":"Keldric Luster","fullName":"Keldric Luster"}}]}]}],"boxscore":{"players":[{"team":{"id":"2050","abbreviation":"BALL"},"statistics":[{"keys":["completions/passingAttempts","passingYards"],"totals":["20/37","120"],"athletes":[{"athlete":{"id":"5075392","displayName":"Keldric Luster"},"stats":["18/33","89"]}]}]}]}}
+;
+
+const ncaaf_detail_board =
+    \\{"events":[{"id":"401858432","name":"Ball State Cardinals at Ohio State Buckeyes","date":"2026-09-05T16:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401858432","date":"2026-09-05T16:30Z","competitors":[{"homeAway":"away","score":"10","winner":false,"team":{"id":"2050","displayName":"Ball State Cardinals","abbreviation":"BALL"}},{"homeAway":"home","score":"48","winner":true,"team":{"id":"194","displayName":"Ohio State Buckeyes","abbreviation":"OSU"}}]}]}]}
+;
+
+test "fetchDetail maps football scoringPlays and top-level leaders" {
+    var fake = DetailFake{ .summary_body = ncaaf_detail_summary, .board_body = ncaaf_detail_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("ncaaf").?, "401858432");
+    // scoringPlays (not `plays`): bare quarter numbers read Q1/Q2.
+    try std.testing.expectEqual(@as(usize, 2), detail.scoring_plays.len);
+    try std.testing.expectEqualStrings("Q1", detail.scoring_plays[0].period);
+    try std.testing.expectEqualStrings("Jeremiah Smith 48 Yd pass from Julian Sayin (Connor Hawkins Kick)", detail.scoring_plays[0].text);
+    try std.testing.expectEqualStrings("0", detail.scoring_plays[0].away_score);
+    try std.testing.expectEqualStrings("7", detail.scoring_plays[0].home_score);
+    try std.testing.expectEqualStrings("Q2", detail.scoring_plays[1].period);
+    // Top-level leaders win over the boxscore fallback (same wire shape).
+    try std.testing.expectEqual(@as(usize, 2), detail.leaders.len);
+    try std.testing.expectEqualStrings("Julian Sayin 21/25, 320 YDS, 3 TD", detail.leaders[0]);
+    try std.testing.expectEqualStrings("Keldric Luster 18/33, 89 YDS", detail.leaders[1]);
+}
+
+test "fetchDetail labels key-only boxscore totals without a bare total" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"401858432","date":"2026-09-05T16:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"2050","homeAway":"away","winner":false,"score":10,"team":{"id":"2050","displayName":"Ball State Cardinals","abbreviation":"BALL"}},{"id":"194","homeAway":"home","winner":true,"score":48,"team":{"id":"194","displayName":"Ohio State Buckeyes","abbreviation":"OSU"}}]}]},"boxscore":{"players":[{"team":{"id":"2050","abbreviation":"BALL"},"statistics":[{"keys":["completions/passingAttempts","passingYards"],"totals":["20/37","120"],"athletes":[{"athlete":{"id":"5075392","displayName":"Keldric Luster"},"stats":["18/33","89"]}]}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = ncaaf_detail_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("ncaaf").?, "401858432");
+    try std.testing.expectEqual(@as(usize, 2), detail.leaders.len);
+    try std.testing.expectEqualStrings("BALL Completions/passing attempts 20/37", detail.leaders[0]);
+    try std.testing.expectEqualStrings("Keldric Luster 18/33", detail.leaders[1]);
+}
+
+test "humanizeStatKey spaces camel humps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("Completions/passing attempts", try humanizeStatKey(arena, "completions/passingAttempts"));
+    try std.testing.expectEqualStrings("Passing yards", try humanizeStatKey(arena, "passingYards"));
+    try std.testing.expectEqualStrings("H-AB", try humanizeStatKey(arena, "H-AB"));
 }
