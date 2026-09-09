@@ -252,9 +252,9 @@ pub fn homeLiveWithZone(
         const heading = try std.fmt.allocPrint(allocator, "sprts  {s} {s}", .{ day, tag });
         defer allocator.free(heading);
         try colorize(w, "2", heading, color);
-        try w.writeAll("\n\n");
+        try w.writeByte('\n');
     }
-    try writeRule(w, .top, default_inner_width);
+    try table.writeSeparator(w, 50);
     try homeSections(allocator, w, boards, color, false, day);
     try w.writeByte('\n');
     if (!quiet) try homeFooter(w, host, color);
@@ -1242,20 +1242,24 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     try pageHead(w, "sprts");
     try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>sprts\n");
-    try writeRule(w, .top, default_inner_width);
+    try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
-        try w.writeAll("│ ");
         const href = try homeLeagueHref(allocator, league.slug, day);
         defer allocator.free(href);
+        var cell: std.Io.Writer.Allocating = .init(allocator);
+        defer cell.deinit();
+        try writeCell(&cell.writer, league.slug, 13, null, false);
+        try cell.writer.writeByte(' ');
+        try writeCell(&cell.writer, league.name, 34, null, false);
+        const padded = try cell.toOwnedSlice();
+        defer allocator.free(padded);
         try w.writeAll("<a href=\"");
         try escapeInto(w, href);
         try w.writeAll("\">");
-        try writeCell(w, league.slug, 13, null, false);
-        try w.writeByte(' ');
-        try writeCell(w, league.name, 34, null, false);
-        try w.writeAll("</a> │\n");
+        try escapeInto(w, std.mem.trimEnd(u8, padded, " "));
+        try w.writeAll("</a>\n");
     }
-    try writeRule(w, .bottom, default_inner_width);
+    try w.writeByte('\n');
     try w.writeAll("Try: curl localhost:8080/mlb\n");
     try w.writeAll("</pre><nav><a href=\"/docs\">docs</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a>");
     try closePageWithNav(w);
@@ -1281,9 +1285,7 @@ pub fn homeHtmlLive(
     try pageHead(w, heading);
     try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>\n");
-    try writeRule(w, .top, default_inner_width);
     try homeSections(allocator, w, boards, false, true, day);
-    try writeRule(w, .bottom, default_inner_width);
     if (!quiet) {
         try w.writeAll("Try: curl ");
         try escapeInto(w, host);
@@ -2608,5 +2610,6 @@ test "tmp debug narrow" {
     defer std.testing.allocator.free(page);
     std.debug.print("\n=====PAGE=====\n{s}\n=====END=====\n", .{page});
 }
+
 
 
