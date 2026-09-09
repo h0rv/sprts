@@ -18,7 +18,8 @@
 //!   from the current 300s bucket is served, else 502. Errors are never
 //!   cached. All formats render from a single normalized board fetch.
 //!   Render variants ride in the key (see `variantTag`): `?color`,
-//!   `?width`, `?height`, and text `?0` each namespace their own
+//!   `?width`, `?height`, text `?0`, and the effective request zone
+//!   (`?tz=`) each namespace their own
 //!   fully-rendered body, so the first variant in a 30s bucket never
 //!   shadows the others.
 //! - Color defaults to on; `?color=0` turns it off and `?color=1` forces it
@@ -209,9 +210,9 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             }
             return serveBoard(env, alloc, route, format, zone);
         },
-        .game => |route| return serveDetail(env, alloc, route, format),
-        .team => |route| return serveTeam(env, alloc, route, format),
-        .standings => |route| return serveStandings(env, alloc, route, format),
+        .game => |route| return serveDetail(env, alloc, route, format, zone),
+        .team => |route| return serveTeam(env, alloc, route, format, zone),
+        .standings => |route| return serveStandings(env, alloc, route, format, zone),
     }
 }
 
@@ -241,9 +242,9 @@ fn serveBoard(
     const slug = try edge.canonicalSlug(alloc, league.slug);
     const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
     // Render variants join the edge key: bodies are cached fully rendered,
-    // so two widths (or color on/off, or ?0) in one 30s bucket need
-    // different entries — otherwise the first variant shadows the rest.
-    const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline);
+    // so two widths (or color on/off, or ?0, or ?tz= zones) in one 30s bucket
+    // need different entries — otherwise the first variant shadows the rest.
+    const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone);
     const board_key = try edge.boardKey(alloc, slug, day, tag);
     const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
     const stale_key = try edge.staleKey(alloc, board_key, epoch_s);
@@ -321,6 +322,7 @@ fn serveDetail(
     alloc: std.mem.Allocator,
     route: router.GameRoute,
     format: router.Format,
+    zone: tz.Zone,
 ) !workers.Response {
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
@@ -332,11 +334,12 @@ fn serveDetail(
     // Variant edge namespace: the cached body is a render, not the
     // normalized payload (unlike the native cache), so every render variant
     // (width/height/color, plus `?0` text via the shared gameOneLine
-    // predicate) needs its own key — otherwise whichever renders first in a
+    // predicate, plus the effective request zone) needs its own key —
+    // otherwise whichever renders first in a
     // 30s bucket shadows the others. HTML/JSON ignore `?0` (team-route
     // precedent: the flag is text-only), so they keep the l0 tag and their
     // stale fallback stays variant-coherent.
-    const tag = try variantTag(alloc, format, route.width, route.height, color, router.gameOneLine(route, format));
+    const tag = try variantTag(alloc, format, route.width, route.height, color, router.gameOneLine(route, format), zone);
     const detail_key = try edge.detailKey(alloc, slug, route.id, tag);
     const fresh_key = try edge.detailFreshKey(alloc, detail_key, epoch_s);
     const stale_key = try edge.detailStaleKey(alloc, detail_key, epoch_s);
@@ -487,14 +490,17 @@ fn serveStream(
 }
 
 /// Render-variant edge tag: format plus every display flag that changes the
-/// cached body (width/height/color/one-line). The edge stores fully-rendered
+/// cached body (width/height/color/one-line) plus the effective request
+/// zone (`?tz=`). The edge stores fully-rendered
 /// bodies (unlike the native payload cache), so two variants sharing one 30s
 /// bucket entry would shadow each other: the first render wins and the other
 /// variant serves the wrong body until the bucket rolls. Null width/height
 /// encode as 0 (the renderer default); `oneline` is the effective flag —
 /// callers pass false where the renderer ignores `?0` (HTML/JSON,
 /// standings), so identical bodies share one entry and stale fallbacks stay
-/// variant-coherent.
+/// variant-coherent. The zone uses the short `tz.zoneTag` form
+/// (`ET`/`UTC`/`UTC-5`/...) so `?tz=utc` renders never share an entry with
+/// the ET default in one bucket and vice versa.
 fn variantTag(
     arena: std.mem.Allocator,
     format: router.Format,
@@ -502,13 +508,17 @@ fn variantTag(
     height: ?u16,
     color: bool,
     oneline: bool,
+    zone: tz.Zone,
 ) ![]u8 {
-    return std.fmt.allocPrint(arena, "{s}/w{d}/h{d}/c{d}/l{d}", .{
+    const zone_tag = try tz.zoneTag(arena, zone);
+    defer arena.free(zone_tag);
+    return std.fmt.allocPrint(arena, "{s}/w{d}/h{d}/c{d}/l{d}/z{s}", .{
         edge.formatTag(format),
         width orelse 0,
         height orelse 0,
         @intFromBool(color),
         @intFromBool(oneline),
+        zone_tag,
     });
 }
 
@@ -567,6 +577,7 @@ fn serveTeam(
     alloc: std.mem.Allocator,
     route: router.TeamRoute,
     format: router.Format,
+    zone: tz.Zone,
 ) !workers.Response {
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
@@ -576,7 +587,7 @@ fn serveTeam(
     const epoch_s = epochSecondsNow();
     const slug = try edge.canonicalSlug(alloc, league.slug);
     const abbr = try edge.canonicalAbbr(alloc, route.abbr);
-    const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline);
+    const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone);
     const key = try edge.teamKey(alloc, slug, abbr, tag);
     const fresh_key = try edge.teamFreshKey(alloc, key, epoch_s);
     const stale_key = try edge.teamStaleKey(alloc, key, epoch_s);
@@ -644,6 +655,7 @@ fn serveStandings(
     alloc: std.mem.Allocator,
     route: router.StandingsRoute,
     format: router.Format,
+    zone: tz.Zone,
 ) !workers.Response {
     const color = route.color orelse try colorDefault(env);
     const league = core.leagues.find(route.league) orelse {
@@ -653,8 +665,9 @@ fn serveStandings(
     const epoch_s = epochSecondsNow();
     const slug = try edge.canonicalSlug(alloc, league.slug);
     // Standings has no one-line renderer (the flag never changes the body),
-    // so `oneline` keys as false and `?0` shares the full entry.
-    const tag = try variantTag(alloc, format, route.width, route.height, color, false);
+    // so `oneline` keys as false and `?0` shares the full entry. The zone
+    // still namespaces the key so a `?tz=` render never shadows the default.
+    const tag = try variantTag(alloc, format, route.width, route.height, color, false, zone);
     const key = try edge.standingsKey(alloc, slug, tag);
     const fresh_key = try edge.standingsFreshKey(alloc, key, epoch_s);
     const stale_key = try edge.standingsStaleKey(alloc, key, epoch_s);
@@ -749,8 +762,9 @@ fn serveAll(
     // Variant key for the per-league refresh puts below: the stored bodies
     // are full renders (never one-line), so `oneline` is always false here
     // — a digest refresh warms the full-render entries single-league routes
-    // read, never the `?0` namespace.
-    const tag = try variantTag(alloc, format, route.width, route.height, color, false);
+    // read, never the `?0` namespace. The request zone joins the tag so the
+    // refresh warms the zone entry single-league routes actually read.
+    const tag = try variantTag(alloc, format, route.width, route.height, color, false, zone);
     const sections = try alloc.alloc(digest.DigestSection, core.leagues.all.len);
     const cache = workers.Cache.default();
     for (&core.leagues.all, 0..) |*league, i| {
@@ -797,7 +811,7 @@ test "edge variant tags split width, color, and one-line in one bucket" {
     const bucket: i64 = 12_345; // one shared 30s + 300s bucket below
     const keyFor = struct {
         fn key(a: std.mem.Allocator, width: ?u16, color: bool, oneline: bool) ![]u8 {
-            const tag = try variantTag(a, .text, width, null, color, oneline);
+            const tag = try variantTag(a, .text, width, null, color, oneline, .et);
             defer a.free(tag);
             const board = try edge.boardKey(a, "mlb", "2026-09-06", tag);
             defer a.free(board);
@@ -852,9 +866,9 @@ test "one bucket never shadows another variant's body" {
     const wide = try render.textWithZone(arena, board, true, 120, null, .et);
     defer arena.free(wide);
     try std.testing.expect(!std.mem.eql(u8, narrow, wide));
-    const narrow_tag = try variantTag(arena, .text, 80, null, true, false);
+    const narrow_tag = try variantTag(arena, .text, 80, null, true, false, .et);
     defer arena.free(narrow_tag);
-    const wide_tag = try variantTag(arena, .text, 120, null, true, false);
+    const wide_tag = try variantTag(arena, .text, 120, null, true, false, .et);
     defer arena.free(wide_tag);
     try std.testing.expect(!std.mem.eql(u8, narrow_tag, wide_tag));
     // ... and color on/off changes the render, so it keys apart too.
@@ -862,11 +876,85 @@ test "one bucket never shadows another variant's body" {
     defer arena.free(mono);
     try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[") != null);
     try std.testing.expect(std.mem.indexOf(u8, mono, "\x1b[") == null);
-    const color_tag = try variantTag(arena, .text, 80, null, true, false);
+    const color_tag = try variantTag(arena, .text, 80, null, true, false, .et);
     defer arena.free(color_tag);
-    const mono_tag = try variantTag(arena, .text, 80, null, false, false);
+    const mono_tag = try variantTag(arena, .text, 80, null, false, false, .et);
     defer arena.free(mono_tag);
     try std.testing.expect(!std.mem.eql(u8, color_tag, mono_tag));
+}
+
+test "edge variant tags split ET and UTC zones in one bucket" {
+    const arena = std.testing.allocator;
+    const bucket: i64 = 12_345; // one shared bucket: zones must not shadow
+    // The bodies diverge (zone-named heading), so the tags must too.
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{},
+    };
+    const et_body = try render.textWithZone(arena, board, true, null, null, .et);
+    defer arena.free(et_body);
+    const utc_body = try render.textWithZone(arena, board, true, null, null, .utc);
+    defer arena.free(utc_body);
+    try std.testing.expect(!std.mem.eql(u8, et_body, utc_body));
+    try std.testing.expect(std.mem.indexOf(u8, et_body, " ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, utc_body, " UTC") != null);
+    // Board namespace: same bucket, same display flags, zones key apart.
+    const et_tag = try variantTag(arena, .text, null, null, true, false, .et);
+    defer arena.free(et_tag);
+    const utc_tag = try variantTag(arena, .text, null, null, true, false, .utc);
+    defer arena.free(utc_tag);
+    try std.testing.expect(!std.mem.eql(u8, et_tag, utc_tag));
+    const et_board = try edge.boardKey(arena, "mlb", "2026-09-06", et_tag);
+    defer arena.free(et_board);
+    const utc_board = try edge.boardKey(arena, "mlb", "2026-09-06", utc_tag);
+    defer arena.free(utc_board);
+    const et_fresh = try edge.freshKey(arena, et_board, bucket);
+    defer arena.free(et_fresh);
+    const utc_fresh = try edge.freshKey(arena, utc_board, bucket);
+    defer arena.free(utc_fresh);
+    try std.testing.expect(!std.mem.eql(u8, et_fresh, utc_fresh));
+    // Identical zones converge on one entry.
+    const et_again = try variantTag(arena, .text, null, null, true, false, .et);
+    defer arena.free(et_again);
+    try std.testing.expectEqualStrings(et_tag, et_again);
+    // Fixed offsets namespace apart from each other and from ET/UTC.
+    const fixed_tag = try variantTag(arena, .text, null, null, true, false, .{ .fixed = -300 });
+    defer arena.free(fixed_tag);
+    try std.testing.expect(!std.mem.eql(u8, et_tag, fixed_tag));
+    try std.testing.expect(!std.mem.eql(u8, utc_tag, fixed_tag));
+    // Every other variant-cached namespace rides the same tag, so detail,
+    // team, standings, and the /all per-league refresh puts inherit the
+    // zone split in the same bucket.
+    const et_detail = try edge.detailKey(arena, "mlb", "1", et_tag);
+    defer arena.free(et_detail);
+    const utc_detail = try edge.detailKey(arena, "mlb", "1", utc_tag);
+    defer arena.free(utc_detail);
+    const et_detail_fresh = try edge.detailFreshKey(arena, et_detail, bucket);
+    defer arena.free(et_detail_fresh);
+    const utc_detail_fresh = try edge.detailFreshKey(arena, utc_detail, bucket);
+    defer arena.free(utc_detail_fresh);
+    try std.testing.expect(!std.mem.eql(u8, et_detail_fresh, utc_detail_fresh));
+    const et_team = try edge.teamKey(arena, "mlb", "phi", et_tag);
+    defer arena.free(et_team);
+    const utc_team = try edge.teamKey(arena, "mlb", "phi", utc_tag);
+    defer arena.free(utc_team);
+    const et_team_fresh = try edge.teamFreshKey(arena, et_team, bucket);
+    defer arena.free(et_team_fresh);
+    const utc_team_fresh = try edge.teamFreshKey(arena, utc_team, bucket);
+    defer arena.free(utc_team_fresh);
+    try std.testing.expect(!std.mem.eql(u8, et_team_fresh, utc_team_fresh));
+    const et_st = try edge.standingsKey(arena, "mlb", et_tag);
+    defer arena.free(et_st);
+    const utc_st = try edge.standingsKey(arena, "mlb", utc_tag);
+    defer arena.free(utc_st);
+    const et_st_fresh = try edge.standingsFreshKey(arena, et_st, bucket);
+    defer arena.free(et_st_fresh);
+    const utc_st_fresh = try edge.standingsFreshKey(arena, utc_st, bucket);
+    defer arena.free(utc_st_fresh);
+    try std.testing.expect(!std.mem.eql(u8, et_st_fresh, utc_st_fresh));
 }
 
 test "worker all?0 matches the native one-line composer" {
