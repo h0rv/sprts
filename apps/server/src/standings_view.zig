@@ -1,14 +1,12 @@
 //! League standings renderer (Schedule/Standings/Teams parity).
 //!
-//! Built ONLY on the shared `table.zig` box primitives (`writeCell`,
-//! `writeCellRight`, `writeRow`, `writeRule`). Alignment rules live in
-//! `table.zig`; this module holds no layout logic.
-//!
-//! Columns are provider-shaped: the `W-L[-T]` record plus a `PTS` column
-//! that appears only when at least one entry carries points (hockey,
-//! soccer); a missing stat renders as `-`, never zero. The `T` leg shows
-//! per row when that entry has ties, so baseball rows read `80-63` while
-//! football rows read `11-3-1` in the same fixed-width column.
+//! Document-style like detail and team: fitted lines, blank-separated
+//! groups, one separator rule under the heading. Columns are
+//! provider-shaped: the `W-L[-T]` record plus a `PTS` column that appears
+//! only when at least one entry carries points (hockey, soccer); a
+//! missing stat renders as `-`, never zero. The `T` leg shows per row
+//! when that entry has ties, so baseball rows read `80-63` while football
+//! rows read `11-3-1` in the same fixed-width column.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -17,9 +15,9 @@ const router = @import("router.zig");
 const render = @import("render.zig");
 const table = @import("table.zig");
 
-/// `width` is total terminal columns; the borders take 2. Never shrinks
-/// below the classic 52-wide box. `height` caps the entries listed
-/// (`+N more` trailer); null = all groups and entries.
+/// `width` is total terminal columns of the document. Never shrinks below
+/// the classic 52-wide page. `height` caps the entries listed (`+N more`
+/// trailer); null = all groups and entries.
 pub fn text(
     allocator: std.mem.Allocator,
     st: standings.LeagueStandings,
@@ -27,46 +25,45 @@ pub fn text(
     width: ?u16,
     height: ?u16,
 ) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     const budget: usize = height orelse std.math.maxInt(usize);
     const has_points = countPoints(st);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try table.writeRule(w, .top, inner);
     {
         const heading = try std.fmt.allocPrint(allocator, "{s} standings  {s}", .{ st.league_name, st.season });
         defer allocator.free(heading);
-        try table.writeRow(w, heading, inner - 2, "2", color);
+        try table.writeLine(w, heading, cols, "2", color);
     }
+    try table.writeSeparator(w, cols);
     if (st.groups.len == 0) {
-        try table.writeRule(w, .mid, inner);
-        try table.writeRow(w, "No standings available.", inner - 2, null, color);
+        try table.writeLine(w, "No standings available.", cols, null, color);
     }
     var shown: usize = 0;
     var total: usize = 0;
+    var first_group = true;
     for (st.groups) |group| total += group.entries.len;
     for (st.groups) |group| {
         if (shown >= budget) break;
-        try table.writeRule(w, .mid, inner);
-        try table.writeRow(w, group.name, inner - 2, "2", color);
+        if (!first_group) try w.writeByte('\n');
+        first_group = false;
+        try table.writeLine(w, group.name, cols, "2", color);
         if (group.entries.len == 0) {
-            try table.writeRow(w, "No entries.", inner - 2, null, color);
+            try table.writeLine(w, "No entries.", cols, null, color);
             continue;
         }
         for (group.entries) |entry| {
             if (shown >= budget) break;
-            try writeEntryRow(w, entry, inner, has_points, color);
+            try writeEntryRow(w, allocator, entry, cols, has_points);
             shown += 1;
         }
     }
     if (shown < total) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{total - shown});
         defer allocator.free(more);
-        try table.writeRule(w, .mid, inner);
-        try table.writeRow(w, more, inner - 2, "2", color);
+        try table.writeLine(w, more, cols, "2", color);
     }
-    try table.writeRule(w, .bottom, inner);
     return out.toOwnedSlice();
 }
 
@@ -81,18 +78,18 @@ fn countPoints(st: standings.LeagueStandings) bool {
 
 fn writeEntryRow(
     w: *std.Io.Writer,
+    allocator: std.mem.Allocator,
     entry: standings.StandingEntry,
-    inner: usize,
+    cols: usize,
     has_points: bool,
-    color: bool,
 ) !void {
-    // Full-line budget is `inner + 2` (borders included). Fixed cells
-    // around the name: "│ " + abbr 4 + gaps + record 9 + " │", plus gap +
-    // points 4 when the column shows; the name absorbs the rest.
+    // Fixed cells around the name: abbr 4 + spaces + record 9 + points 4
+    // when the column shows; the name absorbs the rest. Ragged, never
+    // padded.
     const record_width: usize = 9;
     const points_width: usize = 4;
-    const fixed: usize = 2 + 4 + 1 + 1 + record_width + 2 + (if (has_points) 1 + points_width else 0);
-    const name_width: usize = (inner + 2) -| fixed;
+    const fixed: usize = 4 + 2 + record_width + (if (has_points) 1 + points_width else 0);
+    const name_width: usize = cols -| fixed;
     var record_buf: [32]u8 = undefined;
     const wins = entry.wins orelse "-";
     const losses = entry.losses orelse "-";
@@ -100,17 +97,22 @@ fn writeEntryRow(
         std.fmt.bufPrint(&record_buf, "{s}-{s}-{s}", .{ wins, losses, ties }) catch "-"
     else
         std.fmt.bufPrint(&record_buf, "{s}-{s}", .{ wins, losses }) catch "-";
-    try w.writeAll("│ ");
-    try table.writeCell(w, entry.abbrev, 4, null, color);
-    try w.writeByte(' ');
-    try table.writeCell(w, entry.name, name_width, null, color);
-    try w.writeByte(' ');
-    try table.writeCellRight(w, record, record_width, null, color);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const b = &buf.writer;
+    try table.writeCell(b, entry.abbrev, 4, null, false);
+    try b.writeByte(' ');
+    try table.writeCell(b, entry.name, name_width, null, false);
+    try b.writeByte(' ');
+    try table.writeCellRight(b, record, record_width, null, false);
     if (has_points) {
-        try w.writeByte(' ');
-        try table.writeCellRight(w, entry.points orelse "-", points_width, null, color);
+        try b.writeByte(' ');
+        try table.writeCellRight(b, entry.points orelse "-", points_width, null, false);
     }
-    try w.writeAll(" │\n");
+    const raw = try buf.toOwnedSlice();
+    defer allocator.free(raw);
+    try w.writeAll(std.mem.trimEnd(u8, raw, " "));
+    try w.writeByte('\n');
 }
 
 /// HTML view: the same table as text (color off), never ANSI, inside
@@ -185,8 +187,11 @@ test "standings text draws groups, records, and points with no HTML" {
     try std.testing.expect(std.mem.indexOf(u8, output, "30-25") != null);
     // Points column appears once any entry carries points.
     try std.testing.expect(std.mem.indexOf(u8, output, "85") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "┌") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "└") != null);
+    // Pipe-less document: heading, separator, groups — no box anywhere.
+    for ([_][]const u8{ "┌", "├", "└", "│" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, output, rule) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output, "─") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(output);
@@ -208,22 +213,34 @@ test "standings text hides the points column when no entry has points" {
     try std.testing.expect(std.mem.indexOf(u8, output, "80-63") != null);
 }
 
-test "standings text rows share one frame width and honor height" {
+/// A separator rule is nothing but ─ cells (3 bytes each).
+fn isSeparator(line: []const u8) bool {
+    if (line.len == 0 or line.len % 3 != 0) return false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 3) {
+        if (!std.mem.eql(u8, line[i..][0..3], "─")) return false;
+    }
+    return true;
+}
+
+test "standings text rows fit the page and honor height" {
     for ([_]u16{ 52, 80, 200 }) |width| {
         const output = try text(std.testing.allocator, testStandings(), false, width, null);
         defer std.testing.allocator.free(output);
-        var expect_width: ?usize = null;
         var lines = std.mem.splitScalar(u8, output, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
-            if (line.len == 0 or line[0] != 0xE2) continue;
-            const cells = table.textCells(line);
-            if (expect_width) |ew| try std.testing.expectEqual(ew, cells);
-            expect_width = cells;
+            if (line.len == 0) continue;
+            // Separator spans the requested width; content never exceeds it.
+            if (isSeparator(line)) {
+                try std.testing.expectEqual(table.textCells(line), width);
+            } else {
+                try std.testing.expect(table.textCells(line) <= width);
+            }
             count += 1;
         }
         try std.testing.expect(count > 0);
-        try std.testing.expectEqual(@as(usize, width), expect_width.?);
+        _ = try std.unicode.Utf8View.init(output);
     }
     const capped = try text(std.testing.allocator, testStandings(), false, null, 2);
     defer std.testing.allocator.free(capped);
@@ -295,3 +312,4 @@ test "router standings route is JSON under /api/v1" {
     try std.testing.expect(router.isJsonTarget("/api/v1/mlb/standings"));
     try std.testing.expect(!router.isJsonTarget("/mlb/standings"));
 }
+

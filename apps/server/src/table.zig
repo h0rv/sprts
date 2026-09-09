@@ -457,42 +457,22 @@ pub fn writeArtLineHtml(
     if (open) try w.writeAll("</span>");
 }
 
+/// One braille art row as document text: contrast-filtered glyphs plus
+/// a newline. No borders, no padding — art blocks are ragged by nature
+/// and breathe inside the page like any other section.
 pub fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
-    try w.writeAll("│ ");
+    _ = inner;
     try writeContrastLine(w, line);
-    var i: usize = countCells(line);
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(" │\n");
+    try w.writeByte('\n');
 }
 
-/// One braille art row as HTML: SGR color runs become rgb spans, except
-/// unreadably dark AND unreadably light runs, which inherit the page ink
-/// instead — one markup serves both themes (dark drops would vanish on
-/// dark, light drops on light), while mid-luminance team colors span on.
-/// Uncolored glyphs pass through escaped. Padding uses visible cells so
-/// the frame aligns with the text renderer.
-pub fn writeArtRowHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, line: []const u8, inner: usize) !void {
-    var cell: std.Io.Writer.Allocating = .init(allocator);
-    defer cell.deinit();
-    try writeArtLineHtml(&cell.writer, line, escapeByte);
-    const frag = try cell.toOwnedSlice();
-    defer allocator.free(frag);
-    try w.writeAll("│ ");
-    try w.writeAll(frag);
-    var i: usize = countCells(line);
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(" │\n");
-}
-
-fn escapeByte(w: *std.Io.Writer, b: u8) !void {
-    switch (b) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(b),
-    }
+/// One full-width horizontal separator: `width` ─ cells plus a newline.
+/// Document pages separate sections with these (or blank lines) instead
+/// of box rules; unlike a frame they fit any viewport without scrolling.
+pub fn writeSeparator(w: *std.Io.Writer, width: usize) !void {
+    var i: usize = 0;
+    while (i < width) : (i += 1) try w.writeAll("─");
+    try w.writeByte('\n');
 }
 
 /// Both teams' marks side by side at `.xs`: a horizontal card instead of
@@ -542,10 +522,7 @@ pub fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: [
         for (rows[0..n]) |list| {
             for (list.items) |line| {
                 if (line.len == 0) {
-                    try w.writeAll("│ ");
-                    var i: usize = 0;
-                    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-                    try w.writeAll(" │\n");
+                    try w.writeByte('\n');
                 } else {
                     try writeArtRow(w, line, inner);
                 }
@@ -574,9 +551,8 @@ pub fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: [
         while (fill > 0) : (fill -= 1) try row.writer.writeByte(' ');
         const text = try row.toOwnedSlice();
         defer allocator.free(text);
-        try w.writeAll("│ ");
-        try writeContrastLine(w, text);
-        try w.writeAll(" │\n");
+        try writeContrastLine(w, std.mem.trimEnd(u8, text, " "));
+        try w.writeByte('\n');
     }
 }
 
@@ -950,6 +926,16 @@ test "parity: rules, cells, rows, fit match pre-consolidation render" {
     );
 }
 
+// True when a line carries braille cells anywhere (not just leading):
+// pair rows can open with padding when one side's row is short.
+fn hasBraille(line: []const u8) bool {
+    var bi: usize = 0;
+    while (bi + 2 < line.len) : (bi += 1) {
+        if (line[bi] == 0xE2 and line[bi + 1] >= 0xA0 and line[bi + 1] <= 0xA3) return true;
+    }
+    return false;
+}
+
 test "hardened battery: interior blank mark rows survive the card" { // MLS ATX xs carries interior empty rows (disconnected logo). The old
     // inline copy dropped every empty split line, compressing the logo;
     // the shared path preserves them as blank cells.
@@ -974,7 +960,11 @@ test "hardened battery: interior blank mark rows survive the card" { // MLS ATX 
     };
     const output = try renderBoard(std.testing.allocator, board, false, 52);
     defer std.testing.allocator.free(output);
-    try expectOneFrame(output, 52, false);
+    // No frame assertion here: the shared marks renderer is ragged by
+    // design (the box helper only frames text rows). Validity + no ANSI
+    // still hold with color off.
+    _ = try std.unicode.Utf8View.init(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
     // Raw ATX xs rows (minus the file's trailing newline) each surface as
     // one card row: interior blanks included. ATX and HOU both carry 5
     // rows, so the 5-line card contains every row of each mark; counting
@@ -1006,43 +996,37 @@ test "hardened battery: interior blank mark rows survive the card" { // MLS ATX 
     var card_rows: usize = 0;
     var out_lines = std.mem.splitScalar(u8, output, '\n');
     while (out_lines.next()) |line| {
-        if (line.len == 0 or line[0] != 0xE2) continue;
-        // Art rows carry braille U+2800-U+28FF (E2 A0 80 .. E2 A3 BF).
-        var has_braille = false;
-        var bi: usize = 0;
-        while (bi + 2 < line.len) : (bi += 1) {
-            if (line[bi] == 0xE2 and line[bi + 1] >= 0xA0 and line[bi + 1] <= 0xA3) {
-                has_braille = true;
-                break;
-            }
-        }
-        if (!has_braille) continue;
-        card_rows += 1;
+        if (hasBraille(line)) card_rows += 1;
     }
     try std.testing.expectEqual(@as(usize, 4), card_rows);
-    // The shared-blank row renders as a frame row with no braille but
-    // full frame width (interior to the card, between art rows).
-    var seen_art = false;
+    // The shared-blank row renders as an empty line interior to the card
+    // (between art rows): borderless output has no padded frame row, so
+    // the blank survives as breathing room instead of a bordered cell.
+    // The old inline copy dropped it, compressing the logo vertically.
+    // Meaningful check: an empty line with braille on BOTH sides.
+    var prev_was_art = false;
+    var prev_was_blank_after_art = false;
     var blank_inside = false;
     out_lines = std.mem.splitScalar(u8, output, '\n');
     while (out_lines.next()) |line| {
-        if (line.len == 0 or line[0] != 0xE2) continue;
-        var has_braille = false;
-        var bi: usize = 0;
-        while (bi + 2 < line.len) : (bi += 1) {
-            if (line[bi] == 0xE2 and line[bi + 1] >= 0xA0 and line[bi + 1] <= 0xA3) {
-                has_braille = true;
-                break;
-            }
+        if (line.len == 0) {
+            if (prev_was_art) prev_was_blank_after_art = true;
+            prev_was_art = false;
+            continue;
         }
-        if (has_braille) {
-            seen_art = true;
-        } else if (seen_art) {
-            blank_inside = true;
+        if (!hasBraille(line)) {
+            prev_was_art = false;
+            prev_was_blank_after_art = false;
+            continue;
         }
+        if (prev_was_blank_after_art) blank_inside = true;
+        prev_was_art = true;
+        prev_was_blank_after_art = false;
     }
     try std.testing.expect(blank_inside);
 }
+
+// (hasBraille above; the old inline scan documented the E2 ranges here.)
 
 test "dark logo ink is filtered for terminal contrast" {
     // Near-black (xterm 16) is dropped, readable red kept, resets pass
@@ -1084,3 +1068,4 @@ test "art html band-passes extremes to page ink" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(got);
 }
+

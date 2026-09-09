@@ -65,40 +65,45 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     return validatedJson(domain.Scoreboard, allocator, board);
 }
 
-/// `width` is total terminal columns; the borders take 2. Never shrinks
-/// below the classic 52-wide box, so team art and the fixed participant
-/// cells always fit — extra room stretches the flexible rows and names.
-/// `height` caps the games listed (`+N more` trailer); null/0 = all.
-/// The heading names its zone (`MLB  2026-09-06 ET`) so output never
-/// silently disagrees with ESPN by a day; explicit `?date` boards carry
-/// the request zone the same way.
+/// `width` is total terminal columns of the document (no frame takes
+/// space). Never shrinks below the classic 52-wide page; extra room
+/// stretches names. `height` caps the games listed (`+N more` trailer);
+/// null/0 = all. The heading names its zone (`MLB  2026-09-06 ET`) so
+/// output never silently disagrees with ESPN by a day; explicit `?date`
+/// boards carry the request zone the same way.
+///
+/// Pipe-less by design like the detail and team pages: heading, games
+/// separated by rules, blank air before the footer nav. Columns align
+/// left; rows are ragged, never padded.
 pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     const shown: usize = @min(height orelse board.games.len, board.games.len);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    const t = Table{ .writer = w, .inner = inner, .color = color };
-    try t.rule(.top);
     const tag = try tz.zoneTag(allocator, zone);
     defer allocator.free(tag);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ board.league_name, board.date, tag });
     defer allocator.free(heading);
-    try t.row(heading, "2");
+    try table.writeLine(w, heading, cols, "2", color);
+    try table.writeSeparator(w, cols);
     if (board.games.len == 0) {
-        try t.rule(.mid);
-        try t.row("No games scheduled.", null);
+        try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
     for (board.games[0..shown]) |game| {
-        try t.rule(.mid);
-        try t.row(game.status, statusColor(game.state));
+        try table.writeLine(w, game.status, cols, statusColor(game.state), color);
         if (game.participants.len == 0) {
-            try t.row(game.name, null);
+            try table.writeLine(w, game.name, cols, null, color);
         }
         for (game.participants) |participant| {
-            try t.participantRow(participant);
+            const line = try scoreParticipantLine(allocator, participant, cols);
+            defer allocator.free(line);
+            if (color and participant.winner) try w.writeAll("\x1b[32m");
+            try w.writeAll(line);
+            if (color and participant.winner) try w.writeAll("\x1b[0m");
+            try w.writeByte('\n');
         }
-        try writeGameMarks(w, allocator, board.league, &game, inner, color);
+        try writeGameMarks(w, allocator, board.league, &game, cols, color);
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
@@ -107,16 +112,18 @@ pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, colo
                 if (game.participants.len > 0) game.participants[0].abbreviation else "",
             });
             defer allocator.free(game_link);
-            try t.row(game_link, "2");
+            try table.writeLine(w, game_link, cols, "2", color);
         }
+        // Separator rule closes each game block: the HTML linkifier keys
+        // status rows off it, and it gives dense days a quiet rhythm.
+        try table.writeSeparator(w, cols);
     }
     if (shown < board.games.len) {
         const more = try std.fmt.allocPrint(allocator, "+{d} more", .{board.games.len - shown});
         defer allocator.free(more);
-        try t.rule(.mid);
-        try t.row(more, "2");
+        try table.writeLine(w, more, cols, "2", color);
     }
-    try t.rule(.bottom);
+    try w.writeByte('\n');
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -128,6 +135,38 @@ pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, colo
         next,
     });
     return out.toOwnedSlice();
+}
+
+/// One scoreboard participant row, column-aligned like the old table
+/// interior (abbr, name, score, winner tick, record) but borderless and
+/// unpadded. Winner coloring wraps at emit time, never inside.
+
+fn scoreParticipantLine(allocator: std.mem.Allocator, p: domain.Participant, cols: usize) ![]u8 {
+    var rec_w: usize = 0;
+    if (p.record) |r| rec_w = table.textCells(r);
+    rec_w = @min(rec_w, 10);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const b = &buf.writer;
+    if (p.abbreviation.len > 0) {
+        try writeCell(b, p.abbreviation, 4, null, false);
+        try b.writeByte(' ');
+        try writeCell(b, p.name, cols -| 4 -| 2 -| 4 -| 2 -| (if (p.record != null) rec_w + 3 else 0), null, false);
+    } else {
+        // Athlete identities carry no abbreviation: the name absorbs it.
+        try writeCell(b, p.name, cols -| 7 -| (if (p.record != null) rec_w + 3 else 0), null, false);
+    }
+    try b.writeByte(' ');
+    try writeCellRight(b, p.score, 4, null, false);
+    if (p.record) |r| {
+        try b.writeAll(" (");
+        try writeCell(b, r, rec_w, null, false);
+        try b.writeByte(')');
+    }
+    if (p.winner) try b.writeAll(" ✓") else try b.writeAll("  ");
+    const raw = try buf.toOwnedSlice();
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trimEnd(u8, raw, " "));
 }
 
 /// ET-default wrapper: no `?tz=` means the Eastern day, so existing
@@ -157,15 +196,19 @@ pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     errdefer out.deinit();
     const w = &out.writer;
     try colorize(w, "2", "sprts\n", color);
-    try writeRule(w, .top, default_inner_width);
+    try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
-        try w.writeAll("│ ");
-        try writeCell(w, league.slug, 13, null, color);
-        try w.writeByte(' ');
-        try writeCell(w, league.name, 34, null, color);
-        try w.writeAll(" │\n");
+        var cell: std.Io.Writer.Allocating = .init(allocator);
+        defer cell.deinit();
+        try writeCell(&cell.writer, league.slug, 13, null, color);
+        try cell.writer.writeByte(' ');
+        try writeCell(&cell.writer, league.name, 34, null, color);
+        const padded = try cell.toOwnedSlice();
+        defer allocator.free(padded);
+        try w.writeAll(std.mem.trimEnd(u8, padded, " "));
+        try w.writeByte('\n');
     }
-    try writeRule(w, .bottom, default_inner_width);
+    try w.writeByte('\n');
     try colorize(w, "2", "Try: curl localhost:8080/mlb\n", color);
     return out.toOwnedSlice();
 }
@@ -213,7 +256,7 @@ pub fn homeLiveWithZone(
     }
     try writeRule(w, .top, default_inner_width);
     try homeSections(allocator, w, boards, color, false, day);
-    try writeRule(w, .bottom, default_inner_width);
+    try w.writeByte('\n');
     if (!quiet) try homeFooter(w, host, color);
     return out.toOwnedSlice();
 }
@@ -503,9 +546,9 @@ fn homeSections(
                 if (!live) {
                     live = true;
                     if (html) {
-                        try writeHtmlRow(allocator, "LIVE NOW", "live", default_inner_width, w, null);
+                        try writeHtmlLine(w, allocator, "LIVE NOW", 50, "live", null);
                     } else {
-                        try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color);
+                        try table.writeLine(w, "LIVE NOW", 50, "1;31", color);
                     }
                 }
                 try homeGameLine(allocator, w, result.league, game, color and !html, html, slug_w, abbr_w);
@@ -523,7 +566,7 @@ fn homeSections(
             }
         }
         if (!has_today) continue;
-        if (separated) try table.spacerRow(w, default_inner_width);
+        if (separated) try w.writeByte('\n');
         // League header: name plus M/D date (year is implicit in the
         // page heading). Whole line links to the league page in HTML.
         const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, shortDate(day) });
@@ -531,9 +574,9 @@ fn homeSections(
         if (html) {
             const href = try homeLeagueHref(allocator, result.league.slug, day);
             defer allocator.free(href);
-            try writeHtmlRow(allocator, header, "dim", default_inner_width, w, href);
+            try writeHtmlLine(w, allocator, header, 50, "dim", href);
         } else {
-            try writeRow(w, header, default_inner_width - 2, "2", color);
+            try table.writeLine(w, header, 50, "2", color);
         }
         for (board.games) |game| {
             if (gameIsLive(game)) continue;
@@ -547,14 +590,13 @@ fn homeSections(
         if (board != null and board.?.games.len > 0) continue;
         if (idle_first) {
             idle_first = false;
-            if (separated) try table.spacerRow(w, default_inner_width);
+            if (separated) try w.writeByte('\n');
             if (html) {
-                try writeHtmlRow(allocator, "ALL LEAGUES", "dim", default_inner_width, w, null);
+                try writeHtmlLine(w, allocator, "ALL LEAGUES", 50, "dim", null);
             } else {
-                try writeRow(w, "ALL LEAGUES", default_inner_width - 2, "2", color);
+                try table.writeLine(w, "ALL LEAGUES", 50, "2", color);
             }
         }
-        try w.writeAll("│ ");
         if (html) {
             const href = try homeLeagueHref(allocator, result.league.slug, day);
             defer allocator.free(href);
@@ -562,11 +604,23 @@ fn homeSections(
             try escapeInto(w, href);
             try w.writeAll("\">");
         }
-        try writeCell(w, result.league.slug, 13, null, false);
-        try w.writeByte(' ');
-        try writeCell(w, result.league.name, 34, null, false);
+        {
+            var cell: std.Io.Writer.Allocating = .init(allocator);
+            defer cell.deinit();
+            try writeCell(&cell.writer, result.league.slug, 13, null, false);
+            try cell.writer.writeByte(' ');
+            try writeCell(&cell.writer, result.league.name, 34, null, false);
+            const padded = try cell.toOwnedSlice();
+            defer allocator.free(padded);
+            const trimmed = std.mem.trimEnd(u8, padded, " ");
+            if (html) {
+                try escapeInto(w, trimmed);
+            } else {
+                try w.writeAll(trimmed);
+            }
+        }
         if (html) try w.writeAll("</a>");
-        try w.writeAll(" │\n");
+        try w.writeByte('\n');
     }
 }
 
@@ -653,9 +707,7 @@ fn homeGameLine(
         try writeHtmlHomeGameLine(allocator, line, league, game, w, href);
         return;
     }
-    try w.writeAll("│ ");
-    try writeCell(w, line, 48, statusColor(game.state), color);
-    try w.writeAll(" │\n");
+    try table.writeLine(w, line, 50, statusColor(game.state), color);
 }
 
 /// HTML home game line: `│ <span><a game>..</a><a team>abbr</a>..</span> │`.
@@ -664,21 +716,20 @@ fn homeGameLine(
 /// status word carries the live/upcoming color span. Padding reuses
 /// writeCell so the frame aligns with the text renderer.
 fn writeHtmlHomeGameLine(allocator: std.mem.Allocator, line: []const u8, league: *const leagues.League, game: domain.Game, w: *std.Io.Writer, href: []const u8) !void {
-    try w.writeAll("│ ");
     try writeLinkedGameCell(allocator, line, league, game, w, href);
-    try w.writeAll(" │\n");
+    try w.writeByte('\n');
 }
 
-/// Cell content for a home game line: the whole padded cell wrapped in
-/// its color span, split into sibling anchors — every non-team chunk
-/// links the game view, each participant abbreviation wraps in a team
-/// link. Only non-empty abbreviations link: nameless bouts (UFC-style)
-/// emit a single game link, so rows stay valid either way.
-/// Abbreviations are matched positionally (away first, then home) so a
-/// truncated name can never steal another team's link. Unmatched tails
-/// (padding, scores, status) ride the trailing game link. Stripping tags
-/// concatenates back to the same padded cell, so visible text matches
-/// the text renderer byte for byte.
+/// Cell content for a home game line: the fitted line split into sibling
+/// anchors — every non-team chunk links the game view, each participant
+/// abbreviation wraps in a team link. Only non-empty abbreviations link:
+/// nameless bouts (UFC-style) emit a single game link, so rows stay valid
+/// either way. Abbreviations are matched positionally (away first, then
+/// home) so a truncated name can never steal another team's link.
+/// Unmatched tails (scores, status) ride the trailing game link. The line
+/// is ragged (fitted, trailing blanks trimmed); stripping tags
+/// concatenates back to the same line, so visible text matches the text
+/// renderer byte for byte.
 fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *const leagues.League, game: domain.Game, w: *std.Io.Writer, game_href: []const u8) !void {
     const css = stateClass(game.state);
     if (css) |class| {
@@ -686,13 +737,17 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
         try w.writeAll(class);
         try w.writeAll("\">");
     }
-    // Collect the padded cell first so link offsets stay aligned.
+    // Collect the fitted line first so link offsets stay aligned; the
+    // line stays ragged (trailing blanks trimmed) so underlines stop at
+    // the text and visible text matches the text renderer byte for byte.
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, line, default_inner_width - 2, null, false);
+    try writeCell(&cell.writer, line, 50, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
+    const trimmed = std.mem.trimEnd(u8, padded, " ");
     var cursor: usize = 0;
+    const content = trimmed;
     if (game.participants.len == 2) {
         const first = game.participants[0];
         const second = game.participants[1];
@@ -704,13 +759,13 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
             .{ first, second };
         for ([2]domain.Participant{ away, home_team }) |part| {
             if (part.abbreviation.len == 0) continue;
-            if (std.mem.indexOf(u8, padded[cursor..], part.abbreviation)) |rel| {
+            if (std.mem.indexOf(u8, content[cursor..], part.abbreviation)) |rel| {
                 const at = cursor + rel;
                 if (at > cursor) {
                     try w.writeAll("<a href=\"");
                     try escapeInto(w, game_href);
                     try w.writeAll("\">");
-                    try escapeCellInto(w, padded[cursor..at]);
+                    try escapeCellInto(w, content[cursor..at]);
                     try w.writeAll("</a>");
                 }
                 const team_href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, part.abbreviation });
@@ -724,19 +779,12 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
             }
         }
     }
-    if (padded[cursor..].len > 0) {
-        // Content links, padding does not: trailing blanks ride outside
-        // the anchor so underlines stop at the text, never the border.
-        const tail = std.mem.trimEnd(u8, padded[cursor..], " ");
-        if (tail.len > 0) {
-            try w.writeAll("<a href=\"");
-            try escapeInto(w, game_href);
-            try w.writeAll("\">");
-            try escapeCellInto(w, tail);
-            try w.writeAll("</a>");
-        }
-        var pad: usize = padded[cursor..].len - tail.len;
-        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+    if (content[cursor..].len > 0) {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, game_href);
+        try w.writeAll("\">");
+        try escapeCellInto(w, content[cursor..]);
+        try w.writeAll("</a>");
     }
     if (css != null) try w.writeAll("</span>");
 }
@@ -885,8 +933,7 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
 /// reaches the page. Every other row uses the mono body, so the visible
 /// text still matches `text(color=false)` byte for byte.
 fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, color_body: []const u8, inner: usize, shown: usize) !void {
-    const row_prefix = "│ ";
-    const row_suffix = " │";
+    _ = inner;
     var game_idx: usize = 0;
     var current: ?usize = null;
     var part_pos: usize = 0;
@@ -899,8 +946,14 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
         // elsewhere, which only art rows ever read). Desync falls back
         // to the mono line, never to raw escapes.
         const color_line = color_lines.next() orelse line;
-        if (line.len == 0) continue;
-        if (std.mem.startsWith(u8, line, "├")) {
+        if (line.len == 0) {
+            // Blank separators breathe; the body's single trailing empty
+            // (after its final newline) carries no row.
+            if (lines.peek() == null) continue;
+            try w.writeByte('\n');
+            continue;
+        }
+        if (isRuleLine(line)) {
             try escapeInto(w, line);
             try w.writeByte('\n');
             if (current != null and game_idx >= shown) {
@@ -911,9 +964,8 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
             pending_rule = true;
             continue;
         }
-        if (!std.mem.startsWith(u8, line, row_prefix)) {
-            // Rules, the trailing `/{league}?date=` footer, and anything
-            // else outside a row carry no links.
+        if (line[0] == '/') {
+            // The trailing `/{league}?date=` footer carries no links.
             try escapeInto(w, line);
             try w.writeByte('\n');
             continue;
@@ -932,7 +984,7 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                 current = game_idx;
                 part_pos = 0;
                 game_idx += 1;
-                try writeGameStatusRow(w, allocator, board.league, game, line, row_prefix, row_suffix, true);
+                try writeGameStatusRow(w, allocator, board.league, game, line, true);
                 continue;
             }
             // `+N more` trailer or the empty-schedule note.
@@ -947,15 +999,15 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                 // Name-only game row: the name stands in for the game, so
                 // link it too but skip the anchor id — the status row
                 // above already owns `game-{id}`.
-                try writeGameStatusRow(w, allocator, board.league, game, line, row_prefix, row_suffix, false);
+                try writeGameStatusRow(w, allocator, board.league, game, line, false);
                 continue;
             }
-            if (isColorArtRow(line, game, part_pos, row_prefix, row_suffix)) {
+            if (isColorArtRow(line, game, part_pos)) {
                 // Colored mark row: spans, no link, cursor untouched.
-                try writeColorArtRow(w, line, color_line, row_prefix, row_suffix, inner);
+                try writeColorArtRow(w, color_line);
                 continue;
             }
-            try writeLinkedParticipantRow(w, allocator, board.league, game, &part_pos, line, row_prefix, row_suffix);
+            try writeLinkedParticipantRow(w, allocator, board.league, game, &part_pos, line);
             continue;
         }
         try escapeInto(w, line);
@@ -963,33 +1015,32 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
     }
 }
 
-/// Status (or name-only) row for one game: the whole inner cell becomes
-/// the game link and carries the per-game anchor id. Made `with_id` so a
+/// A separator rule is nothing but ─ cells: headings, statuses, and art
+/// never consist solely of them, so rows cannot be mistaken for rules.
+fn isRuleLine(line: []const u8) bool {
+    if (line.len == 0 or line.len % 3 != 0) return false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 3) {
+        if (!std.mem.eql(u8, line[i..][0..3], "─")) return false;
+    }
+    return true;
+}
+/// Status (or name-only) row for one game: the trimmed line becomes the
+/// game link and carries the per-game anchor id. Made `with_id` so a
 /// caller can reuse the wrapper for rows that already live inside a
-/// linked context without duplicating ids.
+/// linked context without duplicating ids. Padding never enters the
+/// anchor, so underlines stop at the text.
 fn writeGameStatusRow(
     w: *std.Io.Writer,
     allocator: std.mem.Allocator,
     league_slug: []const u8,
     game: *const domain.Game,
     line: []const u8,
-    row_prefix: []const u8,
-    row_suffix: []const u8,
     with_id: bool,
 ) !void {
-    if (!std.mem.endsWith(u8, line, row_suffix) or line.len < row_prefix.len + row_suffix.len) {
-        try escapeInto(w, line);
-        try w.writeByte('\n');
-        return;
-    }
-    const inner = line[row_prefix.len .. line.len - row_suffix.len];
-    // Underline only the content: cell padding rides outside the anchor
-    // so link underlines never cross the whole row (identical rendering
-    // inside <pre>, where spaces survive, and identical visible text).
-    const trimmed = std.mem.trimEnd(u8, inner, " ");
+    const trimmed = std.mem.trimEnd(u8, line, " ");
     const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league_slug, game.id });
     defer allocator.free(href);
-    try w.writeAll(row_prefix);
     try w.writeAll("<a href=\"");
     try escapeInto(w, href);
     if (with_id) {
@@ -999,9 +1050,6 @@ fn writeGameStatusRow(
     try w.writeAll("\">");
     try escapeInto(w, trimmed);
     try w.writeAll("</a>");
-    var pad: usize = inner.len - trimmed.len;
-    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
-    try w.writeAll(row_suffix);
     try w.writeByte('\n');
 }
 
@@ -1021,8 +1069,6 @@ fn writeLinkedParticipantRow(
     game: *const domain.Game,
     part_pos: *usize,
     line: []const u8,
-    row_prefix: []const u8,
-    row_suffix: []const u8,
 ) !void {
     if (part_pos.* >= game.participants.len) {
         // Marks or overflow padding: no participant left to link.
@@ -1045,17 +1091,10 @@ fn writeLinkedParticipantRow(
         try w.writeByte('\n');
         return;
     }
-    if (!std.mem.endsWith(u8, line, row_suffix) or line.len < row_prefix.len + row_suffix.len) {
-        try escapeInto(w, line);
-        try w.writeByte('\n');
-        return;
-    }
     const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league_slug, p.abbreviation });
     defer allocator.free(href);
-    const inner_end = line.len - row_suffix.len;
-    try w.writeAll(row_prefix);
-    var cursor: usize = row_prefix.len;
-    if (std.mem.indexOf(u8, line[cursor..inner_end], p.abbreviation)) |rel| {
+    var cursor: usize = 0;
+    if (std.mem.indexOf(u8, line[cursor..], p.abbreviation)) |rel| {
         const at = cursor + rel;
         try escapeInto(w, line[cursor..at]);
         try w.writeAll("<a href=\"");
@@ -1068,7 +1107,7 @@ fn writeLinkedParticipantRow(
     // A truncated name (ellipsis) is absent from the line, so only link
     // it when the full name is present; the abbr link above stays.
     if (p.name.len > 0) {
-        if (std.mem.indexOf(u8, line[cursor..inner_end], p.name)) |rel| {
+        if (std.mem.indexOf(u8, line[cursor..], p.name)) |rel| {
             const at = cursor + rel;
             try escapeInto(w, line[cursor..at]);
             try w.writeAll("<a href=\"");
@@ -1079,24 +1118,22 @@ fn writeLinkedParticipantRow(
             cursor = at + p.name.len;
         }
     }
-    try escapeInto(w, line[cursor..inner_end]);
-    try w.writeAll(row_suffix);
+    try escapeInto(w, line[cursor..]);
     try w.writeByte('\n');
 }
 
-/// Art-row detector for the linkifier: a bordered row inside a game that
-/// carries braille but neither the current participant's abbreviation nor
-/// name. Mirrors `writeLinkedParticipantRow`'s miss condition exactly so
-/// the two can never disagree about what links: anything flagged here is
-/// a row the linker would have left unlinked with the cursor held.
+/// Art-row detector for the linkifier: a row inside a game that carries
+/// braille but neither the current participant's abbreviation nor name.
+/// Mirrors `writeLinkedParticipantRow`'s miss condition exactly so the two
+/// can never disagree about what links: anything flagged here is a row
+/// the linker would have left unlinked with the cursor held.
 /// Order-agnostic: marks render AFTER the participant rows, so trailing
 /// art rows arrive with the cursor exhausted (`part_pos >= len`). Those
 /// still carry braille and match no participant's abbr/name; the pointer
 /// row also arrives with the cursor exhausted but carries no braille, so
 /// it stays unflagged. Checking every participant in the exhausted case
 /// keeps the mirror exact (the linker would miss there too).
-fn isColorArtRow(line: []const u8, game: *const domain.Game, part_pos: usize, row_prefix: []const u8, row_suffix: []const u8) bool {
-    if (!std.mem.startsWith(u8, line, row_prefix) or !std.mem.endsWith(u8, line, row_suffix)) return false;
+fn isColorArtRow(line: []const u8, game: *const domain.Game, part_pos: usize) bool {
     if (part_pos < game.participants.len) {
         const p = &game.participants[part_pos];
         if (p.abbreviation.len > 0 and std.mem.indexOf(u8, line, p.abbreviation) != null) return false;
@@ -1121,29 +1158,14 @@ fn containsBraille(line: []const u8) bool {
     return false;
 }
 
-/// One colored mark row as HTML: the color twin's inner cell becomes rgb
-/// spans via `table.writeArtLineHtml`; padding uses visible cells so the
-/// frame aligns with the text renderer. Link-free and cursor-free by
-/// construction. Malformed rows fall back to the escaped mono line.
+/// One colored mark row as HTML: the color twin's line becomes rgb spans
+/// via `table.writeArtLineHtml`, ragged like the text renderer.
+/// Link-free and cursor-free by construction.
 fn writeColorArtRow(
     w: *std.Io.Writer,
-    line: []const u8,
     color_line: []const u8,
-    row_prefix: []const u8,
-    row_suffix: []const u8,
-    inner: usize,
 ) !void {
-    if (!std.mem.endsWith(u8, color_line, row_suffix) or color_line.len < row_prefix.len + row_suffix.len) {
-        try escapeInto(w, line);
-        try w.writeByte('\n');
-        return;
-    }
-    const art = color_line[row_prefix.len .. color_line.len - row_suffix.len];
-    try w.writeAll(row_prefix);
-    try table.writeArtLineHtml(w, art, &htmlEscapeByte);
-    var i: usize = table.countCells(art);
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(row_suffix);
+    try table.writeArtLineHtml(w, color_line, &htmlEscapeByte);
     try w.writeByte('\n');
 }
 
@@ -1208,11 +1230,17 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
     return homeHtmlDay(allocator, null);
 }
 
+/// Home page mark: the pixel-S favicon displayed above the table (outside
+/// `<pre>`, so visible-text tests never see it). Fixed size, cached with
+/// the favicon itself.
+pub const home_logo_mark = "<img src=\"/favicon.svg\" alt=\"sprts\" width=\"40\" height=\"40\">\n";
+
 pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     try pageHead(w, "sprts");
+    try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>sprts\n");
     try writeRule(w, .top, default_inner_width);
     for (leagues.all) |league| {
@@ -1251,6 +1279,7 @@ pub fn homeHtmlLive(
     const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
     defer allocator.free(heading);
     try pageHead(w, heading);
+    try w.writeAll(home_logo_mark);
     try w.writeAll("<pre>\n");
     try writeRule(w, .top, default_inner_width);
     try homeSections(allocator, w, boards, false, true, day);
@@ -1299,15 +1328,15 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
+    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}</style>
 ;
 
-/// Site mark: dark rounded square, white mono S, red live dot — the
-/// pi.dev/tinygrad kind of minimal geometric favicon, in our own
+/// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
+/// the tinygrad/pi.dev kind of minimal geometric favicon, in our own
 /// palette. Served verbatim at `/favicon.svg` and linked from every
-/// page head; no script, no external assets.
+/// page head; no script, no external assets, no font dependency.
 pub const favicon_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><text x="29" y="44" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="36" font-weight="bold" text-anchor="middle" fill="#e6ebe7">S</text><circle cx="47" cy="17" r="5" fill="#ff7b7b"/></svg>
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><g fill="#e6ebe7" shape-rendering="crispEdges"><rect x="14" y="8" width="6" height="6"/><rect x="20" y="8" width="6" height="6"/><rect x="26" y="8" width="6" height="6"/><rect x="32" y="8" width="6" height="6"/><rect x="38" y="8" width="6" height="6"/><rect x="44" y="8" width="6" height="6"/><rect x="8" y="14" width="6" height="6"/><rect x="14" y="14" width="6" height="6"/><rect x="8" y="20" width="6" height="6"/><rect x="14" y="20" width="6" height="6"/><rect x="14" y="26" width="6" height="6"/><rect x="20" y="26" width="6" height="6"/><rect x="26" y="26" width="6" height="6"/><rect x="32" y="26" width="6" height="6"/><rect x="38" y="26" width="6" height="6"/><rect x="44" y="26" width="6" height="6"/><rect x="44" y="32" width="6" height="6"/><rect x="50" y="32" width="6" height="6"/><rect x="44" y="38" width="6" height="6"/><rect x="50" y="38" width="6" height="6"/><rect x="8" y="44" width="6" height="6"/><rect x="14" y="44" width="6" height="6"/><rect x="44" y="44" width="6" height="6"/><rect x="50" y="44" width="6" height="6"/><rect x="14" y="50" width="6" height="6"/><rect x="20" y="50" width="6" height="6"/><rect x="26" y="50" width="6" height="6"/><rect x="32" y="50" width="6" height="6"/><rect x="38" y="50" width="6" height="6"/><rect x="44" y="50" width="6" height="6"/></g></svg>
 ;
 
 /// Footer theme toggle: a single localStorage key persists the choice;
@@ -1376,7 +1405,7 @@ test "JSON renderer exposes stable schema marker" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
 }
 
-test "text renderer draws a table and no HTML" {
+test "text renderer draws a document and no HTML" {
     const board: domain.Scoreboard = .{
         .league = "mlb",
         .league_name = "MLB",
@@ -1398,12 +1427,43 @@ test "text renderer draws a table and no HTML" {
     };
     const output = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "┌") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "│") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "└") != null);
+    // Pipe-less document: heading, one separator, blank-separated game,
+    // date footer — no box-drawing bytes anywhere.
+    for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
+        if (std.mem.eql(u8, rule, "─")) continue; // the separator lives here
+        try std.testing.expect(std.mem.indexOf(u8, output, rule) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, output, "─") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "AWY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "   5 ✓") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+    // Long names truncate inside their column: every content line fits.
+    const wide_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Atlético Madrid Club de Fútbol with extra tail", .abbreviation = "ATM", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const wide = try text(std.testing.allocator, wide_board, false, null, null);
+    defer std.testing.allocator.free(wide);
+    try expectNoBrokenLines(wide, 52);
+    try std.testing.expect(std.mem.indexOf(u8, wide, "…") != null);
 }
 
 test "text renderer colors by default and strips with the flag off" {
@@ -1500,6 +1560,8 @@ test "HTML pages link and never carry ANSI" {
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);
+    // Pixel mark above the table, outside the plaintext block.
+    try std.testing.expect(std.mem.indexOf(u8, homepage, home_logo_mark) != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/mlb\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/docs\">docs</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/openapi.json\">spec</a>") != null);
@@ -1721,11 +1783,12 @@ test "page style is plaintext: no buttons, pre always scrolls" {
     try std.testing.expect(std.mem.indexOf(u8, page_style, "min-height:44px") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "border:1px") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "border-radius") == null);
-    // The box must never wrap: pre scrolls horizontally at every width
-    // (no pre-wrap anywhere), so frame lines cannot break on mobile.
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre-wrap") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "white-space:pre;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "overflow-x:auto") != null);
+    // The page must never scroll sideways: output is borderless, so pre
+    // wraps and narrow screens get a smaller face instead of a scrollbar
+    // (the frame era scrolled with pre + overflow-x).
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "white-space:pre-wrap;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "overflow-x:auto") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "max-width:480px") != null);
     // Theme rides on CSS vars; the toggle flips data-theme + localStorage.
     try std.testing.expect(std.mem.indexOf(u8, page_style, "--bg") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "data-theme") != null);
@@ -1745,6 +1808,9 @@ test "footer nav ends with the theme toggle on every page" {
     try std.testing.expect(std.mem.startsWith(u8, favicon_svg, "<svg "));
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "</svg>") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<script") == null);
+    // Pixel mark, not a font glyph: chunky rects with crisp edges.
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "shape-rendering=\"crispEdges\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<text") == null);
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
@@ -1944,11 +2010,10 @@ test "home groups live games, then today, then idle leagues" {
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/docs") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, repo_url) != null);
     try expectAlignedTable(output);
-    // Whitespace: a blank spacer row separates each section, and zero
-    // mid rules exist — sections breathe through spacers, never grid.
-    // The frame opens once (top) and closes once (bottom), so dense
-    // days stay quiet instead of rendering a rule per section.
-    try std.testing.expect(std.mem.indexOf(u8, output, "│                                                  │\n") != null);
+    // Whitespace: a blank line separates each section, and zero
+    // mid rules exist — sections breathe through air, never grid.
+    // The frame opens once (top rule) and never closes with borders,
+    // so dense days stay quiet instead of rendering a rule per section.
     try std.testing.expect(countRules(output) == 0);
     // No line exceeds the 52-column frame, so nothing wraps and the box
     // cannot "break" on narrow screens.
@@ -2058,11 +2123,11 @@ test "text renderer colors marks and strips them with color=false" {
     const colored = try text(std.testing.allocator, board, true, null, null);
     defer std.testing.allocator.free(colored);
     try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[38;5;") != null);
-    try expectAlignedTableColored(colored);
     const plain = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
-    try expectAlignedTable(plain);
+    // No line exceeds the page: ragged rows still fit their columns.
+    try expectNoBrokenLines(plain, 52);
     // Stripping SGR from the colored render reproduces the mono render.
     var stripped: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer stripped.deinit();
@@ -2261,16 +2326,19 @@ test "text renderer honors an explicit width" {
     const board = testBoard();
     const wide = try text(std.testing.allocator, board, false, 80, null);
     defer std.testing.allocator.free(wide);
-    // Top rule: ┌ + 78 × ─ + ┐\n.
-    const eol = std.mem.indexOfScalar(u8, wide, '\n').?;
-    try std.testing.expectEqual(@as(usize, 3 + 78 * 3 + 3), eol);
+    // Heading first, then an 80-wide separator rule.
+    var lines = std.mem.splitScalar(u8, wide, '\n');
+    try std.testing.expectEqualStrings("MLB  2026-09-06 ET", lines.next().?);
+    const rule = lines.next().?;
+    try std.testing.expectEqual(displayWidth(rule), 80);
     _ = try std.unicode.Utf8View.init(wide);
 
-    // Narrow requests never shrink below the classic 52-wide box.
+    // Narrow requests never shrink below the classic 52-wide page.
     const narrow = try text(std.testing.allocator, board, false, 40, null);
     defer std.testing.allocator.free(narrow);
-    const narrow_eol = std.mem.indexOfScalar(u8, narrow, '\n').?;
-    try std.testing.expectEqual(@as(usize, 3 + 50 * 3 + 3), narrow_eol);
+    var narrow_lines = std.mem.splitScalar(u8, narrow, '\n');
+    try std.testing.expectEqualStrings("MLB  2026-09-06 ET", narrow_lines.next().?);
+    try std.testing.expectEqual(displayWidth(narrow_lines.next().?), 52);
 }
 
 test "text renderer caps games with height and counts the rest" {
@@ -2292,7 +2360,7 @@ test "scoreboard text heading names the zone" {
     const et = try textWithZone(std.testing.allocator, board, false, null, null, .et);
     defer std.testing.allocator.free(et);
     try std.testing.expect(std.mem.indexOf(u8, et, "MLB  2026-09-06 ET") != null);
-    try expectAlignedTable(et);
+    try expectNoBrokenLines(et, 52);
 
     const utc = try textWithZone(std.testing.allocator, board, false, null, null, .utc);
     defer std.testing.allocator.free(utc);
@@ -2532,4 +2600,13 @@ test "home html game lines use sibling anchors, never nested" {
     try std.testing.expect(std.mem.indexOf(u8, visible_slice, "nba TRD     @ FRT") != null);
     _ = try std.unicode.Utf8View.init(page);
 }
+
+
+test "tmp debug narrow" {
+    const board = testBoard();
+    const page = try scoreHtml(std.testing.allocator, board, 40, 2);
+    defer std.testing.allocator.free(page);
+    std.debug.print("\n=====PAGE=====\n{s}\n=====END=====\n", .{page});
+}
+
 
