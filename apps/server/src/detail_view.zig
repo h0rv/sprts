@@ -87,8 +87,17 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
         try w.writeByte('\n');
         const chip = try situationText(allocator, situation);
         defer allocator.free(chip);
-        try table.writeLine(w, chip, cols, "1;31", color);
-        if (situation.last_play) |last| try table.writeLine(w, last, cols, null, color);
+        // Live situation never truncates: the chip and the last play
+        // wrap onto ragged continuation lines (same composer feeds the
+        // HTML path below, so visible text stays identical).
+        const chip_lines = try table.wrapLines(allocator, chip, cols);
+        defer freeLines(allocator, chip_lines);
+        for (chip_lines) |line| try table.writeLine(w, line, cols, "1;31", color);
+        if (situation.last_play) |last| {
+            const play_lines = try table.wrapLines(allocator, last, cols);
+            defer freeLines(allocator, play_lines);
+            for (play_lines) |line| try table.writeLine(w, line, cols, null, color);
+        }
     }
     if (game.decisions.len > 0 or hasProbables(game)) {
         try w.writeByte('\n');
@@ -220,8 +229,14 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         try w.writeByte('\n');
         const chip = try situationText(allocator, situation);
         defer allocator.free(chip);
-        try render.writeHtmlLine(w, allocator, chip, cols, "live", null);
-        if (situation.last_play) |last| try render.writeHtmlLine(w, allocator, last, cols, null, null);
+        const chip_lines = try table.wrapLines(allocator, chip, cols);
+        defer freeLines(allocator, chip_lines);
+        for (chip_lines) |line| try render.writeHtmlLine(w, allocator, line, cols, "live", null);
+        if (situation.last_play) |last| {
+            const play_lines = try table.wrapLines(allocator, last, cols);
+            defer freeLines(allocator, play_lines);
+            for (play_lines) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        }
     }
     if (game.decisions.len > 0 or hasProbables(game)) {
         try w.writeByte('\n');
@@ -1209,4 +1224,93 @@ test "detail statuses read the generic ET convention" {
     defer std.testing.allocator.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "9/8 - 7:40 PM ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "EDT") == null);
+}
+
+test "detail live situation wraps the matchup instead of truncating" {
+    // Regression: a live MLB header once rendered
+    // `0-0, 1 out, bases empty Cristopher Sanchez vs Yor…` — the
+    // pitcher-vs-batter tail cut by the truncating writer. Situation
+    // lines now wrap at word boundaries onto continuation lines.
+    var game = testDetail();
+    game.state = "in";
+    game.status = "Top 6th";
+    game.situation = .{
+        .balls = 0,
+        .strikes = 0,
+        .outs = 1,
+        .runners = &.{},
+        .batter = "Yordan Alvarez",
+        .pitcher = "Cristopher Sanchez",
+        .last_play = "Cristopher Sanchez throws a four-seam fastball to Yordan Alvarez for a very long called strike description",
+    };
+    const output = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(output);
+    _ = try std.unicode.Utf8View.init(output);
+    // Both names survive in full — nothing elided.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Cristopher Sanchez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Yordan Alvarez") != null);
+    // No ellipsis on any situation line (other sections, e.g. scoring
+    // plays, still truncate by design — scope the check to the wrapped
+    // chip and last-play rows).
+    var no_elide = std.mem.splitScalar(u8, output, '\n');
+    while (no_elide.next()) |line| {
+        if (std.mem.indexOf(u8, line, "0-0,") != null or
+            std.mem.indexOf(u8, line, "Sanchez") != null or
+            std.mem.indexOf(u8, line, "Alvarez") != null or
+            std.mem.indexOf(u8, line, "four-seam") != null or
+            std.mem.indexOf(u8, line, "fastball") != null or
+            std.mem.indexOf(u8, line, "called strike") != null)
+        {
+            try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+        }
+    }
+    // Joining wrapped lines with spaces reconstructs the full chip and
+    // the full last play, proving no word was dropped or cut.
+    var joined: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer joined.deinit();
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) try joined.writer.writeByte(' ') else {
+            try joined.writer.writeAll(line);
+            try joined.writer.writeByte(' ');
+        }
+    }
+    const flat = try joined.toOwnedSlice();
+    defer std.testing.allocator.free(flat);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "0-0, 1 out, bases empty Cristopher Sanchez vs Yordan Alvarez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "Cristopher Sanchez throws a four-seam fastball to Yordan Alvarez for a very long called strike description") != null);
+    // The chip spans at least two lines: the opener and the tail never
+    // share one row (60 cells cannot fit 52).
+    var opener: ?[]const u8 = null;
+    var tail: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(table.textCells(line) <= 52);
+        if (std.mem.indexOf(u8, line, "0-0,") != null) opener = line;
+        if (std.mem.indexOf(u8, line, "Alvarez") != null and std.mem.indexOf(u8, line, "0-0,") == null) tail = line;
+    }
+    try std.testing.expect(opener != null);
+    try std.testing.expect(tail != null);
+    try std.testing.expect(opener.?.ptr != tail.?.ptr);
+    // HTML carries the same wrapped words with no ANSI; situation rows
+    // carry no ellipsis (scoping as above).
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    _ = try std.unicode.Utf8View.init(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Cristopher Sanchez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Yordan Alvarez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    var page_lines = std.mem.splitScalar(u8, page, '\n');
+    while (page_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "0-0,") != null or
+            std.mem.indexOf(u8, line, "Sanchez") != null or
+            std.mem.indexOf(u8, line, "Alvarez") != null or
+            std.mem.indexOf(u8, line, "four-seam") != null or
+            std.mem.indexOf(u8, line, "fastball") != null or
+            std.mem.indexOf(u8, line, "called strike") != null)
+        {
+            try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+        }
+    }
 }
