@@ -77,8 +77,12 @@ pub const ApiSpec = z.Spec(.{
     z.endpoint(.GET, "/api/v1/all", .{
         .operation_id = "getAll",
         .summary = "Scores for all leagues and date",
-        .description = "Multi-league digest for one date: one Scoreboard per league in league order; " ++
-            "unavailable leagues render as zero-game boards (see digest.DigestJson). " ++
+        .description = "Multi-league digest for one date: one Scoreboard per league in league order. " ++
+            "Outages degrade additively, never by shape change: a failed league renders as a zero-game " ++
+            "board with its slug in the top-level degraded list (zero games plus absent-from-degraded " ++
+            "means off-day; present means outage, retry later; see digest.DigestJson). " ++
+            "Game starts_at is UTC ISO-8601; text/HTML headings name the request zone (default ET). " ++
+            "The source field names the upstream host (normally site.api.espn.com). " ++
             "Date-driven only (?date=YYYY-MM-DD, defaults to today); week is NOT fanned out.",
         .query = AllQuery,
         .responses = .{
@@ -93,7 +97,9 @@ pub const ApiSpec = z.Spec(.{
             "framed as data: lines plus blank-line terminators, each event prefixed with the " ++
             "clear-screen escape \\x1b[2J\\x1b[H for in-place redraw, with : ping keepalive comments. " ++
             "Example: curl -N /nba?stream=sse. Text-only; JSON and HTML always return a single response. " ++
-            "Pass ?week=N (strict positive integer; ESPN honors it only for football leagues, otherwise ignored).",
+            "Pass ?week=N (strict positive integer; ESPN honors it only for football leagues, otherwise ignored). " ++
+            "JSON Scoreboard: game starts_at is UTC ISO-8601 while text/HTML headings name the request " ++
+            "zone (default ET); source names the upstream host (normally site.api.espn.com).",
         .path = ScoreboardPath,
         .query = ScoreboardQuery,
         .responses = .{
@@ -108,7 +114,8 @@ pub const ApiSpec = z.Spec(.{
     // is always JSON. Only `date` on the scoreboard/all digest selects data
     // (bad `date` 400 is only possible there); game/team can only miss
     // (404) or lose upstream (502). The digest never 404s or 502s: one
-    // league's outage degrades to a zero-game board entry.
+    // league's outage degrades to a zero-game board entry plus its slug in
+    // the digest `degraded` list.
     z.endpoint(.GET, "/api/v1/{league}/{id}", .{
         .operation_id = "getGame",
         .summary = "One game with linescore and scoring plays",
@@ -173,7 +180,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "\n" ++
             "JSON API\n" ++
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
-            "  GET /api/v1/all - Scores for all leagues and date. params: date. (getAll)\n" ++
+            "  GET /api/v1/all - Scores for all leagues and date. params: date. degraded lists outage slugs. (getAll)\n" ++
             "  GET /api/v1/league - Scores for one league and date. params: date, week football-only. (getScoreboard)\n" ++
             "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
@@ -195,12 +202,21 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  ?width=N ?height=N terminal size cap\n" ++
             "  ?0 one-line per game, text-only\n" ++
             "\n" ++
+            "JSON DIGEST OUTAGES\n" ++
+            "  /api/v1/all never 404s or 502s: a failed league is a zero-game board plus its slug in degraded.\n" ++
+            "  Zero games with the slug absent from degraded is an off-day; present means outage, retry later.\n" ++
+            "  Text /all marks the same leagues unavailable.\n" ++
+            "\n" ++
+            "ZONES SOURCE\n" ++
+            "  starts_at is UTC ISO-8601; text and HTML headings name the request zone, default ET.\n" ++
+            "  source is the upstream host, normally site.api.espn.com.\n" ++
+            "\n" ++
             "EXAMPLES\n" ++
             "  curl localhost:8080/mlb\n" ++
             "  curl localhost:8080/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/mlb?format=html\n" ++
-            "  curl localhost:8080/api/v1/\n" ++
             "  curl localhost:8080/api/v1/leagues\n" ++
+            "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
             "  curl localhost:8080/openapi.json\n" ++
@@ -237,8 +253,9 @@ test "spec emits all five JSON operations" {
     for ([_][]const u8{ "LeagueList", "DigestJson", "Scoreboard", "DetailGame", "ScheduleTeamView", "LeagueStandings", "ErrorBody" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, doc, name) != null);
     }
-    // Digest envelope reuses existing field names only (see digest.DigestJson).
-    for ([_][]const u8{ "\"date\"", "\"leagues\"", "\"schema_version\"" }) |field| {
+    // Digest envelope is Scoreboard shapes plus the additive `degraded`
+    // outage signal (see digest.DigestJson); nothing renamed or removed.
+    for ([_][]const u8{ "\"date\"", "\"leagues\"", "\"schema_version\"", "\"degraded\"" }) |field| {
         try std.testing.expect(std.mem.indexOf(u8, doc, field) != null);
     }
 }
@@ -356,7 +373,8 @@ test "served openapi.json parses and covers every JSON route" {
         }
         try std.testing.expect(saw_date);
     }
-    // Digest envelope shape: existing field names only.
+    // Digest envelope shape: Scoreboard entries plus the additive outage
+    // signal; per-league shapes stay verbatim.
     {
         const schemas = parsed.value.object.get("components").?.object.get("schemas").?.object;
         try std.testing.expect(schemas.get("DigestJson") != null);
@@ -364,6 +382,21 @@ test "served openapi.json parses and covers every JSON route" {
         try std.testing.expect(props.get("schema_version") != null);
         try std.testing.expect(props.get("date") != null);
         try std.testing.expect(props.get("leagues") != null);
+        try std.testing.expect(props.get("degraded") != null);
+    }
+    // The digest description documents the outage signal and the
+    // zone/source contract, so /openapi.json pins them like /llms.txt.
+    {
+        const get = paths.get("/api/v1/all").?.object.get("get").?.object;
+        const desc = get.get("description").?.string;
+        for ([_][]const u8{ "degraded", "off-day", "UTC", "ET", "source" }) |token| {
+            try std.testing.expect(std.mem.indexOf(u8, desc, token) != null);
+        }
+        const board_get = paths.get("/api/v1/{league}").?.object.get("get").?.object;
+        const board_desc = board_get.get("description").?.string;
+        for ([_][]const u8{ "UTC", "ET", "source" }) |token| {
+            try std.testing.expect(std.mem.indexOf(u8, board_desc, token) != null);
+        }
     }
 }
 
@@ -413,4 +446,64 @@ test "all JSON renderers validate in one process" {
     const list_json = try render.leaguesJson(arena);
     try std.testing.expect(std.mem.indexOf(u8, list_json, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_json, "\"slug\": \"mlb\"") != null);
+}
+
+test "llms.txt examples all route" {
+    // Pin the doc to reality: every curl example path must parse to a real
+    // route. The bare /api/v1/ empty-slug address is .not_found, so it must
+    // never appear here again.
+    const doc = try llmsTxt(std.testing.allocator);
+    defer std.testing.allocator.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "localhost:8080/api/v1/\n") == null);
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "curl ") == null) continue;
+        const marker = std.mem.indexOf(u8, line, "localhost:8080") orelse continue;
+        const path = std.mem.trim(u8, line[marker + "localhost:8080".len ..], " \t\r");
+        if (path.len == 0) continue;
+        count += 1;
+        try std.testing.expect(router.parse(path) != .not_found);
+    }
+    try std.testing.expect(count >= 8);
+    // Outage and zone/source contracts live in the agent surface too.
+    for ([_][]const u8{ "degraded", "off-day", "UTC", "site.api.espn.com" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, doc, token) != null);
+    }
+}
+
+test "series-tied lines never double the Series prefix" {
+    // Fixture inputs are the exact strings the provider builders emit: the
+    // schedule-derived path already speaks season-series language, while the
+    // ESPN summary path passes playoff wording through verbatim. Detail
+    // views prefix unconditionally, so only the first shape is clean.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base: core.detail.GameDetail = .{
+        .id = "401816828",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
+    };
+    var tied = base;
+    tied.series = "Season series tied 1-1 (game 2 of 4)";
+    const tied_text = try detail_view.renderText(arena, tied, false, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, tied_text, "Series: Season series tied 1-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tied_text, "Series: Series") == null);
+    // ESPN-verbatim playoff wording still doubles the prefix through the
+    // unconditional "Series: " render; normalizing "Series tied ..." belongs
+    // in provider.summarySeries (out of this lane), pinned here as the repro.
+    var verbatim = base;
+    verbatim.series = "Series tied 1-1 (game 2 of 4)";
+    const verbatim_text = try detail_view.renderText(arena, verbatim, false, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, verbatim_text, "Series: Series tied 1-1") != null);
+    // JSON carries the provider string with no prefix, so it never doubles.
+    const verbatim_json = try detail_view.json(arena, verbatim);
+    try std.testing.expect(std.mem.indexOf(u8, verbatim_json, "Series tied 1-1 (game 2 of 4)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verbatim_json, "Series: Series") == null);
+    _ = try std.unicode.Utf8View.init(tied_text);
 }
