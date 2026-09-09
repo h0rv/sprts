@@ -1506,41 +1506,62 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
     };
 }
 
-/// Upcoming display: `"vs ATL 5:05 PM"` / `"at NYM 7:15 PM"` (UTC, from the
-/// ISO timestamp). Falls back to the calendar date when no time parses.
+/// Upcoming display: `"vs ATL 5:05 PM"` / `"at NYM 7:15 PM"` (US Eastern,
+/// converted from the UTC ISO timestamp via `core.date`, EDT/EST by the rule
+/// at the game instant). Falls back to the raw UTC wall time when the
+/// timestamp shape is unknown, and to the calendar date when no time parses.
 fn upcomingResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) ![]u8 {
     const versus = if (std.mem.eql(u8, event.home_away, "away")) "at" else "vs";
     if (event.date.len >= 16 and event.date[13] == ':') {
-        const hour = std.fmt.parseInt(u8, event.date[11..13], 10) catch {
+        var hour = std.fmt.parseInt(u8, event.date[11..13], 10) catch {
             return std.fmt.allocPrint(arena, "{s} {s} {s}", .{ versus, event.opponent_abbrev, event.date });
         };
-        const minute = event.date[14..16];
+        var minute: u8 = std.fmt.parseInt(u8, event.date[14..16], 10) catch {
+            return std.fmt.allocPrint(arena, "{s} {s} {s}", .{ versus, event.opponent_abbrev, event.date });
+        };
+        // ESPN timestamps are UTC; team pages read Eastern. Shift the wall
+        // clock by the offset in force at the game instant (September
+        // kickoffs land in EDT, January tip-offs in EST).
+        if (core.date.parseTimestampUTC(event.date)) |epoch| {
+            const shifted = epoch + @as(i64, core.date.etOffsetMinutes(epoch)) * std.time.s_per_min;
+            const wall = @mod(shifted, std.time.s_per_day);
+            hour = @intCast(@divFloor(wall, std.time.s_per_hour));
+            minute = @intCast(@divFloor(@mod(wall, std.time.s_per_hour), std.time.s_per_min));
+        }
         const twelve = if (hour % 12 == 0) @as(u8, 12) else hour % 12;
         const suffix: []const u8 = if (hour < 12) "AM" else "PM";
-        return std.fmt.allocPrint(arena, "{s} {s} {d}:{s} {s}", .{ versus, event.opponent_abbrev, twelve, minute, suffix });
+        return std.fmt.allocPrint(arena, "{s} {s} {d}:{d:0>2} {s}", .{ versus, event.opponent_abbrev, twelve, minute, suffix });
     }
     const prefix = if (event.date.len >= 10) event.date[0..10] else event.date;
     return std.fmt.allocPrint(arena, "{s} {s} {s}", .{ versus, event.opponent_abbrev, prefix });
 }
 
-/// Final display: `"W 5-3"` / `"L 2-4"` (our score first). A numeric tie
-/// with no winner flag renders `"D"`. Missing scores fall back to status.
+/// Final display: `"W 5-3"` / `"L 2-4"` (our score first), `"D 2-2"` for
+/// numeric ties. A tie is a draw whatever the winner flag reads: ESPN marks
+/// both sides `winner: false` on soccer draws, which used to render
+/// `"L 0-0"`. Missing scores fall back to status.
 fn finalResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) ![]u8 {
     if (event.our_score.len == 0 or event.opp_score.len == 0) {
         return arena.dupe(u8, event.status);
     }
-    const prefix: []const u8 = prefix: {
-        if (event.won) |won| break :prefix if (won) "W" else "L";
-        const ours = std.fmt.parseInt(i64, event.our_score, 10) catch break :prefix "F";
-        const theirs = std.fmt.parseInt(i64, event.opp_score, 10) catch break :prefix "F";
-        break :prefix if (ours == theirs) "D" else if (ours > theirs) "W" else "L";
+    const ours = std.fmt.parseInt(i64, event.our_score, 10) catch null;
+    const theirs = std.fmt.parseInt(i64, event.opp_score, 10) catch null;
+    if (ours) |o| if (theirs) |t| {
+        if (o == t) return std.fmt.allocPrint(arena, "D {s}-{s}", .{ event.our_score, event.opp_score });
+        if (event.won) |won| return std.fmt.allocPrint(arena, "{s} {s}-{s}", .{ if (won) "W" else "L", event.our_score, event.opp_score });
+        return std.fmt.allocPrint(arena, "{s} {s}-{s}", .{ if (o > t) "W" else "L", event.our_score, event.opp_score });
     };
-    return std.fmt.allocPrint(arena, "{s} {s}-{s}", .{ prefix, event.our_score, event.opp_score });
+    if (event.won) |won| return std.fmt.allocPrint(arena, "{s} {s}-{s}", .{ if (won) "W" else "L", event.our_score, event.opp_score });
+    return std.fmt.allocPrint(arena, "F {s}-{s}", .{ event.our_score, event.opp_score });
 }
 
 fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) !core.schedule.GameRef {
     const result = if (std.mem.eql(u8, event.state, "post"))
         try finalResult(arena, event)
+    else if (std.mem.eql(u8, event.state, "in"))
+        // Live rows render `"<date> <vs/at OPP> <result>"`, so the result
+        // must not repeat the opponent the way upcoming results do.
+        try liveScheduleResult(arena, event)
     else
         try upcomingResult(arena, event);
     return .{
@@ -1556,6 +1577,15 @@ fn gameRefFromEvent(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent
         .result = result,
         .probable = event.probable,
     };
+}
+
+/// Live display from schedule scores alone: `"{our}-{opp} {status}"` (the
+/// board shape, no opponent); bare status when no scores are posted yet.
+fn liveScheduleResult(arena: std.mem.Allocator, event: core.schedule.ScheduleEvent) ![]u8 {
+    if (event.our_score.len > 0 and event.opp_score.len > 0) {
+        return std.fmt.allocPrint(arena, "{s}-{s} {s}", .{ event.our_score, event.opp_score, event.status });
+    }
+    return arena.dupe(u8, event.status);
 }
 
 /// Live display from a board game: `"{our}-{opp} {status}"`, e.g.
@@ -1612,7 +1642,7 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         ), abbrev);
     }
 
-    const split = core.schedule.splitSchedule(parsed.events, today);
+    const split = try core.schedule.splitSchedule(arena, parsed.events, today);
     var next: std.ArrayList(core.schedule.GameRef) = .empty;
     for (split.upcoming[0..@min(split.upcoming.len, 5)]) |event| {
         try next.append(arena, try gameRefFromEvent(arena, event));
@@ -2261,3 +2291,120 @@ const detail_summary_minimal =
 const detail_board_minimal =
  \\{"events":[{"id":"7","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"7","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"1","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
  ;
+
+fn schedEvent(state: []const u8, our_score: []const u8, opp_score: []const u8, won: ?bool) core.schedule.ScheduleEvent {
+    return .{
+        .id = "t",
+        .date = "2026-09-05T19:05Z",
+        .opponent_abbrev = "ATL",
+        .opponent_name = "Atlanta Braves",
+        .home_away = "home",
+        .state = state,
+        .status = "Final",
+        .our_score = our_score,
+        .opp_score = opp_score,
+        .won = won,
+    };
+}
+
+test "finals derive draws from tied scores whatever the winner flag reads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // ESPN marks both sides winner=false on soccer draws: "L 0-0" before.
+    try std.testing.expectEqualStrings("D 2-2", try finalResult(arena, schedEvent("post", "2", "2", false)));
+    try std.testing.expectEqualStrings("D 0-0", try finalResult(arena, schedEvent("post", "0", "0", false)));
+    // Null-flag draws already worked; winner flags still decide non-ties.
+    try std.testing.expectEqualStrings("D 1-1", try finalResult(arena, schedEvent("post", "1", "1", null)));
+    try std.testing.expectEqualStrings("W 2-1", try finalResult(arena, schedEvent("post", "2", "1", true)));
+    try std.testing.expectEqualStrings("W 3-1", try finalResult(arena, schedEvent("post", "3", "1", null)));
+    try std.testing.expectEqualStrings("L 1-3", try finalResult(arena, schedEvent("post", "1", "3", false)));
+    try std.testing.expectEqualStrings("L 1-3", try finalResult(arena, schedEvent("post", "1", "3", null)));
+    // Missing scores fall back to status.
+    try std.testing.expectEqualStrings("Final", try finalResult(arena, schedEvent("post", "", "", null)));
+}
+
+test "upcoming times read Eastern, not UTC" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = core.schedule.ScheduleEvent{
+        .id = "t",
+        .date = "",
+        .opponent_abbrev = "DAL",
+        .opponent_name = "Dallas",
+        .home_away = "home",
+        .state = "pre",
+        .status = "Scheduled",
+    };
+    // The reported NFL kickoff: Sept 13 8:20 PM ET is 09-14T00:20Z.
+    var sept = base;
+    sept.date = "2026-09-14T00:20Z";
+    try std.testing.expectEqualStrings("vs DAL 8:20 PM", try upcomingResult(arena, sept));
+    // Away sides and the EDT offset likewise shift back four hours.
+    var away = base;
+    away.home_away = "away";
+    away.opponent_abbrev = "PHI";
+    away.date = "2026-09-08T22:40Z";
+    try std.testing.expectEqualStrings("at PHI 6:40 PM", try upcomingResult(arena, away));
+    // January reads EST: 02:30Z is 9:30 PM the evening before.
+    var jan = base;
+    jan.date = "2026-01-15T02:30Z";
+    try std.testing.expectEqualStrings("vs DAL 9:30 PM", try upcomingResult(arena, jan));
+    // Unparsable timestamps keep the old fallbacks, never an error.
+    var bad = base;
+    bad.date = "sometime";
+    try std.testing.expectEqualStrings("vs DAL sometime", try upcomingResult(arena, bad));
+}
+
+test "live schedule rows carry no opponent repeat in the result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var live = schedEvent("in", "2", "3", null);
+    live.status = "Top 9th";
+    const with_scores = try gameRefFromEvent(arena, live);
+    try std.testing.expectEqualStrings("2-3 Top 9th", with_scores.result);
+    var unscored = schedEvent("in", "", "", null);
+    unscored.status = "Top 9th";
+    const bare = try gameRefFromEvent(arena, unscored);
+    try std.testing.expectEqualStrings("Top 9th", bare.result);
+}
+
+// Partition regression (FakeTransportState, never live ESPN): a postponed
+// game with a past date, a draw flagged winner=false on both sides, and a
+// cross-midnight live game interleave one final. Only the final is past;
+// everything else stays upcoming in schedule order.
+const team_partition_schedule =
+    \\{"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies","recordSummary":"80-63","standingSummary":"2nd in NL East"},"events":[
+    \\{"id":"ppd1","date":"2026-09-04T19:05Z","competitions":[{"id":"ppd1","date":"2026-09-04T19:05Z","status":{"type":{"state":"pre","shortDetail":"Postponed"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"probables":[]},{"homeAway":"away","team":{"id":"12","abbreviation":"ATL","displayName":"Atlanta Braves"},"probables":[]}]}]},
+    \\{"id":"draw1","date":"2026-09-05T19:05Z","competitions":[{"id":"draw1","date":"2026-09-05T19:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"home","winner":false,"score":{"displayValue":"2"},"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"probables":[]},{"homeAway":"away","winner":false,"score":{"displayValue":"2"},"team":{"id":"12","abbreviation":"ATL","displayName":"Atlanta Braves"},"probables":[]}]}]},
+    \\{"id":"live9","date":"2026-09-06T22:40Z","competitions":[{"id":"live9","date":"2026-09-06T22:40Z","status":{"type":{"state":"in","shortDetail":"Top 9th"}},"competitors":[{"homeAway":"home","score":{"displayValue":"2"},"team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"probables":[]},{"homeAway":"away","score":{"displayValue":"3"},"team":{"id":"12","abbreviation":"ATL","displayName":"Atlanta Braves"},"probables":[]}]}]},
+    \\{"id":"fut1","date":"2026-09-08T17:05Z","competitions":[{"id":"fut1","date":"2026-09-08T17:05Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"22","abbreviation":"PHI","displayName":"Philadelphia Phillies"},"probables":[]},{"homeAway":"away","team":{"id":"12","abbreviation":"ATL","displayName":"Atlanta Braves"},"probables":[]}]}]}
+    \\]}
+;
+
+test "fetchTeam partitions by completion across interleaved dates" {
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = team_partition_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true, // live join off; partitioning is schedule-only.
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // fakeClock today is 2026-09-07: the 09-06 live game is cross-midnight.
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    try std.testing.expect(view.live == null);
+    try std.testing.expectEqual(@as(usize, 1), view.last.len);
+    try std.testing.expectEqualStrings("draw1", view.last[0].id);
+    try std.testing.expectEqualStrings("D 2-2", view.last[0].result);
+    try std.testing.expectEqual(@as(usize, 3), view.next.len);
+    try std.testing.expectEqualStrings("ppd1", view.next[0].id);
+    try std.testing.expectEqualStrings("live9", view.next[1].id);
+    try std.testing.expectEqualStrings("2-3 Top 9th", view.next[1].result);
+    try std.testing.expectEqualStrings("fut1", view.next[2].id);
+    try std.testing.expectEqualStrings("vs ATL 1:05 PM", view.next[2].result);
+    try std.testing.expectEqual(@as(usize, 0), view.extra_past.len);
+    try std.testing.expectEqual(@as(usize, 0), view.extra_next.len);
+}

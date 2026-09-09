@@ -659,13 +659,16 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
 }
 
 /// Minimal browser page: the same table as text, never ANSI, with real
-/// links. Browsers cannot use terminal escapes, so HTML output is always
-/// uncolored and the text renderer stays the single source of layout.
+/// links. Browsers cannot use terminal escapes, so SGR never reaches the
+/// page raw: team marks re-render as rgb spans while the text renderer
+/// stays the single source of layout.
 /// The title and the table heading both name the zone
 /// (`MLB scores 2026-09-06 ET`); the date nav stays date-only.
 pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
     const body = try textWithZone(allocator, board, false, width, height, zone);
     defer allocator.free(body);
+    const color_body = try textWithZone(allocator, board, true, width, height, zone);
+    defer allocator.free(color_body);
     const previous = try dates.shift(allocator, board.date, -1);
     defer allocator.free(previous);
     const next = try dates.shift(allocator, board.date, 1);
@@ -680,13 +683,14 @@ pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard,
     try pageHead(w, title);
     try w.writeAll("<pre>");
     const shown: usize = @min(height orelse board.games.len, board.games.len);
-    try writeLinkedScoreboard(w, allocator, board, body, shown);
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}?date={s}\">earlier</a>", .{ board.league, previous });
     try w.print("<a href=\"/{s}\">today</a>", .{board.league});
     try w.print("<a href=\"/{s}?date={s}\">later</a>", .{ board.league, next });
     try w.print("<a href=\"/api/v1/{s}?date={s}\">json</a>", .{ board.league, board.date });
-    try w.writeAll("</nav></main></body></html>");
+    try closePageWithNav(w);
     return out.toOwnedSlice();
 }
 
@@ -703,8 +707,12 @@ pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: 
 /// tags are added, so the visible text matches `text(color=false)`
 /// byte for byte. Everything — including built hrefs — escapes via
 /// `escapeInto`, so hostile provider text (`<OT>`-style statuses) can
-/// never break the page.
-fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, shown: usize) !void {
+/// never break the page. Team marks ride along in color: art rows
+/// (braille, no participant hit) re-emit from a color=true twin body via
+/// `table.writeArtLineHtml`, so SGR becomes rgb spans and `\x1b[` never
+/// reaches the page. Every other row uses the mono body, so the visible
+/// text still matches `text(color=false)` byte for byte.
+fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, color_body: []const u8, inner: usize, shown: usize) !void {
     const row_prefix = "│ ";
     const row_suffix = " │";
     var game_idx: usize = 0;
@@ -713,7 +721,12 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
     var pending_rule = false;
     var first_row = true;
     var lines = std.mem.splitScalar(u8, body, '\n');
+    var color_lines = std.mem.splitScalar(u8, color_body, '\n');
     while (lines.next()) |line| {
+        // Lockstep twin: same layout, plus SGR on art rows (and ANSI
+        // elsewhere, which only art rows ever read). Desync falls back
+        // to the mono line, never to raw escapes.
+        const color_line = color_lines.next() orelse line;
         if (line.len == 0) continue;
         if (std.mem.startsWith(u8, line, "├")) {
             try escapeInto(w, line);
@@ -763,6 +776,11 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                 // link it too but skip the anchor id — the status row
                 // above already owns `game-{id}`.
                 try writeGameStatusRow(w, allocator, board.league, game, line, row_prefix, row_suffix, false);
+                continue;
+            }
+            if (isColorArtRow(line, game, part_pos, row_prefix, row_suffix)) {
+                // Colored mark row: spans, no link, cursor untouched.
+                try writeColorArtRow(w, line, color_line, row_prefix, row_suffix, inner);
                 continue;
             }
             try writeLinkedParticipantRow(w, allocator, board.league, game, &part_pos, line, row_prefix, row_suffix);
@@ -888,6 +906,98 @@ fn writeLinkedParticipantRow(
     try w.writeByte('\n');
 }
 
+/// Art-row detector for the linkifier: a bordered row inside a game that
+/// carries braille but neither the current participant's abbreviation nor
+/// name. Mirrors `writeLinkedParticipantRow`'s miss condition exactly so
+/// the two can never disagree about what links: anything flagged here is
+/// a row the linker would have left unlinked with the cursor held.
+fn isColorArtRow(line: []const u8, game: *const domain.Game, part_pos: usize, row_prefix: []const u8, row_suffix: []const u8) bool {
+    if (part_pos >= game.participants.len) return false;
+    if (!std.mem.startsWith(u8, line, row_prefix) or !std.mem.endsWith(u8, line, row_suffix)) return false;
+    const p = &game.participants[part_pos];
+    if (p.abbreviation.len > 0 and std.mem.indexOf(u8, line, p.abbreviation) != null) return false;
+    if (p.name.len > 0 and std.mem.indexOf(u8, line, p.name) != null) return false;
+    return containsBraille(line);
+}
+
+/// True when the line holds braille cells (U+2800-U+28FF: E2 A0-A3 ...).
+/// Box rules (E2 94), the winner check (E2 9C), and the ellipsis
+/// (E2 80) never match, so only mark rows qualify.
+fn containsBraille(line: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < line.len) : (i += 1) {
+        if (line[i] == 0xE2 and line[i + 1] >= 0xA0 and line[i + 1] <= 0xA3) return true;
+    }
+    return false;
+}
+
+/// One colored mark row as HTML: the color twin's inner cell becomes rgb
+/// spans via `table.writeArtLineHtml`; padding uses visible cells so the
+/// frame aligns with the text renderer. Link-free and cursor-free by
+/// construction. Malformed rows fall back to the escaped mono line.
+fn writeColorArtRow(
+    w: *std.Io.Writer,
+    line: []const u8,
+    color_line: []const u8,
+    row_prefix: []const u8,
+    row_suffix: []const u8,
+    inner: usize,
+) !void {
+    if (!std.mem.endsWith(u8, color_line, row_suffix) or color_line.len < row_prefix.len + row_suffix.len) {
+        try escapeInto(w, line);
+        try w.writeByte('\n');
+        return;
+    }
+    const art = color_line[row_prefix.len .. color_line.len - row_suffix.len];
+    try w.writeAll(row_prefix);
+    try table.writeArtLineHtml(w, art, &htmlEscapeByte);
+    var i: usize = table.countCells(art);
+    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(row_suffix);
+    try w.writeByte('\n');
+}
+
+/// One-byte HTML escaper for `table.writeArtLineHtml`: escape `&<>"'`,
+/// pass glyph bytes through. Mirrors `escapeInto` per byte.
+fn htmlEscapeByte(w: *std.Io.Writer, b: u8) !void {
+    switch (b) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(b),
+    }
+}
+
+/// One borderless HTML content line for the document-style views (game
+/// detail, team): fitted to `cols` exactly like the text renderer
+/// (truncate, trailing blanks trimmed), then optional link wrapping,
+/// optional span class, newline. Column rows arrive pre-composed so text
+/// and HTML share the same strings and the visible text stays identical.
+pub fn writeHtmlLine(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const u8, cols: usize, css: ?[]const u8, link: ?[]const u8) !void {
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, cols, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    const trimmed = std.mem.trimEnd(u8, padded, " ");
+    if (link) |href| {
+        try w.writeAll("<a href=\"");
+        try escapeInto(w, href);
+        try w.writeAll("\">");
+    }
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    try escapeInto(w, trimmed);
+    if (css != null) try w.writeAll("</span>");
+    if (link != null) try w.writeAll("</a>");
+    try w.writeByte('\n');
+}
+
 /// Per-league today link shared by the static home rows and the live
 /// home rows: `/{slug}?date={day}` when a day is in hand, dateless
 /// `/{slug}` otherwise. One spelling everywhere, so the shortcut never
@@ -929,7 +1039,8 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     }
     try writeRule(w, .bottom, default_inner_width);
     try w.writeAll("Try: curl localhost:8080/mlb\n");
-    try w.writeAll("</pre><nav><a href=\"/docs\">docs</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a></nav></main></body></html>");
+    try w.writeAll("</pre><nav><a href=\"/docs\">docs</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a>");
+    try closePageWithNav(w);
     return out.toOwnedSlice();
 }
 
@@ -963,9 +1074,11 @@ pub fn homeHtmlLive(
     }
     try w.writeAll("</pre>");
     if (!quiet) {
-        try w.writeAll("<nav><a href=\"/docs\">docs</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a></nav>");
+        try w.writeAll("<nav><a href=\"/docs\">docs</a><a href=\"/openapi.json\">spec</a><a href=\"" ++ repo_url ++ "\">github</a>");
+        try closePageWithNav(w);
+    } else {
+        try w.writeAll("</main></body></html>");
     }
-    try w.writeAll("</main></body></html>");
     return out.toOwnedSlice();
 }
 
@@ -973,7 +1086,7 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     try escapeInto(w, title);
-    try w.writeAll("</title>" ++ page_style ++ "</head><body><main>");
+    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>");
 }
 
 /// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
@@ -994,8 +1107,32 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
+    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
 ;
+
+/// Footer theme toggle: no CSS, no storage dependency beyond one
+/// localStorage key. Reads the saved theme before first paint (inline
+/// in head) so there is no dark flash, then the footer link flips
+/// `data-theme` and persists it.
+const theme_script =
+    \\<script>(function(){try{var t=localStorage.getItem("sprts-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+    \\<script>function sprtsTheme(){try{var h=document.documentElement;var n=h.dataset.theme==="light"?"dark":"light";h.dataset.theme=n;localStorage.setItem("sprts-theme",n);}catch(e){}return false;}</script>
+;
+
+/// Theme toggle link appended to every page footer nav. A plain link
+/// (not a button) so it needs no button CSS and keeps the plaintext
+/// vibe; with JS off it is a harmless `#` jump.
+pub fn themeNavSuffix() []const u8 {
+    return "<a href=\"#\" onclick=\"return sprtsTheme()\">light/dark</a>";
+}
+
+/// Closing tags shared by every HTML page: theme toggle link, then
+/// nav, main, body, html. Callers write their own nav links first,
+/// then this. Keeps footers identical everywhere.
+pub fn closePageWithNav(w: *std.Io.Writer) !void {
+    try w.writeAll(themeNavSuffix());
+    try w.writeAll("</nav></main></body></html>");
+}
 
 /// CSS class matching the ANSI role for a game state: live games glow
 /// red, upcoming games read yellow, finished games stay plain.
@@ -1018,7 +1155,8 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
             try pageHead(&out.writer, "sprts error");
             try out.writer.writeAll("<pre>sprts: ");
             try escapeInto(&out.writer, message);
-            try out.writer.writeAll("</pre><nav><a href=\"/\">leagues</a></nav></main></body></html>");
+            try out.writer.writeAll("</pre><nav><a href=\"/\">leagues</a>");
+            try closePageWithNav(&out.writer);
         },
         .json => {
             try out.writer.writeAll("{\"error\":");
@@ -1253,12 +1391,24 @@ test "scoreHtml art rows stay pos-indexed and unlinked" {
     const mark = core.art.teamArt("mlb", "PHI", .xs).?;
     const first_line = mark[0..std.mem.indexOfScalar(u8, mark, '\n').?];
     if (core.art.teamArt("mlb", "NYM", .xs)) |_| {
-        // Marks exist: art row(s) must escape the mark without anchors.
-        try std.testing.expect(std.mem.indexOf(u8, page, first_line) != null);
-        var lines = std.mem.splitScalar(u8, page, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.indexOf(u8, line, first_line) != null) {
-                try std.testing.expect(std.mem.indexOf(u8, line, "<a href") == null);
+        if (core.art.teamArtColor("mlb", "PHI", .xs)) |_| {
+            // Colored marks: SGR becomes rgb spans, never raw escapes,
+            // and art rows stay link-free (spans only, no anchors).
+            try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") != null);
+            var lines = std.mem.splitScalar(u8, page, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.indexOf(u8, line, "rgb(") != null) {
+                    try std.testing.expect(std.mem.indexOf(u8, line, "<a href") == null);
+                }
+            }
+        } else {
+            // Mono marks: art row(s) must escape the mark without anchors.
+            try std.testing.expect(std.mem.indexOf(u8, page, first_line) != null);
+            var lines = std.mem.splitScalar(u8, page, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.indexOf(u8, line, first_line) != null) {
+                    try std.testing.expect(std.mem.indexOf(u8, line, "<a href") == null);
+                }
             }
         }
     }
@@ -1292,7 +1442,21 @@ test "page style is plaintext: no buttons, pre always scrolls" {
     try std.testing.expect(std.mem.indexOf(u8, page_style, "pre-wrap") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "white-space:pre;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "overflow-x:auto") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "background:#10140f") != null);
+    // Theme rides on CSS vars; the toggle flips data-theme + localStorage.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "--bg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "data-theme") != null);
+}
+
+test "footer nav ends with the theme toggle on every page" {
+    const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(scoreboard);
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "light/dark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "sprtsTheme()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "localStorage") != null);
+    const err = try errorBody(std.testing.allocator, "nope", .html);
+    defer std.testing.allocator.free(err);
+    try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
 }
 
 fn expectAlignedTable(output: []const u8) !void {

@@ -198,7 +198,8 @@ fn htmlHelp(arena: std.mem.Allocator, route: router.HelpRoute) ![]u8 {
     try render.pageHead(w, "sprts help");
     try w.writeAll("<pre>");
     try render.escapeInto(w, body);
-    try w.writeAll("</pre><nav><a href=\"/\">leagues</a><a href=\"/openapi.json\">spec</a></nav></main></body></html>");
+    try w.writeAll("</pre><nav><a href=\"/\">leagues</a><a href=\"/openapi.json\">spec</a>");
+    try render.closePageWithNav(w);
     return out.toOwnedSlice();
 }
 

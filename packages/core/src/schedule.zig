@@ -23,8 +23,8 @@ pub const TeamInfo = struct {
 };
 
 /// One schedule row from the perspective of the viewed team. `result` is a
-/// display string: `"W 4-2"` / `"L 3-5"` for finals, `"vs OPP 7:05 PM"` /
-/// `"at OPP 7:05 PM"` (UTC) for upcoming games.
+/// display string: `"W 4-2"` / `"L 3-5"` / `"D 2-2"` for finals, `"vs OPP 7:05 PM"` /
+/// `"at OPP 7:05 PM"` (US Eastern) for upcoming games.
 pub const GameRef = struct {
     id: []const u8,
     date: []const u8,
@@ -91,36 +91,44 @@ pub const ScheduleEvent = struct {
 };
 
 pub const Split = struct {
-    past: []const ScheduleEvent,
-    upcoming: []const ScheduleEvent,
+    past: []ScheduleEvent,
+    upcoming: []ScheduleEvent,
 };
 
 fn datePrefix(date: []const u8) []const u8 {
     return if (date.len >= 10) date[0..10] else date;
 }
 
-fn isPastEvent(event: ScheduleEvent, today: []const u8) bool {
-    const prefix = datePrefix(event.date);
-    if (std.mem.order(u8, prefix, today) == .lt) return true;
-    if (std.mem.order(u8, prefix, today) == .gt) return false;
-    // Same calendar day: only completed games count as past. Live (`in`)
-    // games stay upcoming so the live join can surface them.
+/// A game is past only once it is completed (`post`). Live games stay
+/// upcoming so the live join can surface them — even across UTC midnight —
+/// and postponed games (`pre` with a past date) wait in upcoming instead of
+/// filing under Last as phantom results. Completion decides, not the
+/// calendar: date-prefix bucketing once filed a live 09-08 Top-9th game
+/// under Last 5 while it was still being played on 09-09.
+fn isPastEvent(event: ScheduleEvent) bool {
+    if (std.mem.eql(u8, event.state, "in")) return false;
     return std.mem.eql(u8, event.state, "post");
 }
 
-/// Partition a date-ascending schedule into past/upcoming around `today`
-/// (`YYYY-MM-DD`). Pure and allocation-free: returns subslices.
-pub fn splitSchedule(events: []const ScheduleEvent, today: []const u8) Split {
-    var first_upcoming: usize = events.len;
-    for (events, 0..) |event, i| {
-        if (!isPastEvent(event, today)) {
-            first_upcoming = i;
-            break;
+/// Partition a schedule into completed (`state == post`) and upcoming
+/// (anything else) halves, preserving schedule order in each. Both slices
+/// are allocated from `arena`: postponed and cross-midnight live games can
+/// interleave the completed ones, so no single split point would stay
+/// correct. `today` is retained for call-site stability and ignored.
+pub fn splitSchedule(arena: std.mem.Allocator, events: []const ScheduleEvent, today: []const u8) !Split {
+    _ = today;
+    var past: std.ArrayList(ScheduleEvent) = .empty;
+    var upcoming: std.ArrayList(ScheduleEvent) = .empty;
+    for (events) |event| {
+        if (isPastEvent(event)) {
+            try past.append(arena, event);
+        } else {
+            try upcoming.append(arena, event);
         }
     }
     return .{
-        .past = events[0..first_upcoming],
-        .upcoming = events[first_upcoming..],
+        .past = try past.toOwnedSlice(arena),
+        .upcoming = try upcoming.toOwnedSlice(arena),
     };
 }
 
@@ -194,7 +202,9 @@ test "splitSchedule partitions past and upcoming around today" {
         testEvent("3", "2026-09-06T19:05Z", "pre"),
         testEvent("4", "2026-09-08T19:05Z", "pre"),
     };
-    const split = splitSchedule(&events, "2026-09-06");
+    const split = try splitSchedule(std.testing.allocator, &events, "2026-09-06");
+    defer std.testing.allocator.free(split.past);
+    defer std.testing.allocator.free(split.upcoming);
     try std.testing.expectEqual(@as(usize, 2), split.past.len);
     try std.testing.expectEqual(@as(usize, 2), split.upcoming.len);
     try std.testing.expectEqualStrings("2", split.past[1].id);
@@ -205,9 +215,32 @@ test "splitSchedule keeps live games on the upcoming side" {
     const events = [_]ScheduleEvent{
         testEvent("1", "2026-09-06T17:05Z", "in"),
     };
-    const split = splitSchedule(&events, "2026-09-06");
+    const split = try splitSchedule(std.testing.allocator, &events, "2026-09-06");
+    defer std.testing.allocator.free(split.past);
+    defer std.testing.allocator.free(split.upcoming);
     try std.testing.expectEqual(@as(usize, 0), split.past.len);
     try std.testing.expectEqual(@as(usize, 1), split.upcoming.len);
+}
+
+test "splitSchedule files by completion when dates interleave" {
+    // A postponed game (pre, past date) sits between finals and a live game
+    // that started yesterday is still `in`: neither is a result yet, so
+    // both stay upcoming even though no single split point separates them.
+    const events = [_]ScheduleEvent{
+        testEvent("ppd", "2026-09-04T19:05Z", "pre"),
+        testEvent("old", "2026-09-05T19:05Z", "post"),
+        testEvent("live", "2026-09-06T22:40Z", "in"),
+        testEvent("fut", "2026-09-08T19:05Z", "pre"),
+    };
+    const split = try splitSchedule(std.testing.allocator, &events, "2026-09-07");
+    defer std.testing.allocator.free(split.past);
+    defer std.testing.allocator.free(split.upcoming);
+    try std.testing.expectEqual(@as(usize, 1), split.past.len);
+    try std.testing.expectEqualStrings("old", split.past[0].id);
+    try std.testing.expectEqual(@as(usize, 3), split.upcoming.len);
+    try std.testing.expectEqualStrings("ppd", split.upcoming[0].id);
+    try std.testing.expectEqualStrings("live", split.upcoming[1].id);
+    try std.testing.expectEqualStrings("fut", split.upcoming[2].id);
 }
 
 test "seriesFor finds the contiguous block and counts wins" {

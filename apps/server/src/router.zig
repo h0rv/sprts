@@ -248,6 +248,17 @@ pub fn isJsonTarget(target: []const u8) bool {
     return std.mem.startsWith(u8, path, "/api/v1/");
 }
 
+/// True when a game-detail request renders the one-line fallback instead of
+/// the full box: text format plus the oneline flag (`?0`, `?oneline=1`,
+/// `?one-line=1`, and the bare `?oneline` spelling). HTML and JSON ignore
+/// `?0` and keep their full renders — team-route precedent, the flag is
+/// text-only — so `/{league}/{id}?0&format=html` and every `/api/v1/` game
+/// address stay full. Both serve paths (native `main.zig`, worker
+/// `serveDetail`) branch on this so their dispatches cannot drift.
+pub fn gameOneLine(route: GameRoute, format: Format) bool {
+    return format == .text and route.oneline;
+}
+
 /// True when the scoreboard request asks for a live SSE stream: either the
 /// `?stream=` query flag (`sse`, `1`, or `true`, case-insensitive) or an
 /// `Accept: text/event-stream` header. `parse` fills `ScoreboardRoute.stream`
@@ -611,4 +622,43 @@ test "standings routes parse before the game/team split" {
     // Unknown-league slugs still parse: the serve layer answers 404 via
     // the league lookup, so the route carries the slug verbatim.
     try std.testing.expectEqualStrings("quidditch", parse("/quidditch/standings").standings.league);
+}
+
+test "game one-line flag spellings parse on the detail route" {
+    // Exact bug-report addresses: both spellings must set the flag.
+    try std.testing.expect(parse("/mlb/401816856?0").game.oneline);
+    try std.testing.expect(parse("/mlb/401816856?oneline=1").game.oneline);
+    // The remaining spellings ride the same parseDisplay path.
+    try std.testing.expect(parse("/mlb/401816856?one-line=1").game.oneline);
+    try std.testing.expect(parse("/mlb/401816856?oneline").game.oneline);
+    try std.testing.expect(parse("/mlb/401816856?0&q").game.oneline);
+    try std.testing.expect(parse("/mlb/401816856?color=0&0").game.oneline);
+    // Off spellings stay full-box: bare, explicit 0, long-wins-over-alias.
+    try std.testing.expect(!parse("/mlb/401816856").game.oneline);
+    try std.testing.expect(!parse("/mlb/401816856?oneline=0").game.oneline);
+    try std.testing.expect(!parse("/mlb/401816856?0&oneline=0").game.oneline);
+    // The /api/v1/ twin parses the same flag (JSON by address; dispatch
+    // ignores ?0 there, covered below).
+    try std.testing.expect(parse("/api/v1/mlb/401816856?0").game.oneline);
+}
+
+test "game detail dispatch honors one-line for text only" {
+    // Dispatch-level: parse output plus formatFor feed the same predicate
+    // both serve paths branch on, so these assertions pin the renderer
+    // selection for the bug-report addresses.
+    const alias = parse("/mlb/401816856?0").game;
+    try std.testing.expect(gameOneLine(alias, formatFor("/mlb/401816856?0", "*/*")));
+    const long = parse("/mlb/401816856?oneline=1").game;
+    try std.testing.expect(gameOneLine(long, formatFor("/mlb/401816856?oneline=1", "*/*")));
+    // Bare stays full-box.
+    const bare = parse("/mlb/401816856").game;
+    try std.testing.expect(!gameOneLine(bare, formatFor("/mlb/401816856", "*/*")));
+    // ?0 combined with HTML stays full-page (team-route precedent: the flag
+    // is text-only), via Accept header and via ?format= alike.
+    try std.testing.expect(!gameOneLine(alias, formatFor("/mlb/401816856?0", "text/html")));
+    try std.testing.expect(!gameOneLine(alias, formatFor("/mlb/401816856?format=html&0", "*/*")));
+    // JSON ignores ?0 too, address-driven and Accept-driven alike.
+    const api = parse("/api/v1/mlb/401816856?0").game;
+    try std.testing.expect(!gameOneLine(api, formatFor("/api/v1/mlb/401816856?0", "*/*")));
+    try std.testing.expect(!gameOneLine(alias, formatFor("/mlb/401816856?0", "application/json")));
 }

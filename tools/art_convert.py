@@ -25,10 +25,16 @@ def load_gray(path: str | None, url: str | None):
 
 
 def load_both(path: str | None, url: str | None):
-    """Load a logo as (gray, rgba), cropped to the ink bounding box.
+    """Load a logo as (gray, rgba), normalized to a centered square.
 
     load_gray() stays the mono entry point so existing callers are
     untouched; color conversion needs the RGBA twin cropped identically.
+
+    Normalization (so every mark renders at a consistent size/position):
+    crop to the ink bounding box, paste centered on a square canvas
+    (side = max dimension), and return the square pair. Downstream
+    `grid_size` then sees identical aspect for every logo, so row counts
+    stop varying with the source image's original proportions.
     """
     from PIL import Image, ImageChops
 
@@ -44,7 +50,14 @@ def load_both(path: str | None, url: str | None):
     if bbox:
         gray = gray.crop(bbox)
         im = im.crop(bbox)
-    return gray, im
+    side = max(gray.size[0], gray.size[1])
+    if side <= 0:
+        return gray, im
+    square_gray = Image.new("L", (side, side), 255)
+    square_gray.paste(gray, ((side - gray.size[0]) // 2, (side - gray.size[1]) // 2))
+    square_rgba = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square_rgba.alpha_composite(im, ((side - im.size[0]) // 2, (side - im.size[1]) // 2))
+    return square_gray, square_rgba
 
 
 def otsu_threshold(small) -> int:

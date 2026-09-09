@@ -1,6 +1,7 @@
-//! Per-team text/HTML/JSON views built ONLY on the shared `table.zig`
-//! box primitives (`writeRow`/`writeRule`). Alignment rules live in
-//! `table.zig`; this module holds no layout logic.
+//! Per-team text/HTML/JSON views in the pipe-less document style
+//! (wttr.in spirit): fitted lines separated by blank lines, no box
+//! rules. Line fitting goes through the shared `table.writeLine` and
+//! `render.writeHtmlLine`; this module holds no layout logic.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -16,13 +17,13 @@ const tz = @import("tz.zig");
 /// caps the next tail (`+N more`); last games always show all five so the
 /// recent form reads at a glance. Empty when nothing is scheduled.
 pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     const upcoming = view.next[0..@min(view.next.len, height orelse view.next.len)];
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try table.writeRule(w, .top, inner);
-    // Team logo mark above the header when the generator has one.
+    // Team logo mark above the header when the generator has one: raw
+    // braille lines, no box, no padding (color sidecar when asked).
     if (core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark| {
         const use_mark = if (color)
             core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse mark
@@ -31,9 +32,10 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         var lines = std.mem.splitScalar(u8, use_mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            try table.writeArtRow(w, line, inner);
+            try w.writeAll(line);
+            try w.writeByte('\n');
         }
-        try table.spacerRow(w, inner);
+        try w.writeByte('\n');
     }
     {
         // one-line: header gains the zone label via `tz.labelFor` (ET default;
@@ -45,7 +47,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         else
             try std.fmt.allocPrint(allocator, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, zone_tag });
         defer allocator.free(header);
-        try table.writeRow(w, header, inner - 2, null, color);
+        try table.writeLine(w, header, cols, null, color);
     }
     if (view.team.record_summary) |record| {
         const line = if (view.team.standing_summary) |standing|
@@ -53,102 +55,137 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         else
             try std.fmt.allocPrint(allocator, "{s}", .{record});
         defer allocator.free(line);
-        try table.writeRow(w, line, inner - 2, "2", color);
+        try table.writeLine(w, line, cols, "2", color);
     } else if (view.team.standing_summary) |standing| {
-        try table.writeRow(w, standing, inner - 2, "2", color);
+        try table.writeLine(w, standing, cols, "2", color);
     }
     if (view.live) |live| {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "LIVE NOW", inner - 2, "1;31", color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "LIVE NOW", cols, "1;31", color);
         const live_line = try gameLine(allocator, live);
         defer allocator.free(live_line);
-        try table.writeRow(w, live_line, inner - 2, "1;31", color);
+        try table.writeLine(w, live_line, cols, "1;31", color);
     }
     if (view.last.len > 0) {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "Last 5:", inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Last 5:", cols, null, color);
         for (view.last) |game| {
             const line = try gameLineFull(allocator, view.league, game);
             defer allocator.free(line);
-            try table.writeRow(w, line, inner - 2, null, color);
+            try table.writeLine(w, line, cols, null, color);
         }
     }
     if (upcoming.len > 0) {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "Next 5:", inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Next 5:", cols, null, color);
         for (upcoming) |game| {
             const next_line = try gameLineFull(allocator, view.league, game);
             defer allocator.free(next_line);
-            try table.writeRow(w, next_line, inner - 2, null, color);
+            try table.writeLine(w, next_line, cols, null, color);
             if (game.probable.len > 0) {
                 const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
                 defer allocator.free(line);
-                try table.writeRow(w, line, inner - 2, "2", color);
+                try table.writeLine(w, line, cols, "2", color);
             }
         }
         if (upcoming.len < view.next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
             defer allocator.free(more);
-            try table.spacerRow(w, inner);
-            try table.writeRow(w, more, inner - 2, "2", color);
+            try table.writeLine(w, more, cols, "2", color);
         }
     } else if (view.last.len == 0 and view.live == null) {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "No games scheduled.", inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
     // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
     // absent). Each side shows up to `height orelse 5` rows with a `+N more`
     // trailer, mirroring the Next tail. Earlier continues Last newest-first;
     // Later continues Next chronological, with probable starters like Next.
     if (view.extra_past.len > 0) {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "Earlier:", inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Earlier:", cols, null, color);
         const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
         for (shown_past) |game| {
             const line = try gameLineFull(allocator, view.league, game);
             defer allocator.free(line);
-            try table.writeRow(w, line, inner - 2, null, color);
+            try table.writeLine(w, line, cols, null, color);
         }
         if (shown_past.len < view.extra_past.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
             defer allocator.free(more);
-            try table.writeRow(w, more, inner - 2, "2", color);
+            try table.writeLine(w, more, cols, "2", color);
         }
     }
     if (view.extra_next.len > 0) {
-        try table.spacerRow(w, inner);
-        try table.writeRow(w, "Later:", inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Later:", cols, null, color);
         const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
         for (shown_next) |game| {
             const next_line = try gameLineFull(allocator, view.league, game);
             defer allocator.free(next_line);
-            try table.writeRow(w, next_line, inner - 2, null, color);
+            try table.writeLine(w, next_line, cols, null, color);
             if (game.probable.len > 0) {
                 const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
                 defer allocator.free(line);
-                try table.writeRow(w, line, inner - 2, "2", color);
+                try table.writeLine(w, line, cols, "2", color);
             }
         }
         if (shown_next.len < view.extra_next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
             defer allocator.free(more);
-            try table.writeRow(w, more, inner - 2, "2", color);
+            try table.writeLine(w, more, cols, "2", color);
         }
     }
-    try table.writeRule(w, .bottom, inner);
+    // Back link to the league board, separated like any other section.
+    try w.writeByte('\n');
+    try w.print("/{s}\n", .{view.league});
     return out.toOwnedSlice();
+}
+
+/// Fit `s` to `cols` terminal cells through the shared `table.writeCell`,
+/// then strip the padding: document lines breathe instead of forming a
+/// box column. Color wraps the fitted bytes only; the padding is trimmed
+/// ahead of the reset so the SGR span survives intact.
+fn fitLine(allocator: std.mem.Allocator, s: []const u8, cols: usize, code: ?[]const u8, color: bool) ![]u8 {
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try table.writeCell(&cell.writer, s, cols, code, color);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    if (color and code != null and std.mem.endsWith(u8, padded, "\x1b[0m")) {
+        const body = std.mem.trimEnd(u8, padded[0 .. padded.len - "\x1b[0m".len], " ");
+        return std.fmt.allocPrint(allocator, "{s}\x1b[0m", .{body});
+    }
+    return allocator.dupe(u8, std.mem.trimEnd(u8, padded, " "));
 }
 
 /// One game body line. Final/live results (`"L 4-5"`, `"3-2 Top 7th"`) carry
 /// no opponent, so they get `"<date> <vs/at OPP> <result>"`; upcoming
 /// results already read `"vs OPP 7:05 PM"`, so they get `"<date> <result>"`.
 fn gameLine(allocator: std.mem.Allocator, game: schedule.GameRef) ![]u8 {
-    const date = shortDate(game.date[0..@min(game.date.len, 10)]);
+    // Eastern calendar day: ESPN instants are UTC, so an 8:20 PM ET kickoff
+    // reads as the next UTC day without this shift (matches the ET times
+    // already in `result`; `GameRef.date` itself stays a true UTC instant).
+    const day = try gameDay(allocator, game.date);
+    defer allocator.free(day);
+    const prefix = shortDate(day);
     if (std.mem.eql(u8, game.state, "pre")) {
-        return std.fmt.allocPrint(allocator, "{s} {s}", .{ date, game.result });
+        return std.fmt.allocPrint(allocator, "{s} {s}", .{ prefix, game.result });
     }
     const versus = if (std.mem.eql(u8, game.home_away, "away")) "at" else "vs";
-    return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ date, versus, game.opponent_abbrev, game.result });
+    return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ prefix, versus, game.opponent_abbrev, game.result });
+}
+
+/// Eastern calendar day (`YYYY-MM-DD`) for a schedule instant: full UTC
+/// timestamps shift to the Eastern day, date-only strings pass through.
+/// Fallback (never errors): unknown shapes keep their raw prefix. Pair
+/// with `shortDate` for the `MM-DD` line prefix, or with `tz.labelFor`
+/// for the `M/D ZONE` header tag.
+fn gameDay(allocator: std.mem.Allocator, iso: []const u8) ![]u8 {
+    if (core.date.parseTimestampUTC(iso)) |epoch| {
+        return core.date.todayInTz(allocator, epoch, core.date.etOffsetMinutes(epoch));
+    }
+    return allocator.dupe(u8, iso[0..@min(iso.len, 10)]);
 }
 
 /// Short date: `2026-09-08` becomes `09-08`. Matches render.zig's
@@ -171,10 +208,9 @@ fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, game: schedule
 /// HTML view: same sections as text (logo, header, live, last 5, next 5),
 /// never ANSI, with links. Schedule rows link to their game views; the
 /// nav mirrors the scoreboard pages. Logo marks render as plain braille
-/// (no SGR in HTML): `renderText(mono)` body is only the fallback for
-/// sections this builder does not re-emit.
+/// (no SGR in HTML). Sections breathe through blank lines, never rules.
 pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_slug: []const u8, width: ?u16, height: ?u16) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     const upcoming = view.next[0..@min(view.next.len, height orelse view.next.len)];
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -183,14 +219,19 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
     defer allocator.free(title);
     try render.pageHead(w, title);
     try w.writeAll("<pre>");
-    try render.writeRule(w, .top, inner);
-    if (core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark| {
+    // Colored logo mark as HTML rows: SGR runs become rgb spans via
+    // `table.writeArtLineHtml` (mono marks emit plain glyphs). No box,
+    // no padding — art lines are ragged by nature.
+    if (core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse
+        core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark|
+    {
         var lines = std.mem.splitScalar(u8, mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            try render.writeArtRow(w, line, inner);
+            try table.writeArtLineHtml(w, line, escapeByte);
+            try w.writeByte('\n');
         }
-        try htmlSpacer(w, inner);
+        try w.writeByte('\n');
     }
     {
         // one-line: header gains the zone label via `tz.labelFor` (ET default; see renderText).
@@ -201,7 +242,7 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         else
             try std.fmt.allocPrint(allocator, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, zone_tag });
         defer allocator.free(header);
-        try writeHtmlCell(allocator, header, null, inner, w);
+        try render.writeHtmlLine(w, allocator, header, cols, null, null);
     }
     if (view.team.record_summary) |record| {
         const line = if (view.team.standing_summary) |standing|
@@ -209,131 +250,112 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
         else
             try std.fmt.allocPrint(allocator, "{s}", .{record});
         defer allocator.free(line);
-        try writeHtmlCell(allocator, line, "dim", inner, w);
+        try render.writeHtmlLine(w, allocator, line, cols, "dim", null);
     } else if (view.team.standing_summary) |standing| {
-        try writeHtmlCell(allocator, standing, "dim", inner, w);
+        try render.writeHtmlLine(w, allocator, standing, cols, "dim", null);
     }
     if (view.live) |live| {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "LIVE NOW", "live", inner, w);
-        try teamGameHtml(allocator, w, league_slug, live, "live", inner);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "LIVE NOW", cols, "live", null);
+        try teamGameHtml(allocator, w, league_slug, live, "live", cols);
     }
     if (view.last.len > 0) {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "Last 5:", null, inner, w);
-        for (view.last) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Last 5:", cols, null, null);
+        for (view.last) |game| try teamGameHtml(allocator, w, league_slug, game, null, cols);
     }
     if (upcoming.len > 0) {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "Next 5:", null, inner, w);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Next 5:", cols, null, null);
         for (upcoming) |game| {
-            try teamGameHtml(allocator, w, league_slug, game, null, inner);
+            try teamGameHtml(allocator, w, league_slug, game, null, cols);
             if (game.probable.len > 0) {
                 const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
                 defer allocator.free(line);
-                try writeHtmlCell(allocator, line, "dim", inner, w);
+                try render.writeHtmlLine(w, allocator, line, cols, "dim", null);
             }
         }
         if (upcoming.len < view.next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.next.len - upcoming.len});
             defer allocator.free(more);
-            try htmlSpacer(w, inner);
-            try writeHtmlCell(allocator, more, "dim", inner, w);
+            try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
     } else if (view.last.len == 0 and view.live == null) {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "No games scheduled.", null, inner, w);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "No games scheduled.", cols, null, null);
     }
     // depth: full-season overflow beyond Last/Next 5 (optional; skipped when
     // absent). Same caps and trailers as text; rows link to game views.
     if (view.extra_past.len > 0) {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "Earlier:", null, inner, w);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Earlier:", cols, null, null);
         const shown_past = view.extra_past[0..@min(view.extra_past.len, @as(usize, height orelse 5))];
-        for (shown_past) |game| try teamGameHtml(allocator, w, league_slug, game, null, inner);
+        for (shown_past) |game| try teamGameHtml(allocator, w, league_slug, game, null, cols);
         if (shown_past.len < view.extra_past.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_past.len - shown_past.len});
             defer allocator.free(more);
-            try writeHtmlCell(allocator, more, "dim", inner, w);
+            try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
     }
     if (view.extra_next.len > 0) {
-        try htmlSpacer(w, inner);
-        try writeHtmlCell(allocator, "Later:", null, inner, w);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Later:", cols, null, null);
         const shown_next = view.extra_next[0..@min(view.extra_next.len, @as(usize, height orelse 5))];
         for (shown_next) |game| {
-            try teamGameHtml(allocator, w, league_slug, game, null, inner);
+            try teamGameHtml(allocator, w, league_slug, game, null, cols);
             if (game.probable.len > 0) {
                 const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
                 defer allocator.free(line);
-                try writeHtmlCell(allocator, line, "dim", inner, w);
+                try render.writeHtmlLine(w, allocator, line, cols, "dim", null);
             }
         }
         if (shown_next.len < view.extra_next.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{view.extra_next.len - shown_next.len});
             defer allocator.free(more);
-            try writeHtmlCell(allocator, more, "dim", inner, w);
+            try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
     }
-    try render.writeRule(w, .bottom, inner);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}\">scores</a>", .{league_slug});
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ league_slug, view.team.abbrev });
-    try w.writeAll("</nav></main></body></html>");
+    try render.closePageWithNav(w);
     return out.toOwnedSlice();
 }
 
-/// One schedule row as HTML: `│ <a>line</a> │` linking to the game view.
+/// One schedule row as HTML: the fitted line linking to the game view.
 /// Empty ids (should not happen; the provider always sets one) render
-/// as a plain row rather than a dead link.
-fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, game: schedule.GameRef, css: ?[]const u8, inner: usize) !void {
+/// as a plain line rather than a dead link.
+fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
     const line = try gameLine(allocator, game);
     defer allocator.free(line);
-    try w.writeAll("│ ");
+    const trimmed = try fitLine(allocator, line, cols, null, false);
+    defer allocator.free(trimmed);
     if (game.id.len > 0) {
         try w.print("<a href=\"/{s}/{s}\">", .{ league, game.id });
     }
-    var cell: std.Io.Writer.Allocating = .init(allocator);
-    defer cell.deinit();
-    try render.writeCell(&cell.writer, line, inner - 2, null, false);
-    const padded = try cell.toOwnedSlice();
-    defer allocator.free(padded);
     if (css) |class| {
         try w.writeAll("<span class=\"");
         try w.writeAll(class);
         try w.writeAll("\">");
     }
-    try render.escapeInto(w, padded);
+    try render.escapeInto(w, trimmed);
     if (css != null) try w.writeAll("</span>");
     if (game.id.len > 0) try w.writeAll("</a>");
-    try w.writeAll(" │\n");
+    try w.writeByte('\n');
 }
 
-/// Blank spacer row for the HTML team view: borders with nothing
-/// between, matching the text view's `table.spacerRow` rhythm.
-fn htmlSpacer(w: *std.Io.Writer, inner: usize) !void {
-    try w.writeAll("│ ");
-    var i: usize = 0;
-    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    try w.writeAll(" │\n");
-}
 
-/// Padded + escaped cell with optional color span, no borders or link.
-fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer) !void {
-    try w.writeAll("│ ");
-    if (css) |class| {
-        try w.writeAll("<span class=\"");
-        try w.writeAll(class);
-        try w.writeAll("\">");
+/// One-byte HTML escaper for `table.writeArtLineHtml`: escape `&<>"'`,
+/// pass glyph bytes through. Mirrors `render.escapeInto` per byte.
+fn escapeByte(w: *std.Io.Writer, b: u8) !void {
+    switch (b) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(b),
     }
-    var cell: std.Io.Writer.Allocating = .init(allocator);
-    defer cell.deinit();
-    try render.writeCell(&cell.writer, s, inner - 2, null, false);
-    const padded = try cell.toOwnedSlice();
-    defer allocator.free(padded);
-    try render.escapeInto(w, padded);
-    if (css != null) try w.writeAll("</span>");
-    try w.writeAll(" │\n");
 }
 
 /// JSON view. Validated through the shared `render.validatedJson` gate —
@@ -439,15 +461,23 @@ test "team text honors height and colors live rows" {
 
 test "team text renders an empty view and honors width" {
     const empty: schedule.TeamView = .{
-        .league = "mlb",
+        // Artless league: no mark precedes the header, so the header
+        // opens the pipe-less page.
+        .league = "zzz",
         .league_name = "MLB",
         .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
     };
     const output = try renderText(std.testing.allocator, empty, false, 80, null);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "No games scheduled.") != null);
-    const eol = std.mem.indexOfScalar(u8, output, '\n').?;
-    try std.testing.expectEqual(@as(usize, 3 + 78 * 3 + 3), eol);
+    try std.testing.expect(std.mem.startsWith(u8, output, "Philadelphia Phillies (PHI)\n"));
+    _ = try std.unicode.Utf8View.init(output);
+    // Width honored: every fitted line stays within the 80 columns.
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(table.textCells(line) <= 80);
+    }
 }
 
 test "team HTML links and never carries ANSI" {
@@ -462,8 +492,13 @@ test "team HTML links and never carries ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "Next 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/PHI\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
-    // Sections breathe through blank spacer rows, never mid rules.
-    try std.testing.expect(std.mem.indexOf(u8, page, "├") == null);
+    // Pipe-less like text: no rules or borders anywhere.
+    for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, page, rule) == null);
+    }
+    // Colored logo: SGR runs become rgb spans, never raw escapes.
+    try std.testing.expect(std.mem.indexOf(u8, page, "38;5;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span style=\"color:rgb(") != null);
 
     const err = try @import("render.zig").errorBody(std.testing.allocator, "unknown team; see /api/v1/leagues", .html);
     defer std.testing.allocator.free(err);
@@ -566,19 +601,25 @@ fn writeResults(w: *std.Io.Writer, games: []const schedule.GameRef) !void {
     }
 }
 
-// one-line: header-hook day (next game first, then live, then first last);
-// null when the view carries no games.
+// one-line: header-hook instant (next game first, then live, then first last);
+// null when the view carries no games. Full timestamp (not the date
+// prefix) so `zoneTag` can shift evening games to the Eastern day.
 fn zoneDayFor(view: schedule.TeamView) ?[]const u8 {
-    if (view.next.len > 0) return view.next[0].date[0..@min(view.next[0].date.len, 10)];
-    if (view.live) |live| return live.date[0..@min(live.date.len, 10)];
-    if (view.last.len > 0) return view.last[0].date[0..@min(view.last[0].date.len, 10)];
+    if (view.next.len > 0) return view.next[0].date;
+    if (view.live) |live| return live.date;
+    if (view.last.len > 0) return view.last[0].date;
     return null;
 }
 
 // one-line: `M/D ZONE` header tag via `tz.labelFor` (ET default), or "" when dateless.
+// The hook day is an ESPN UTC instant; shift to the Eastern calendar day
+// first so evening games tag the day they were played, not the next UTC
+// morning (same shift as `gameLine`).
 fn zoneTag(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
     const day = zoneDayFor(view) orelse return allocator.dupe(u8, "");
-    return tz.labelFor(allocator, day, .et);
+    const et = try gameDay(allocator, day);
+    defer allocator.free(et);
+    return tz.labelFor(allocator, et, .et);
 }
 
 // one-line: tests (append-only block; box tests above belong to views-depth).
@@ -610,6 +651,46 @@ test "team one-line honors quiet framing and strips color when off" {
     const bare = try renderTextOneLine(std.testing.allocator, empty, false, false);
     defer std.testing.allocator.free(bare);
     try std.testing.expectEqualStrings("PHI | Last: none | Next: none\n", bare);
+}
+
+test "team game lines and zone tag use the Eastern calendar day" {
+    // 2026-09-14T00:20Z is Sept 13, 8:20 PM ET: the UTC date prefix alone
+    // would read 09-14. GameRef.date stays the true instant; display shifts.
+    const late = schedule.GameRef{
+        .id = "x",
+        .date = "2026-09-14T00:20Z",
+        .opponent_abbrev = "NYG",
+        .opponent_name = "New York Giants",
+        .home_away = "away",
+        .status = "9/13 - 8:20 PM EDT",
+        .state = "pre",
+        .result = "vs NYG 8:20 PM",
+    };
+    const line = try gameLine(std.testing.allocator, late);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.startsWith(u8, line, "09-13 "));
+    // Date-only strings (no time to shift) pass through untouched.
+    const dated = schedule.GameRef{
+        .id = "y",
+        .date = "2026-09-08",
+        .opponent_abbrev = "NYG",
+        .opponent_name = "New York Giants",
+        .home_away = "home",
+        .status = "Final",
+        .state = "post",
+        .result = "W 5-3",
+    };
+    const line2 = try gameLine(std.testing.allocator, dated);
+    defer std.testing.allocator.free(line2);
+    try std.testing.expect(std.mem.startsWith(u8, line2, "09-08 "));
+    // The header tag shifts too: next game is the 8:20 PM ET kickoff.
+    var view = testView();
+    view.live = null;
+    view.last = &.{};
+    view.next = &.{late};
+    const tag = try zoneTag(std.testing.allocator, view);
+    defer std.testing.allocator.free(tag);
+    try std.testing.expectEqualStrings("9/13 ET", tag);
 }
 
 test "team box headers carry the zone label" {
@@ -665,14 +746,17 @@ test "team depth overflow renders earlier and later with data, skips without" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Probable: Ranger Suarez") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(output);
-    // Section rows keep the box borders so alignment holds.
+    // Pipe-less document style: rows carry the fitted line only, with
+    // no box borders anywhere in the page.
+    for ([_][]const u8{ "│", "┌", "└", "├", "─" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, output, rule) == null);
+    }
     var lines = std.mem.splitScalar(u8, output, '\n');
     var found = false;
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, "/mlb/fut1") == null) continue;
         found = true;
-        try std.testing.expect(std.mem.startsWith(u8, line, "│ "));
-        try std.testing.expect(std.mem.endsWith(u8, line, " │"));
+        try std.testing.expectEqualStrings("09-09 vs NYM 3:05 PM  /mlb/fut1", line);
     }
     try std.testing.expect(found);
 
@@ -739,3 +823,4 @@ test "team depth overflow rides the json wire format additively" {
     try std.testing.expectEqual(@as(usize, 0), legacy.extra_past.len);
     try std.testing.expectEqual(@as(usize, 0), legacy.extra_next.len);
 }
+

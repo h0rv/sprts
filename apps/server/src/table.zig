@@ -216,6 +216,24 @@ pub fn writeRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u
     try w.writeAll(" │\n");
 }
 
+/// One borderless content line: `s` fitted to `width` cells (truncate at
+/// a code-point boundary with an ellipsis when too long, never padded),
+/// optional SGR around the fitted bytes only, then a newline. The
+/// document-style views (game detail, team) build from these with blank
+/// lines between sections instead of rules; the scoreboard keeps the box.
+/// Column rows compose `writeCell`/`writeCellRight` in a buffer first
+/// (their padding is interior there), trim trailing blanks, and emit the
+/// buffer with a plain write plus newline.
+pub fn writeLine(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
+    const end, const ellipsis = fit(s, width);
+    const use_color = color and code != null;
+    if (use_color) try w.print("\x1b[{s}m", .{code.?});
+    try writeSanitized(w, s[0..end]);
+    if (ellipsis) try w.writeAll("…");
+    if (use_color) try w.writeAll("\x1b[0m");
+    try w.writeByte('\n');
+}
+
 pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     const left: []const u8 = switch (which) {
         .top => "┌",
@@ -372,12 +390,78 @@ fn parseXtermIndex(seq: []const u8) ?u8 {
     return @intCast(n);
 }
 
+/// Copy a colored mark line to HTML: each SGR `38;5;N` run becomes an
+/// rgb span, resets close the open span. Glyph bytes escape via `esc`.
+/// `esc` escapes one byte (`&<>"'`); the caller supplies render's
+/// escapeCellInto-compatible shim. Uncolored lines emit plain glyphs.
+pub fn writeArtLineHtml(
+    w: *std.Io.Writer,
+    line: []const u8,
+    esc: *const fn (*std.Io.Writer, u8) anyerror!void,
+) !void {
+    var buf: [64]u8 = undefined;
+    var open = false;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and line[j] != 'm') : (j += 1) {}
+            if (j >= line.len) return;
+            const seq = line[i .. j + 1];
+            if (parseXtermIndex(seq)) |idx| {
+                if (open) try w.writeAll("</span>");
+                const rgb = xtermRgb(idx);
+                const span = std.fmt.bufPrint(&buf, "<span style=\"color:rgb({d},{d},{d})\">", .{ rgb[0], rgb[1], rgb[2] }) catch unreachable;
+                try w.writeAll(span);
+                open = true;
+            } else {
+                if (open) {
+                    try w.writeAll("</span>");
+                    open = false;
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        try esc(w, line[i]);
+        i += 1;
+    }
+    if (open) try w.writeAll("</span>");
+}
+
 pub fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     try w.writeAll("│ ");
     try writeContrastLine(w, line);
     var i: usize = countCells(line);
     while (i < inner - 2) : (i += 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
+}
+
+/// One braille art row as HTML: SGR color runs become rgb spans via
+/// `writeArtLineHtml`, uncolored glyphs pass through escaped. Padding
+/// uses visible cells so the frame aligns with the text renderer.
+pub fn writeArtRowHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, line: []const u8, inner: usize) !void {
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeArtLineHtml(&cell.writer, line, escapeByte);
+    const frag = try cell.toOwnedSlice();
+    defer allocator.free(frag);
+    try w.writeAll("│ ");
+    try w.writeAll(frag);
+    var i: usize = countCells(line);
+    while (i < inner - 2) : (i += 1) try w.writeByte(' ');
+    try w.writeAll(" │\n");
+}
+
+fn escapeByte(w: *std.Io.Writer, b: u8) !void {
+    switch (b) {
+        '&' => try w.writeAll("&amp;"),
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '"' => try w.writeAll("&quot;"),
+        '\'' => try w.writeAll("&#39;"),
+        else => try w.writeByte(b),
+    }
 }
 
 /// Both teams' marks side by side at `.xs`: a horizontal card instead of

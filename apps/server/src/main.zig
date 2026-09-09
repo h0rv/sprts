@@ -291,11 +291,13 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             cache_state = @tagName(cached.outcome);
             status = .ok;
             const game_detail = cached.data.detail;
-            const body = switch (format) {
-                .text => if (game_route.oneline)
-                    try server_app.detail_view.renderTextOneLine(arena, game_detail, game_route.color orelse color_default, game_route.quiet)
-                else
-                    try server_app.detail_view.renderText(arena, game_detail, game_route.color orelse color_default, game_route.width, game_route.height),
+            // One-line fallback via the shared predicate: text + ?0 selects
+            // renderTextOneLine, every other combination keeps the full box
+            // (html/json ignore ?0 by team-route precedent).
+            const body = if (server_app.router.gameOneLine(game_route, format))
+                try server_app.detail_view.renderTextOneLine(arena, game_detail, game_route.color orelse color_default, game_route.quiet)
+            else switch (format) {
+                .text => try server_app.detail_view.renderText(arena, game_detail, game_route.color orelse color_default, game_route.width, game_route.height),
                 .html => try server_app.detail_view.detailHtml(arena, game_detail, game_route.width, game_route.height),
                 .json => try server_app.detail_view.json(arena, game_detail),
             };

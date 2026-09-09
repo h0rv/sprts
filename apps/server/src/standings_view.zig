@@ -135,7 +135,7 @@ pub fn html(
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}\">scores</a>", .{st.league});
     try w.print("<a href=\"/api/v1/{s}/standings\">json</a>", .{st.league});
-    try w.writeAll("</nav></main></body></html>");
+    try render.closePageWithNav(w);
     return out.toOwnedSlice();
 }
 

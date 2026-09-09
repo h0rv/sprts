@@ -1,11 +1,11 @@
-//! Per-game detail renderer (wt-detail).
+//! Per-game detail renderer: a pipe-less document, not a box grid.
 //!
-//! Built ONLY on the shared `table.zig` box primitives (`writeCell`,
-//! `writeRow`, `writeRule`, `writeCellRight`, `fit`). Layout mirrors the
-//! scoreboard box rules (52-min columns, `+N more` trailer for scoring
-//! plays via `height`): header (teams + score + status + venue/attendance),
-//! linescore grid (period columns + R/H/E), live situation chip, decisions
-//! + probables, scoring plays (latest 5), series line.
+//! Built on the shared `table.zig` cell primitives (`writeCell`,
+//! `writeCellRight`, `writeLine`, `textCells`) plus small local composers
+//! that column-align each section (participants, scoring plays, leaders,
+//! stats). Sections breathe through blank lines, wttr.in-style; the
+//! scoreboard keeps the box, documents don't. Text and HTML share every
+//! composed string so the two can never drift.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -17,11 +17,6 @@ const table = @import("table.zig");
 const tz = @import("tz.zig");
 const writeCell = table.writeCell;
 const writeCellRight = table.writeCellRight;
-const writeRow = table.writeRow;
-const writeRule = table.writeRule;
-
-/// Classic box: 52 terminal columns, 50 between the borders.
-const default_inner_width = 50;
 
 pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
     // Validated through the shared `render.validatedJson` gate — see it
@@ -31,303 +26,250 @@ pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
     return render.validatedJson(detail.GameDetail, allocator, game);
 }
 
-/// `width` is total terminal columns; the borders take 2. Never shrinks
-/// below the classic 52-wide box. `height` caps the scoring plays listed
+/// `width` is total terminal columns of the document. Never shrinks below
+/// the classic 52-wide page. `height` caps the scoring plays listed
 /// (`+N more` trailer); null/0 = latest 5.
+///
+/// Pipe-less by design: the page reads as aligned prose with blank lines
+/// between sections (wttr.in-style), not a box grid. Column rows
+/// (participants, scoring plays, leaders, stats) share composers with
+/// `detailHtml` so text and HTML can never drift.
 pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: bool, width: ?u16, height: ?u16) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try writeRule(w, .top, inner);
     // one-line: heading gains the zone label via `tz.labelFor` (ET default;
     // `?tz=` plumbing stays in main/worker, which this task must not touch).
     const zone_label = try tz.labelFor(allocator, game.date, .et);
     defer allocator.free(zone_label);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s} ({s})", .{ game.league_name, game.date, zone_label });
     defer allocator.free(heading);
-    try writeRow(w, heading, inner - 2, "2", color);
-    try writeRule(w, .mid, inner);
-    try writeRow(w, game.status, inner - 2, statusColor(game.state), color);
-    for (game.participants) |entry| {
-        try writeDetailParticipantRow(w, entry, color, inner);
+    try table.writeLine(w, heading, cols, "2", color);
+    try table.writeLine(w, game.status, cols, statusColor(game.state), color);
+    const plines = try participantLines(allocator, game.participants, cols);
+    defer freeLines(allocator, plines);
+    for (plines, game.participants) |line, entry| {
+        if (color and entry.winner) try w.writeAll("\x1b[32m");
+        try w.writeAll(line);
+        if (color and entry.winner) try w.writeAll("\x1b[0m");
+        try w.writeByte('\n');
     }
     if (game.venue) |venue| {
+        try w.writeByte('\n');
         if (game.attendance) |crowd| {
             const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
             defer allocator.free(line);
-            try writeRow(w, line, inner - 2, null, color);
+            try table.writeLine(w, line, cols, null, color);
         } else {
-            try writeRow(w, venue, inner - 2, null, color);
+            try table.writeLine(w, venue, cols, null, color);
         }
     } else if (game.attendance) |crowd| {
+        try w.writeByte('\n');
         const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
         defer allocator.free(line);
-        try writeRow(w, line, inner - 2, null, color);
+        try table.writeLine(w, line, cols, null, color);
     }
     if (maxPeriod(game) > 0) {
-        try writeRule(w, .mid, inner);
-        try writeLineScore(w, allocator, game, inner, color);
+        try w.writeByte('\n');
+        const grid = try lineScoreLines(allocator, game);
+        defer freeLines(allocator, grid);
+        for (grid, 0..) |line, i| {
+            const mark: ?[]const u8 = if (i == 0) "2" else if (i - 1 < game.participants.len and game.participants[i - 1].winner) "32" else null;
+            try table.writeLine(w, line, cols, mark, color);
+        }
     }
     if (game.situation) |situation| {
-        try writeRule(w, .mid, inner);
+        try w.writeByte('\n');
         const chip = try situationText(allocator, situation);
         defer allocator.free(chip);
-        try writeRow(w, chip, inner - 2, "1;31", color);
-        if (situation.last_play) |last| try writeRow(w, last, inner - 2, null, color);
+        try table.writeLine(w, chip, cols, "1;31", color);
+        if (situation.last_play) |last| try table.writeLine(w, last, cols, null, color);
     }
     if (game.decisions.len > 0 or hasProbables(game)) {
-        try writeRule(w, .mid, inner);
+        try w.writeByte('\n');
         for (game.decisions) |decision| {
             const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ decision.outcome, decision.name });
             defer allocator.free(line);
-            try writeRow(w, line, inner - 2, null, color);
+            try table.writeLine(w, line, cols, null, color);
         }
         for (game.participants) |entry| {
             if (entry.probable) |starter| {
                 const line = try std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ entry.abbreviation, starter });
                 defer allocator.free(line);
-                try writeRow(w, line, inner - 2, null, color);
+                try table.writeLine(w, line, cols, null, color);
             }
         }
     }
     if (game.scoring_plays.len > 0) {
-        try writeRule(w, .mid, inner);
-        try writeRow(w, "Scoring plays", inner - 2, "2", color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Scoring plays", cols, "2", color);
         const limit: usize = @min(height orelse 5, game.scoring_plays.len);
         const start = game.scoring_plays.len - limit;
-        for (game.scoring_plays[start..]) |play| {
-            const line = try std.fmt.allocPrint(allocator, "{s} {s}-{s} {s}", .{ play.period, play.away_score, play.home_score, play.text });
-            defer allocator.free(line);
-            try writeRow(w, line, inner - 2, null, color);
+        const rows = try scoringLines(allocator, game.scoring_plays[start..], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
         }
         if (start > 0) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{start});
             defer allocator.free(more);
-            try writeRow(w, more, inner - 2, "2", color);
+            try table.writeLine(w, more, cols, "2", color);
         }
     }
     if (game.leaders.len > 0) {
-        try writeRule(w, .mid, inner);
-        try writeRow(w, "Leaders", inner - 2, "2", color);
-        for (game.leaders[0..@min(game.leaders.len, 8)]) |leader| {
-            try writeRow(w, leader, inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Leaders", cols, "2", color);
+        const rows = try keyValueLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
         }
     }
     if (game.series) |series| {
-        try writeRule(w, .mid, inner);
+        try w.writeByte('\n');
         const series_line = try std.fmt.allocPrint(allocator, "Series: {s}", .{series});
         defer allocator.free(series_line);
-        try writeRow(w, series_line, inner - 2, null, color);
+        try table.writeLine(w, series_line, cols, null, color);
     }
     // depth: box-score team totals (optional; skipped when the provider
     // supplies none). Capped like Leaders: first 8 lines, no trailer.
     if (game.team_stats.len > 0) {
-        try writeRule(w, .mid, inner);
-        try writeRow(w, "Team stats", inner - 2, "2", color);
-        for (game.team_stats[0..@min(game.team_stats.len, 8)]) |stat| {
-            try writeRow(w, stat, inner - 2, null, color);
+        try w.writeByte('\n');
+        try table.writeLine(w, "Team stats", cols, "2", color);
+        const rows = try keyValueLines(allocator, game.team_stats[0..@min(game.team_stats.len, 8)], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
         }
     }
-    try writeRule(w, .bottom, inner);
+    try w.writeByte('\n');
     const back = try std.fmt.allocPrint(allocator, "/{s}?date={s}\n", .{ game.league, game.date });
     defer allocator.free(back);
     try w.writeAll(back);
     return out.toOwnedSlice();
 }
 
-/// Minimal browser page: section-by-section like the text renderer,
-/// never ANSI, with links. The status row links back to the league
-/// scoreboard; each participant row links to its team view. Colors ride
-/// as spans (live/upcoming/winner) so the web matches the terminal.
+/// Browser page mirroring `renderText` line for line: the same composed
+/// strings, real links, state colors as spans. Blank lines breathe where
+/// the text page breathes; no rules, no borders.
 pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: ?u16, height: ?u16) ![]u8 {
-    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    const cols: usize = @min(@max(width orelse 52, 52), 200);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     const title = try std.fmt.allocPrint(allocator, "{s} game detail", .{game.league_name});
     defer allocator.free(title);
-    try pageHead(w, title);
+    try render.pageHead(w, title);
     try w.writeAll("<pre>");
     // one-line: heading gains the zone label via `tz.labelFor` (ET default; see renderText).
     const zone_label = try tz.labelFor(allocator, game.date, .et);
     defer allocator.free(zone_label);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s} ({s})", .{ game.league_name, game.date, zone_label });
     defer allocator.free(heading);
-    try htmlRow(allocator, heading, "dim", inner, w, null);
+    try render.writeHtmlLine(w, allocator, heading, cols, "dim", null);
     const status_href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ game.league, game.date });
     defer allocator.free(status_href);
-    try htmlRow(allocator, game.status, stateClass(game.state), inner, w, status_href);
-    for (game.participants) |entry| {
-        const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ game.league, entry.abbreviation });
-        defer allocator.free(href);
-        const row = try participantLine(allocator, entry, inner);
-        defer allocator.free(row);
-        try htmlRow(allocator, row, if (entry.winner) "win" else null, inner, w, href);
+    try render.writeHtmlLine(w, allocator, game.status, cols, stateClass(game.state), status_href);
+    const plines = try participantLines(allocator, game.participants, cols);
+    defer freeLines(allocator, plines);
+    for (plines, game.participants) |line, entry| {
+        const href = if (entry.abbreviation.len > 0)
+            try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ game.league, entry.abbreviation })
+        else
+            null;
+        defer if (href) |h| allocator.free(h);
+        try render.writeHtmlLine(w, allocator, line, cols, if (entry.winner) "win" else null, href);
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.venue) |venue| {
+        try w.writeByte('\n');
         if (game.attendance) |crowd| {
             const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
             defer allocator.free(line);
-            try htmlRow(allocator, line, null, inner, w, null);
+            try render.writeHtmlLine(w, allocator, line, cols, null, null);
         } else {
-            try htmlRow(allocator, venue, null, inner, w, null);
+            try render.writeHtmlLine(w, allocator, venue, cols, null, null);
         }
     } else if (game.attendance) |crowd| {
+        try w.writeByte('\n');
         const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
         defer allocator.free(line);
-        try htmlRow(allocator, line, null, inner, w, null);
+        try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (maxPeriod(game) > 0) {
-        const line = try lineScoreLine(allocator, game, inner);
-        defer allocator.free(line);
-        try htmlRow(allocator, line, null, inner, w, null);
+        try w.writeByte('\n');
+        const grid = try lineScoreLines(allocator, game);
+        defer freeLines(allocator, grid);
+        for (grid, 0..) |line, i| {
+            const css: ?[]const u8 = if (i == 0) "dim" else if (i - 1 < game.participants.len and game.participants[i - 1].winner) "win" else null;
+            try render.writeHtmlLine(w, allocator, line, cols, css, null);
+        }
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.situation) |situation| {
+        try w.writeByte('\n');
         const chip = try situationText(allocator, situation);
         defer allocator.free(chip);
-        try htmlRow(allocator, chip, "live", inner, w, null);
-        if (situation.last_play) |last| try htmlRow(allocator, last, null, inner, w, null);
+        try render.writeHtmlLine(w, allocator, chip, cols, "live", null);
+        if (situation.last_play) |last| try render.writeHtmlLine(w, allocator, last, cols, null, null);
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.decisions.len > 0 or hasProbables(game)) {
+        try w.writeByte('\n');
         for (game.decisions) |decision| {
             const line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ decision.outcome, decision.name });
             defer allocator.free(line);
-            try htmlRow(allocator, line, null, inner, w, null);
+            try render.writeHtmlLine(w, allocator, line, cols, null, null);
         }
         for (game.participants) |entry| {
             if (entry.probable) |starter| {
                 const line = try std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ entry.abbreviation, starter });
                 defer allocator.free(line);
-                try htmlRow(allocator, line, null, inner, w, null);
+                try render.writeHtmlLine(w, allocator, line, cols, null, null);
             }
         }
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.scoring_plays.len > 0) {
-        try htmlRow(allocator, "Scoring plays", "dim", inner, w, null);
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Scoring plays", cols, "dim", null);
         const limit: usize = @min(height orelse 5, game.scoring_plays.len);
         const start = game.scoring_plays.len - limit;
-        for (game.scoring_plays[start..]) |play| {
-            const line = try std.fmt.allocPrint(allocator, "{s} {s}-{s} {s}", .{ play.period, play.away_score, play.home_score, play.text });
-            defer allocator.free(line);
-            try htmlRow(allocator, line, null, inner, w, null);
-        }
+        const rows = try scoringLines(allocator, game.scoring_plays[start..], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
         if (start > 0) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more", .{start});
             defer allocator.free(more);
-            try htmlRow(allocator, more, "dim", inner, w, null);
+            try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.leaders.len > 0) {
-        try htmlRow(allocator, "Leaders", "dim", inner, w, null);
-        for (game.leaders[0..@min(game.leaders.len, 8)]) |leader| {
-            try htmlRow(allocator, leader, null, inner, w, null);
-        }
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Leaders", cols, "dim", null);
+        const rows = try keyValueLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     if (game.series) |series| {
+        try w.writeByte('\n');
         const series_line = try std.fmt.allocPrint(allocator, "Series: {s}", .{series});
         defer allocator.free(series_line);
-        try htmlRow(allocator, series_line, null, inner, w, null);
+        try render.writeHtmlLine(w, allocator, series_line, cols, null, null);
     }
-    try w.writeAll("│ ");
-    {
-        var i: usize = 0;
-        while (i < inner - 2) : (i += 1) try w.writeByte(' ');
-    }
-    try w.writeAll(" │\n");
     // depth: box-score team totals (optional; skipped when absent).
     if (game.team_stats.len > 0) {
-        try htmlRow(allocator, "Team stats", "dim", inner, w, null);
-        for (game.team_stats[0..@min(game.team_stats.len, 8)]) |stat| {
-            try htmlRow(allocator, stat, null, inner, w, null);
-        }
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Team stats", cols, "dim", null);
+        const rows = try keyValueLines(allocator, game.team_stats[0..@min(game.team_stats.len, 8)], cols);
+        defer freeLines(allocator, rows);
+        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}?date={s}\">scores</a>", .{ game.league, game.date });
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ game.league, game.id });
-    try w.writeAll("</nav></main></body></html>");
+    try render.closePageWithNav(w);
     return out.toOwnedSlice();
-}
-
-/// One HTML table row: padded + escaped cell with optional color span
-/// and link. Mirrors render.zig's writeHtmlTable (kept local: those
-/// helpers are private to render.zig, see the module doc).
-fn htmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
-    try w.writeAll("│ ");
-    if (link) |href| {
-        try w.writeAll("<a href=\"");
-        try escapeInto(w, href);
-        try w.writeAll("\">");
-    }
-    if (css) |class| {
-        try w.writeAll("<span class=\"");
-        try w.writeAll(class);
-        try w.writeAll("\">");
-    }
-    var cell: std.Io.Writer.Allocating = .init(allocator);
-    defer cell.deinit();
-    try writeCell(&cell.writer, s, inner - 2, null, false);
-    const padded = try cell.toOwnedSlice();
-    defer allocator.free(padded);
-    try escapeCellInto(w, padded);
-    if (css != null) try w.writeAll("</span>");
-    if (link != null) try w.writeAll("</a>");
-    try w.writeAll(" │\n");
-}
-
-/// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
-/// box-safe bytes through untouched.
-fn escapeCellInto(w: *std.Io.Writer, cell: []const u8) !void {
-    for (cell) |byte| switch (byte) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(byte),
-    };
 }
 
 /// CSS class matching the ANSI role for a game state.
@@ -335,66 +277,6 @@ fn stateClass(state: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, state, "in")) return "live";
     if (std.mem.eql(u8, state, "pre")) return "upcoming";
     return null;
-}
-
-/// Plain-text participant row content (no borders, no ANSI) for the HTML
-/// linker. Mirrors writeDetailParticipantRow layout.
-fn participantLine(allocator: std.mem.Allocator, participant: detail.DetailParticipant, inner: usize) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-    try writeCell(w, participant.abbreviation, 4, null, false);
-    try w.writeByte(' ');
-    try writeCell(w, participant.name, inner - 2 - 12, null, false);
-    try w.writeByte(' ');
-    try writeCellRight(w, participant.score, 4, null, false);
-    if (participant.winner) {
-        try w.writeAll(" ✓");
-    } else {
-        try w.writeAll("  ");
-    }
-    return out.toOwnedSlice();
-}
-
-/// Linescore grid as one pre-wrapped block (period columns + R/H/E).
-/// The text renderer emits one row per line; HTML wraps the same lines
-/// in a single cell each so the grid survives escaping.
-fn lineScoreLine(allocator: std.mem.Allocator, game: detail.GameDetail, inner: usize) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const periods = maxPeriod(game);
-    var head: std.Io.Writer.Allocating = .init(allocator);
-    defer head.deinit();
-    try head.writer.writeAll("    ");
-    var p: usize = 1;
-    while (p <= periods) : (p += 1) try head.writer.print("{d:>3}", .{p});
-    try head.writer.writeAll("   R   H   E");
-    const head_text = try head.toOwnedSlice();
-    defer allocator.free(head_text);
-    var body: std.Io.Writer.Allocating = .init(allocator);
-    defer body.deinit();
-    try body.writer.writeAll(head_text);
-    for (game.participants) |entry| {
-        var line: std.Io.Writer.Allocating = .init(allocator);
-        defer line.deinit();
-        try line.writer.print("{s:<4}", .{entry.abbreviation});
-        var i: usize = 0;
-        while (i < periods) : (i += 1) {
-            const cell: []const u8 = if (i < entry.lines.len) entry.lines[i].display else "-";
-            try line.writer.print("{s:>3}", .{cell});
-        }
-        try line.writer.print("   {s:>3}   {s:>3}   {s:>3}", .{
-            entry.score,
-            entry.hits orelse "-",
-            entry.errors orelse "-",
-        });
-        const text = try line.toOwnedSlice();
-        defer allocator.free(text);
-        try body.writer.writeByte('\n');
-        try body.writer.writeAll(text);
-    }
-    _ = inner;
-    return body.toOwnedSlice();
 }
 
 fn statusColor(state: []const u8) ?[]const u8 {
@@ -443,9 +325,133 @@ fn situationText(allocator: std.mem.Allocator, situation: detail.Situation) ![]u
     });
 }
 
-/// Linescore grid: `TEAM 1 2 3 R H E`. Period columns right-align in 3 cells;
-/// missing cells render `-`. R/H/E come from the last score plus hits/errors.
-fn writeLineScore(w: *std.Io.Writer, allocator: std.mem.Allocator, game: detail.GameDetail, inner: usize, color: bool) !void {
+/// Free a `[][]u8` built by the composers below.
+fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
+    for (lines) |line| allocator.free(line);
+    allocator.free(lines);
+}
+
+/// Split a "label ... value" row at its last space: leaders
+/// (`Jeremy Pena 1-5`) and team stats (`HOU Games Played 1`) align the
+/// trailing value right. No space means the whole string is the label.
+fn splitValue(s: []const u8) struct { label: []const u8, value: []const u8 } {
+    const at = std.mem.lastIndexOfScalar(u8, s, ' ') orelse return .{ .label = s, .value = "" };
+    return .{ .label = s[0..at], .value = s[at + 1 ..] };
+}
+
+/// Aligned key/value rows: labels left, values sharing one right column
+/// (widest value wins). Value-less rows render as plain fitted lines.
+/// `total` is the content width. Shared by text and HTML.
+fn keyValueLines(allocator: std.mem.Allocator, items: []const []const u8, total: usize) ![][]u8 {
+    var value_w: usize = 0;
+    for (items) |item| value_w = @max(value_w, table.textCells(splitValue(item).value));
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    for (items) |item| {
+        const parts = splitValue(item);
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buf.deinit();
+        if (parts.value.len == 0) {
+            try writeCell(&buf.writer, parts.label, total, null, false);
+        } else {
+            try writeCell(&buf.writer, parts.label, total -| value_w -| 1, null, false);
+            try buf.writer.writeByte(' ');
+            try writeCellRight(&buf.writer, parts.value, value_w, null, false);
+        }
+        const raw = try buf.toOwnedSlice();
+        defer allocator.free(raw);
+        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Aligned scoring-play rows: period | running score | description, with
+/// one shared period/score column per section. Score fuses the structured
+/// away/home fields (`6-4`) so the text column starts together.
+fn scoringLines(allocator: std.mem.Allocator, plays: []const detail.DetailScoringPlay, total: usize) ![][]u8 {
+    var period_w: usize = 0;
+    var score_w: usize = 0;
+    for (plays) |play| {
+        period_w = @max(period_w, table.textCells(play.period));
+        score_w = @max(score_w, table.textCells(play.away_score) + 1 + table.textCells(play.home_score));
+    }
+    period_w = @min(period_w, 14);
+    score_w = @min(score_w, 9);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    for (plays) |play| {
+        const score = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ play.away_score, play.home_score });
+        defer allocator.free(score);
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buf.deinit();
+        try writeCell(&buf.writer, play.period, period_w, null, false);
+        try buf.writer.writeByte(' ');
+        try writeCell(&buf.writer, score, score_w, null, false);
+        try buf.writer.writeByte(' ');
+        try writeCell(&buf.writer, play.text, total -| period_w -| 1 -| score_w -| 1, null, false);
+        const raw = try buf.toOwnedSlice();
+        defer allocator.free(raw);
+        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Participant block rows: `ABBR name … score ✓ record`. The name flexes;
+/// abbreviation, score, and record ride fixed right-ish columns so
+/// multi-team blocks scan. Winner coloring wraps the whole line at emit
+/// time (text) or rides a span (HTML), never inside the composer.
+fn participantLines(allocator: std.mem.Allocator, participants: []const detail.DetailParticipant, total: usize) ![][]u8 {
+    var abbr_w: usize = 0;
+    var rec_w: usize = 0;
+    for (participants) |p| {
+        abbr_w = @max(abbr_w, table.textCells(p.abbreviation));
+        if (p.record) |r| rec_w = @max(rec_w, table.textCells(r));
+    }
+    abbr_w = @min(abbr_w, 4);
+    rec_w = @min(rec_w, 10);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    for (participants) |p| {
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buf.deinit();
+        const fixed: usize = abbr_w + 2 + 3 + 2 + (if (p.record != null) rec_w + 1 else 0);
+        try writeCell(&buf.writer, p.abbreviation, abbr_w, null, false);
+        try buf.writer.writeByte(' ');
+        try writeCell(&buf.writer, p.name, total -| fixed, null, false);
+        try buf.writer.writeByte(' ');
+        try writeCellRight(&buf.writer, p.score, 3, null, false);
+        if (p.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
+        if (p.record) |r| {
+            try buf.writer.writeByte(' ');
+            try writeCellRight(&buf.writer, r, rec_w, null, false);
+        }
+        const raw = try buf.toOwnedSlice();
+        defer allocator.free(raw);
+        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Linescore grid as plain strings: header, one row per team, then a
+/// combined records line (`PHI 81-63 · HOU 73-71`, absent when no team
+/// carries one). One composer for text and HTML so the grid can never
+/// drift between them (the old HTML path collapsed it to one line and
+/// dropped the records entirely).
+fn lineScoreLines(allocator: std.mem.Allocator, game: detail.GameDetail) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
     const periods = maxPeriod(game);
     var head: std.Io.Writer.Allocating = .init(allocator);
     defer head.deinit();
@@ -453,9 +459,7 @@ fn writeLineScore(w: *std.Io.Writer, allocator: std.mem.Allocator, game: detail.
     var p: usize = 1;
     while (p <= periods) : (p += 1) try head.writer.print("{d:>3}", .{p});
     try head.writer.writeAll("   R   H   E");
-    const head_text = try head.toOwnedSlice();
-    defer allocator.free(head_text);
-    try writeRow(w, head_text, inner - 2, "2", color);
+    try out.append(allocator, try head.toOwnedSlice());
     for (game.participants) |entry| {
         var line: std.Io.Writer.Allocating = .init(allocator);
         defer line.deinit();
@@ -470,67 +474,20 @@ fn writeLineScore(w: *std.Io.Writer, allocator: std.mem.Allocator, game: detail.
             entry.hits orelse "-",
             entry.errors orelse "-",
         });
-        const text = try line.toOwnedSlice();
-        defer allocator.free(text);
-        const mark: ?[]const u8 = if (entry.winner) "32" else null;
-        try writeRow(w, text, inner - 2, mark, color);
+        try out.append(allocator, try line.toOwnedSlice());
     }
-    if (game.participants.len > 0) {
-        if (game.participants[0].record) |record| {
-            const line = try std.fmt.allocPrint(allocator, "{s} {s}", .{ game.participants[0].abbreviation, record });
-            defer allocator.free(line);
-            try writeRow(w, line, inner - 2, null, color);
-        }
-        if (game.participants.len > 1) {
-            if (game.participants[1].record) |record| {
-                const line = try std.fmt.allocPrint(allocator, "{s} {s}", .{ game.participants[1].abbreviation, record });
-                defer allocator.free(line);
-                try writeRow(w, line, inner - 2, null, color);
-            }
-        }
+    var recs: std.Io.Writer.Allocating = .init(allocator);
+    defer recs.deinit();
+    var first = true;
+    for (game.participants) |entry| {
+        const record = entry.record orelse continue;
+        if (!first) try recs.writer.writeAll(" · ");
+        first = false;
+        try recs.writer.print("{s} {s}", .{ entry.abbreviation, record });
     }
+    if (!first) try out.append(allocator, try recs.toOwnedSlice());
+    return out.toOwnedSlice(allocator);
 }
-
-fn writeDetailParticipantRow(w: *std.Io.Writer, participant: detail.DetailParticipant, color: bool, inner: usize) !void {
-    const mark: ?[]const u8 = if (participant.winner) "32" else null;
-    try w.writeAll("│ ");
-    try writeCell(w, participant.abbreviation, 4, mark, color);
-    try w.writeByte(' ');
-    // Fixed cells around the name: abbr 4 + spaces 2 + score 4 + check 2.
-    try writeCell(w, participant.name, inner - 2 - 12, mark, color);
-    try w.writeByte(' ');
-    try writeCellRight(w, participant.score, 4, mark, color);
-    if (participant.winner) {
-        if (color) try w.writeAll("\x1b[32m");
-        try w.writeAll(" ✓");
-        if (color) try w.writeAll("\x1b[0m");
-    } else {
-        try w.writeAll("  ");
-    }
-    try w.writeAll(" │\n");
-}
-
-fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
-    try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
-    try escapeInto(w, title);
-    try w.writeAll("</title>" ++ page_style ++ "</head><body><main>");
-}
-
-fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| switch (byte) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(byte),
-    };
-}
-
-const page_style =
-    \\<style>html,body{margin:0;background:#10140f;color:#e6ebe7}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:#6fd3a0}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:#6fd3a0}.dim{color:#8b968f}.live{color:#ff7b7b;font-weight:bold}.upcoming{color:#e8c547}.win{color:#5fd08a;font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
-;
 
 fn testDetail() detail.GameDetail {
     return .{
@@ -594,11 +551,13 @@ fn testDetail() detail.GameDetail {
     };
 }
 
-test "detail text renders the box and all sections" {
+test "detail text reads as aligned sections without box rules" {
     const output = try renderText(std.testing.allocator, testDetail(), false, null, null);
     defer std.testing.allocator.free(output);
-    try std.testing.expect(std.mem.indexOf(u8, output, "┌") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "└") != null);
+    // Pipe-less document: no box-drawing bytes anywhere.
+    for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, output, rule) == null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, output, "Final") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "✓") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Citizens Bank Park (42793)") != null);
@@ -611,6 +570,25 @@ test "detail text renders the box and all sections" {
     try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(output);
+    // Scoring plays share period/score columns: the 9th-inning row opens
+    // with its period and running score before the description.
+    try std.testing.expect(std.mem.indexOf(u8, output, "9th Inning 5-4 Riley tripled") != null);
+    // The lone leader row right-aligns its value at the page width.
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var found = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "10-35") == null) continue;
+        found = true;
+        try std.testing.expect(std.mem.endsWith(u8, line, "10-35"));
+    }
+    try std.testing.expect(found);
+    // Every line fits the 52-column page: composed rows are exact width,
+    // fitted rows truncate, so nothing sticks out past the margin.
+    var all = std.mem.splitScalar(u8, output, '\n');
+    while (all.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(table.textCells(line) <= 52);
+    }
 }
 
 test "detail text shows the live situation chip" {
@@ -687,8 +665,15 @@ test "detail html wraps in pre and links back" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/ATL\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<span") != null);
-    // Sections breathe through blank spacer rows, never mid rules.
-    try std.testing.expect(std.mem.indexOf(u8, page, "├") == null);
+    // Pipe-less like text: no rules or borders anywhere.
+    for ([_][]const u8{ "┌", "├", "└", "│", "─" }) |rule| {
+        try std.testing.expect(std.mem.indexOf(u8, page, rule) == null);
+    }
+    // Linescore renders one row per line (not one collapsed cell) and the
+    // records line survives alongside the grid.
+    try std.testing.expect(std.mem.indexOf(u8, page, "R   H   E") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "85-58") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "9th Inning 5-4 Riley tripled") != null);
 }
 
 test "detail error bodies reuse the shared error renderer" {
@@ -849,19 +834,24 @@ test "detail depth team stats render with data and skip without" {
     const output = try renderText(std.testing.allocator, game, false, null, null);
     defer std.testing.allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Team stats") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "ATL At Bats 35") != null);
+    // Aligned form: label, shared value column, value (`ATL At Bats … 35`).
+    try std.testing.expect(std.mem.indexOf(u8, output, "ATL At Bats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "35") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(output);
-    // Section rows keep the box borders so alignment holds.
+    // Values share one right column: both stat rows end at the same width
+    // with their values flush right.
     var lines = std.mem.splitScalar(u8, output, '\n');
-    var found = false;
+    var widths: [2]usize = .{ 0, 0 };
+    var n: usize = 0;
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "ATL At Bats 35") == null) continue;
-        found = true;
-        try std.testing.expect(std.mem.startsWith(u8, line, "│ "));
-        try std.testing.expect(std.mem.endsWith(u8, line, " │"));
+        if (std.mem.indexOf(u8, line, "At Bats") == null) continue;
+        try std.testing.expect(n < widths.len);
+        widths[n] = line.len;
+        n += 1;
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(widths[0], widths[1]);
 
     const bare = try renderText(std.testing.allocator, testDetail(), false, null, null);
     defer std.testing.allocator.free(bare);
@@ -900,3 +890,4 @@ test "detail depth team stats ride the json wire format additively" {
     const legacy = try std.json.parseFromSliceLeaky(detail.GameDetail, arena, try json(arena, testDetail()), .{});
     try std.testing.expectEqual(@as(usize, 0), legacy.team_stats.len);
 }
+

@@ -66,6 +66,28 @@ pub fn todayET(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u8 {
     return todayInTz(allocator, epoch_seconds, etOffsetMinutes(epoch_seconds));
 }
 
+/// Parse an ESPN-style UTC timestamp (`YYYY-MM-DDTHH:MM`, trailing seconds
+/// and `Z` tolerated) to epoch seconds. Returns null on any bad shape so
+/// callers can fall back to date-prefix handling. Pure.
+pub fn parseTimestampUTC(value: []const u8) ?i64 {
+    if (value.len < 16) return null;
+    if (value[10] != 'T' or value[13] != ':') return null;
+    if (!validate(value[0..10])) return null;
+    const epoch_day = toEpochDay(value[0..10]) catch return null;
+    const hour = std.fmt.parseInt(u8, value[11..13], 10) catch return null;
+    if (hour > 23) return null;
+    const minute = std.fmt.parseInt(u8, value[14..16], 10) catch return null;
+    if (minute > 59) return null;
+    var seconds: i64 = 0;
+    if (value.len >= 19 and value[16] == ':') {
+        seconds = std.fmt.parseInt(i64, value[17..19], 10) catch return null;
+        if (seconds < 0 or seconds > 60) return null;
+    }
+    return @as(i64, epoch_day) * std.time.s_per_day +
+        @as(i64, hour) * std.time.s_per_hour +
+        @as(i64, minute) * std.time.s_per_min + seconds;
+}
+
 /// Year (e.g. 2026) containing this epoch day (days since 1970-01-01).
 fn yearOfEpochDay(epoch_day: i64) u16 {
     var day = epoch_day;
@@ -206,6 +228,21 @@ test "todayET keeps night games on the ET day" {
     defer std.testing.allocator.free(spring);
     try std.testing.expectEqualStrings("2026-03-08", spring);
     try std.testing.expectError(error.InvalidDate, todayET(std.testing.allocator, -1));
+}
+
+test "parseTimestampUTC reads ESPN timestamps to epoch seconds" {
+    // 2026-09-07T00:00Z is 1788739200; +7d +20m lands on 2026-09-14T00:20Z.
+    try std.testing.expectEqual(@as(?i64, 1789345200), parseTimestampUTC("2026-09-14T00:20Z"));
+    try std.testing.expectEqual(@as(?i64, 1789345245), parseTimestampUTC("2026-09-14T00:20:45Z"));
+    // Seconds and the Z marker are tolerated when absent.
+    try std.testing.expectEqual(@as(?i64, 1789345200), parseTimestampUTC("2026-09-14T00:20"));
+    // Bad shapes yield null, never an error.
+    try std.testing.expect(parseTimestampUTC("") == null);
+    try std.testing.expect(parseTimestampUTC("2026-09-14") == null);
+    try std.testing.expect(parseTimestampUTC("2026-09-14 00:20") == null);
+    try std.testing.expect(parseTimestampUTC("2026-13-01T00:00Z") == null);
+    try std.testing.expect(parseTimestampUTC("2026-09-14T24:00Z") == null);
+    try std.testing.expect(parseTimestampUTC("2026-09-14T00:60Z") == null);
 }
 
 test "todayInTz applies a fixed offset" {

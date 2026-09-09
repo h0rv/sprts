@@ -302,7 +302,9 @@ fn serveBoard(
 /// Game detail (wt-detail): same edge-cache scheme as the board, keyed on
 /// `detail/<slug>/<id>/<format>` (fresh 30s bucket, stale 300s on upstream
 /// error). Unknown game ids are 404; upstream failures are 502; errors are
-/// never cached. Render flags stay out of the key.
+/// never cached. Render flags stay out of the key, except one-line text:
+/// `?0` renders under `detail/<slug>/<id>/text-1line` so the full box and
+/// the one-line fallback never shadow each other in a fresh bucket.
 fn serveDetail(
     env: *workers.Env,
     alloc: std.mem.Allocator,
@@ -316,7 +318,14 @@ fn serveDetail(
 
     const epoch_s = epochSecondsNow();
     const slug = try edge.canonicalSlug(alloc, league.slug);
-    const tag = edge.formatTag(format);
+    // One-line text (`?0`) gets its own edge namespace: the cached body is a
+    // render, not the normalized payload (unlike the native cache), so the
+    // full-box text render and the one-line text render must never share a
+    // key — otherwise whichever renders first in a 30s bucket shadows the
+    // other and `?0` returns the full box (or vice versa). HTML/JSON ignore
+    // `?0` (team-route precedent: the flag is text-only), so they keep the
+    // canonical tags and their stale fallback stays variant-coherent.
+    const tag = if (router.gameOneLine(route, format)) "text-1line" else edge.formatTag(format);
     const detail_key = try edge.detailKey(alloc, slug, route.id, tag);
     const fresh_key = try edge.detailFreshKey(alloc, detail_key, epoch_s);
     const stale_key = try edge.detailStaleKey(alloc, detail_key, epoch_s);
@@ -353,11 +362,13 @@ fn serveDetail(
             return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
         },
     };
-    const body = switch (format) {
-        .text => if (route.oneline)
-            try detail_view.renderTextOneLine(alloc, game_detail, color, route.quiet)
-        else
-            try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
+    // Text dispatch via the shared predicate (mirrors the native game arm):
+    // text + ?0 selects renderTextOneLine, every other combination keeps
+    // the full renderers (html/json ignore ?0 by team-route precedent).
+    const body = if (router.gameOneLine(route, format))
+        try detail_view.renderTextOneLine(alloc, game_detail, color, route.quiet)
+    else switch (format) {
+        .text => try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
         .html => try detail_view.detailHtml(alloc, game_detail, route.width, route.height),
         .json => try detail_view.json(alloc, game_detail),
     };

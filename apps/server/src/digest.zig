@@ -154,7 +154,7 @@ pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSectio
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/all?date={s}\">all</a>", .{day});
     try w.print("<a href=\"/api/v1/all?date={s}\">json</a>", .{day});
-    try w.writeAll("</nav></main></body></html>");
+    try render.closePageWithNav(w);
     _ = quiet;
     return out.toOwnedSlice();
 }
