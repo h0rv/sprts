@@ -234,6 +234,90 @@ pub fn writeLine(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const 
     try w.writeByte('\n');
 }
 
+/// Word-wrap `s` onto ragged lines of at most `width` columns: splits at
+/// word boundaries (spaces and control bytes, which render as blanks
+/// anyway), hard-breaking an over-long word at code-point boundaries.
+/// Each line holds at most `width` cells AND `width` bytes, so the
+/// truncating emitters (`writeLine`, `render.writeHtmlLine` — both keyed
+/// off the byte-budget `fit`) pass wrapped lines through untouched: no
+/// ellipsis, ever. Lines join with single spaces (runs collapse); free
+/// each line plus the slice itself when done.
+pub fn wrapLines(allocator: std.mem.Allocator, s: []const u8, width: usize) ![][]u8 {
+    const max_w: usize = @max(width, 1);
+    var words: std.ArrayList([]const u8) = .empty;
+    defer words.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decode(s, i);
+        if (d.cp == ' ' or isControl(d.cp)) {
+            i += d.len;
+            continue;
+        }
+        const start = i;
+        while (i < s.len) {
+            const e = decode(s, i);
+            if (e.cp == ' ' or isControl(e.cp)) break;
+            i += e.len;
+        }
+        try words.append(allocator, s[start..i]);
+    }
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    var cur: std.ArrayList(u8) = .empty;
+    defer cur.deinit(allocator);
+    var cur_cells: usize = 0;
+    for (words.items) |word| {
+        var j: usize = 0;
+        while (j < word.len) {
+            // One fitting piece: the whole word, or the next code-point
+            // chunk of an over-long word (cells and bytes both bounded
+            // so downstream `fit` never truncates).
+            var k = j;
+            var cells: usize = 0;
+            const fits = textCells(word[j..]) <= max_w and word[j..].len <= max_w;
+            if (fits) {
+                k = word.len;
+                cells = textCells(word[j..]);
+            } else {
+                while (k < word.len) {
+                    const d = decode(word, k);
+                    const cw = cellWidth(d.cp);
+                    if (k > j and (cells + cw > max_w or (k + d.len) - j > max_w)) break;
+                    cells += cw;
+                    k += d.len;
+                }
+                if (k == j) {
+                    // One atomic char wider than the page: emit it alone
+                    // rather than looping forever.
+                    const d = decode(word, j);
+                    cells = cellWidth(d.cp);
+                    k = j + d.len;
+                }
+            }
+            const piece = word[j..k];
+            j = k;
+            if (cur.items.len == 0) {
+                try cur.appendSlice(allocator, piece);
+                cur_cells = cells;
+            } else if (cur_cells + 1 + cells <= max_w and cur.items.len + 1 + piece.len <= max_w) {
+                try cur.append(allocator, ' ');
+                try cur.appendSlice(allocator, piece);
+                cur_cells += 1 + cells;
+            } else {
+                try out.append(allocator, try allocator.dupe(u8, cur.items));
+                cur.clearRetainingCapacity();
+                try cur.appendSlice(allocator, piece);
+                cur_cells = cells;
+            }
+        }
+    }
+    if (cur.items.len > 0) try out.append(allocator, try allocator.dupe(u8, cur.items));
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn writeRule(w: *std.Io.Writer, which: Rule, inner: usize) !void {
     const left: []const u8 = switch (which) {
         .top => "┌",
@@ -1084,4 +1168,51 @@ test "degenerate widths cannot wrap or hang" {
         try std.testing.expect(got.len < 64);
         _ = try std.unicode.Utf8View.init(got);
     }
+}
+
+test "wrapLines splits at word boundaries within width" {
+    const lines = try wrapLines(std.testing.allocator, "0-0, 1 out, bases empty Cristopher Sanchez vs Yordan Alvarez", 52);
+    defer {
+        for (lines) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(lines);
+    }
+    try std.testing.expect(lines.len >= 2);
+    for (lines) |line| {
+        try std.testing.expect(textCells(line) <= 52);
+        try std.testing.expect(line.len <= 52);
+        try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+    }
+    // Rejoining with spaces restores the input verbatim: no word lost.
+    var joined: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer joined.deinit();
+    for (lines, 0..) |line, i| {
+        if (i > 0) try joined.writer.writeByte(' ');
+        try joined.writer.writeAll(line);
+    }
+    const flat = try joined.toOwnedSlice();
+    defer std.testing.allocator.free(flat);
+    try std.testing.expectEqualStrings("0-0, 1 out, bases empty Cristopher Sanchez vs Yordan Alvarez", flat);
+}
+
+test "wrapLines fits short input on one line and hard-breaks long words" {
+    const one = try wrapLines(std.testing.allocator, "2-2, 2 out", 52);
+    defer {
+        for (one) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(one);
+    }
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("2-2, 2 out", one[0]);
+    const broken = try wrapLines(std.testing.allocator, "supercalifragilisticexpialidocious", 10);
+    defer {
+        for (broken) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(broken);
+    }
+    try std.testing.expect(broken.len > 1);
+    for (broken) |line| {
+        try std.testing.expect(textCells(line) <= 10);
+        try std.testing.expect(line.len <= 10);
+    }
+    const empty = try wrapLines(std.testing.allocator, "", 52);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
