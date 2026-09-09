@@ -266,13 +266,16 @@ pub fn homeOneLine(
     return homeOneLineWithZone(allocator, boards, color, .et);
 }
 
-/// Compact one-liner per game: `MLB  NYY 0 @ BOS 3 ✓  Top 7th`.
+/// Compact one-liner per game, column-aligned across the page: leagues,
+/// teams, and scores share fixed columns so days scan vertically; only
+/// the trailing status is ragged. `mlb  CLE   9 @ BAL   5 ✓  Bot 7th`.
+/// `slug_w`/`abbr_w` are page-wide maxima (computed in `homeSections`).
 /// A two-participant game always reads as a duel: team sides are
 /// `{abbr} {score}`; athlete sides (empty abbreviation, e.g. UFC) read
 /// as bare names joined with ` v `. Records stay out: they would drown
 /// the line (`ufc  Name 9-0-0` reads like a score). Non-duels fall back
 /// to the game name. Returns null for nothing to show.
-fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: domain.Game) !?[]u8 {
+fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: domain.Game, slug_w: usize, abbr_w: usize) !?[]u8 {
     if (game.participants.len == 2) {
         const first = game.participants[0];
         const second = game.participants[1];
@@ -282,50 +285,114 @@ fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: d
             .{ second, first }
         else
             .{ first, second };
+        // Winner tick rides a fixed 2-cell column so scores align whether
+        // or not the game is decided yet.
+        const mark: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
+        const date_part = splitStatus(shortStatus(game.status));
+        const date = date_part.date;
+        const rest = date_part.rest;
+        if (away.abbreviation.len > 0 and home_team.abbreviation.len > 0) {
+            // Column duel: slug, sides, scores, tick, then the date word
+            // (if any) and the status tail. Callers fit to the frame.
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            errdefer buf.deinit();
+            const b = &buf.writer;
+            try writeCell(b, league.slug, slug_w, null, false);
+            try b.writeByte(' ');
+            try writeCell(b, away.abbreviation, abbr_w, null, false);
+            try b.writeByte(' ');
+            try writeCellRight(b, away.score, 3, null, false);
+            try b.writeAll(" @ ");
+            try writeCell(b, home_team.abbreviation, abbr_w, null, false);
+            try b.writeByte(' ');
+            try writeCellRight(b, home_team.score, 3, null, false);
+            try b.writeAll(mark);
+            try b.writeAll("  ");
+            try writeCell(b, date, 5, null, false);
+            const norm = try tz.normalizeEastern(allocator, rest);
+            defer allocator.free(norm);
+            try b.writeAll(norm);
+            return try buf.toOwnedSlice();
+        }
         if (away.abbreviation.len > 0 or home_team.abbreviation.len > 0) {
             const away_side = try sideText(allocator, away);
             defer allocator.free(away_side);
             const home_side = try sideText(allocator, home_team);
             defer allocator.free(home_side);
-            const mark = if (away.winner) " ✓" else if (home_team.winner) " ✓" else "";
-            const short_status = shortStatus(game.status);
+            const mark2: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            errdefer buf.deinit();
+            try writeCell(&buf.writer, league.slug, slug_w, null, false);
+            try buf.writer.writeByte(' ');
             if (away_side.len > 0 and home_side.len > 0) {
-                const joiner: []const u8 = if (away.abbreviation.len > 0 and home_team.abbreviation.len > 0) " @ " else " v ";
-                return try std.fmt.allocPrint(allocator, "{s}  {s}{s}{s}{s}  {s}", .{
-                    league.slug, away_side, joiner, home_side, mark, short_status,
-                });
+                const joiner: []const u8 = " v ";
+                try buf.writer.writeAll(away_side);
+                try buf.writer.writeAll(joiner);
+                try buf.writer.writeAll(home_side);
+            } else {
+                const side = if (away_side.len > 0) away_side else home_side;
+                try buf.writer.writeAll(side);
             }
-            const side = if (away_side.len > 0) away_side else home_side;
-            return try std.fmt.allocPrint(allocator, "{s}  {s}{s}  {s}", .{
-                league.slug, side, mark, short_status,
-            });
+            try buf.writer.writeAll(mark2);
+            try gameLineTail(allocator, &buf.writer, date, rest);
+            return try buf.toOwnedSlice();
         }
         if (away.name.len > 0 or home_team.name.len > 0) {
-            const mark = if (away.winner) " ✓" else if (home_team.winner) " ✓" else "";
-            return try std.fmt.allocPrint(allocator, "{s}  {s} v {s}{s}  {s}", .{
-                league.slug, away.name, home_team.name, mark, shortStatus(game.status),
-            });
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            errdefer buf.deinit();
+            try writeCell(&buf.writer, league.slug, slug_w, null, false);
+            try buf.writer.writeByte(' ');
+            try buf.writer.writeAll(away.name);
+            try buf.writer.writeAll(" v ");
+            try buf.writer.writeAll(home_team.name);
+            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
+            try gameLineTail(allocator, &buf.writer, date, rest);
+            return try buf.toOwnedSlice();
         }
         if (away.score.len > 0 or home_team.score.len > 0) {
-            return try std.fmt.allocPrint(allocator, "{s}  {s} {s} @ {s} {s}{s}  {s}", .{
-                league.slug,
-                away.abbreviation,
-                away.score,
-                home_team.abbreviation,
-                home_team.score,
-                if (away.winner) " ✓" else if (home_team.winner) " ✓" else "",
-                shortStatus(game.status),
-            });
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            errdefer buf.deinit();
+            try writeCell(&buf.writer, league.slug, slug_w, null, false);
+            try buf.writer.writeByte(' ');
+            try writeCell(&buf.writer, away.abbreviation, abbr_w, null, false);
+            try buf.writer.writeByte(' ');
+            try writeCellRight(&buf.writer, away.score, 3, null, false);
+            try buf.writer.writeAll(" @ ");
+            try writeCell(&buf.writer, home_team.abbreviation, abbr_w, null, false);
+            try buf.writer.writeByte(' ');
+            try writeCellRight(&buf.writer, home_team.score, 3, null, false);
+            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
+            try gameLineTail(allocator, &buf.writer, date, rest);
+            return try buf.toOwnedSlice();
         }
-        return try std.fmt.allocPrint(allocator, "{s}  {s} @ {s}  {s}", .{
-            league.slug,
-            away.abbreviation,
-            home_team.abbreviation,
-            shortStatus(game.status),
-        });
+        var tail_buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer tail_buf.deinit();
+        try writeCell(&tail_buf.writer, league.slug, slug_w, null, false);
+        try tail_buf.writer.writeByte(' ');
+        try tail_buf.writer.writeAll(away.abbreviation);
+        try tail_buf.writer.writeAll(" @ ");
+        try tail_buf.writer.writeAll(home_team.abbreviation);
+        try tail_buf.writer.writeAll("  ");
+        const tail_part = splitStatus(shortStatus(game.status));
+        const tail_date = tail_part.date;
+        const tail_rest = tail_part.rest;
+        try writeCell(&tail_buf.writer, tail_date, 5, null, false);
+        try tail_buf.writer.writeAll(tail_rest);
+        return try tail_buf.toOwnedSlice();
     }
     if (game.participants.len == 0 and game.name.len == 0) return null;
-    return try std.fmt.allocPrint(allocator, "{s}  {s}  {s}", .{ league.slug, game.name, shortStatus(game.status) });
+    var name_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer name_buf.deinit();
+    try writeCell(&name_buf.writer, league.slug, slug_w, null, false);
+    try name_buf.writer.writeByte(' ');
+    try name_buf.writer.writeAll(game.name);
+    try name_buf.writer.writeAll("  ");
+    const name_part = splitStatus(shortStatus(game.status));
+    const name_date = name_part.date;
+    const name_rest = name_part.rest;
+    try writeCell(&name_buf.writer, name_date, 5, null, false);
+    try name_buf.writer.writeAll(name_rest);
+    return try name_buf.toOwnedSlice();
 }
 
 /// Short date: `2026-09-08` becomes `09-08`. The year is implicit in
@@ -333,6 +400,36 @@ fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: d
 fn shortDate(day: []const u8) []const u8 {
     if (day.len >= 10 and day[4] == '-' and day[7] == '-') return day[5..10];
     return day;
+}
+
+/// Split a home status into its leading date word and the tail: `9/9 -
+/// 8:20 PM EDT` becomes date `9/9` + `8:20 PM EDT`; anything else
+/// (`Final`, `Bot 7th`, `Scheduled`) has no date word. The date column
+/// aligns kickoff times down the page.
+fn splitStatus(status: []const u8) struct { date: []const u8, rest: []const u8 } {
+    var i: usize = 0;
+    while (i < status.len and status[i] >= '0' and status[i] <= '9') : (i += 1) {}
+    var j = i;
+    if (j < status.len and (status[j] == '/' or status[j] == '-')) {
+        j += 1;
+        const k = j;
+        while (j < status.len and status[j] >= '0' and status[j] <= '9') : (j += 1) {}
+        if (j > k and j + 2 < status.len and status[j] == ' ' and status[j + 1] == '-' and status[j + 2] == ' ') {
+            return .{ .date = status[0..j], .rest = status[j + 3 ..] };
+        }
+    }
+    return .{ .date = "", .rest = status };
+}
+
+/// Shared tail for home game lines: two spaces, the date word in its
+/// fixed column, then the status tail. Keeps every gameLine branch in
+/// the same rhythm without repeating the separators.
+fn gameLineTail(allocator: std.mem.Allocator, w: *std.Io.Writer, date: []const u8, rest: []const u8) !void {
+    try w.writeAll("  ");
+    try writeCell(w, date, 5, null, false);
+    const norm = try tz.normalizeEastern(allocator, rest);
+    defer allocator.free(norm);
+    try w.writeAll(norm);
 }
 
 /// Short status: strip a leading `YYYY-` year prefix (`2026-09-08`
@@ -381,6 +478,22 @@ fn homeSections(
     comptime html: bool,
     day: []const u8,
 ) !void {
+    // Page-wide column widths so league, team, and score columns align
+    // down the whole page: widest slug/abbreviation among leagues with
+    // shown games (idle-league rows keep their own fixed cells). Floors
+    // keep narrow days compact; caps bound exotic abbreviations.
+    var slug_w: usize = 3;
+    var abbr_w: usize = 2;
+    for (boards) |result| {
+        const board = result.board orelse continue;
+        if (board.games.len == 0) continue;
+        slug_w = @max(slug_w, table.textCells(result.league.slug));
+        for (board.games) |game| {
+            for (game.participants) |p| abbr_w = @max(abbr_w, table.textCells(p.abbreviation));
+        }
+    }
+    slug_w = @min(slug_w, 10);
+    abbr_w = @min(abbr_w, 5);
     var separated = false;
     var live = false;
     for (boards) |result| {
@@ -395,7 +508,7 @@ fn homeSections(
                         try writeRow(w, "LIVE NOW", default_inner_width - 2, "1;31", color);
                     }
                 }
-                try homeGameLine(allocator, w, result.league, game, color and !html, html);
+                try homeGameLine(allocator, w, result.league, game, color and !html, html, slug_w, abbr_w);
             }
         }
     }
@@ -424,7 +537,7 @@ fn homeSections(
         }
         for (board.games) |game| {
             if (gameIsLive(game)) continue;
-            try homeGameLine(allocator, w, result.league, game, color and !html, html);
+            try homeGameLine(allocator, w, result.league, game, color and !html, html, slug_w, abbr_w);
         }
         separated = true;
     }
@@ -476,17 +589,33 @@ fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, 
 }
 
 /// Section header row for the HTML home renderer (league names, LIVE
-/// NOW, ALL LEAGUES): padded cell with optional span and link.
+/// NOW, ALL LEAGUES): padded cell with optional span and link. Linked
+/// headers wrap the trimmed text only; padding stays outside the anchor
+/// so underlines never cross the row.
 fn writeHtmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, inner: usize, w: *std.Io.Writer, link: ?[]const u8) !void {
     _ = inner;
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, default_inner_width - 2, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    const trimmed = std.mem.trimEnd(u8, padded, " ");
     try w.writeAll("│ ");
     if (link) |href| {
         try w.writeAll("<a href=\"");
         try escapeInto(w, href);
         try w.writeAll("\">");
     }
-    try writeHtmlCell(allocator, s, css, w);
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    try escapeCellInto(w, trimmed);
+    if (css != null) try w.writeAll("</span>");
     if (link != null) try w.writeAll("</a>");
+    var pad: usize = padded.len - trimmed.len;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
     try w.writeAll(" │\n");
 }
 
@@ -508,8 +637,10 @@ fn homeGameLine(
     game: domain.Game,
     color: bool,
     html: bool,
+    slug_w: usize,
+    abbr_w: usize,
 ) !void {
-    const line = try gameLine(allocator, league, game) orelse return;
+    const line = try gameLine(allocator, league, game, slug_w, abbr_w) orelse return;
     defer allocator.free(line);
     if (html) {
         // Sibling anchors only: non-team text links the game view,
@@ -594,11 +725,18 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
         }
     }
     if (padded[cursor..].len > 0) {
-        try w.writeAll("<a href=\"");
-        try escapeInto(w, game_href);
-        try w.writeAll("\">");
-        try escapeCellInto(w, padded[cursor..]);
-        try w.writeAll("</a>");
+        // Content links, padding does not: trailing blanks ride outside
+        // the anchor so underlines stop at the text, never the border.
+        const tail = std.mem.trimEnd(u8, padded[cursor..], " ");
+        if (tail.len > 0) {
+            try w.writeAll("<a href=\"");
+            try escapeInto(w, game_href);
+            try w.writeAll("\">");
+            try escapeCellInto(w, tail);
+            try w.writeAll("</a>");
+        }
+        var pad: usize = padded[cursor..].len - tail.len;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
     }
     if (css != null) try w.writeAll("</span>");
 }
@@ -845,6 +983,10 @@ fn writeGameStatusRow(
         return;
     }
     const inner = line[row_prefix.len .. line.len - row_suffix.len];
+    // Underline only the content: cell padding rides outside the anchor
+    // so link underlines never cross the whole row (identical rendering
+    // inside <pre>, where spaces survive, and identical visible text).
+    const trimmed = std.mem.trimEnd(u8, inner, " ");
     const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league_slug, game.id });
     defer allocator.free(href);
     try w.writeAll(row_prefix);
@@ -855,8 +997,10 @@ fn writeGameStatusRow(
         try escapeInto(w, game.id);
     }
     try w.writeAll("\">");
-    try escapeInto(w, inner);
+    try escapeInto(w, trimmed);
     try w.writeAll("</a>");
+    var pad: usize = inner.len - trimmed.len;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
     try w.writeAll(row_suffix);
     try w.writeByte('\n');
 }
@@ -1130,7 +1274,9 @@ pub fn homeHtmlLive(
 
 pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
+        "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
+        "<title>");
     try escapeInto(w, title);
     try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>");
 }
@@ -1156,12 +1302,22 @@ const page_style =
     \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;word-wrap:normal;overflow-x:auto;-webkit-overflow-scrolling:touch}a{color:var(--link)}pre a{color:inherit;text-decoration:underline;text-underline-offset:2px}pre a:hover{color:var(--link)}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}</style>
 ;
 
-/// Footer theme toggle: no CSS, no storage dependency beyond one
-/// localStorage key. Reads the saved theme before first paint (inline
-/// in head) so there is no dark flash, then the footer link flips
-/// `data-theme` and persists it.
+/// Site mark: dark rounded square, white mono S, red live dot — the
+/// pi.dev/tinygrad kind of minimal geometric favicon, in our own
+/// palette. Served verbatim at `/favicon.svg` and linked from every
+/// page head; no script, no external assets.
+pub const favicon_svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#10140f"/><text x="29" y="44" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="36" font-weight="bold" text-anchor="middle" fill="#e6ebe7">S</text><circle cx="47" cy="17" r="5" fill="#ff7b7b"/></svg>
+;
+
+/// Footer theme toggle: a single localStorage key persists the choice;
+/// without one the OS preference wins (matchMedia before first paint, so
+/// there is no dark flash either way). The footer link flips `data-theme`
+/// and re-persists it; with storage blocked (private mode) the toggle
+/// still works per page and every load falls back to the OS theme, so
+/// pages can never disagree with each other.
 const theme_script =
-    \\<script>(function(){try{var t=localStorage.getItem("sprts-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+    \\<script>(function(){try{var t=localStorage.getItem("sprts-theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.dataset.theme=t;}catch(e){}})();</script>
     \\<script>function sprtsTheme(){try{var h=document.documentElement;var n=h.dataset.theme==="light"?"dark":"light";h.dataset.theme=n;localStorage.setItem("sprts-theme",n);}catch(e){}return false;}</script>
 ;
 
@@ -1402,6 +1558,45 @@ fn expectVisiblePreText(page: []const u8, board: domain.Scoreboard, width: ?u16,
     try std.testing.expectEqualStrings(want, visible_slice);
 }
 
+test "scoreboard links underline content, never padding" {
+    // Cell padding rides outside anchors so underlines stop at the text:
+    // no anchor may close on a blank (padded-inside form `  </a>`).
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(page);
+    var lines = std.mem.splitScalar(u8, page, '\n');
+    var anchors: usize = 0;
+    while (lines.next()) |line| {
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, line, cursor, "</a>")) |end| {
+            anchors += 1;
+            try std.testing.expect(end > 0);
+            try std.testing.expect(line[end - 1] != ' ');
+            cursor = end + 1;
+        }
+    }
+    try std.testing.expect(anchors > 0);
+    try expectVisiblePreText(page, board, null, null);
+}
+
 test "scoreHtml art rows stay pos-indexed and unlinked" {
     const board: domain.Scoreboard = .{
         .league = "mlb",
@@ -1543,6 +1738,13 @@ test "footer nav ends with the theme toggle on every page" {
     try std.testing.expect(std.mem.indexOf(u8, scoreboard, "light/dark") != null);
     try std.testing.expect(std.mem.indexOf(u8, scoreboard, "sprtsTheme()") != null);
     try std.testing.expect(std.mem.indexOf(u8, scoreboard, "localStorage") != null);
+    // First visits without a stored choice follow the OS theme.
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "prefers-color-scheme") != null);
+    // Every page head links the favicon and serves valid SVG for it.
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "rel=\"icon\"") != null);
+    try std.testing.expect(std.mem.startsWith(u8, favicon_svg, "<svg "));
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "</svg>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<script") == null);
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
@@ -1702,7 +1904,7 @@ test "home groups live games, then today, then idle leagues" {
             },
         },
     };
-    const ufc_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, ufc_board.games[0]);
+    const ufc_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, ufc_board.games[0], 3, 3);
     defer std.testing.allocator.free(ufc_line.?);
     // Athlete sides join with " v "; records stay out of the line.
     try std.testing.expect(std.mem.indexOf(u8, ufc_line.?, " v ") != null);
@@ -1731,12 +1933,12 @@ test "home groups live games, then today, then idle leagues" {
             },
         },
     };
-    const half_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, half_board.games[0]);
+    const half_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, half_board.games[0], 3, 4);
     defer std.testing.allocator.free(half_line.?);
     try std.testing.expect(std.mem.indexOf(u8, half_line.?, "LOUD") != null);
     try std.testing.expect(std.mem.indexOf(u8, half_line.?, "Christian Natividad") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "mlb  AWY 0 @ HME 3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "nba  TRD @ FRT  7:05 PM ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mlb AWY   0 @ HME   3 ✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nba TRD     @ FRT") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "nfl") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/mlb") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "example.test/docs") != null);
@@ -2325,8 +2527,9 @@ test "home html game lines use sibling anchors, never nested" {
     }
     const visible_slice = try visible.toOwnedSlice();
     defer std.testing.allocator.free(visible_slice);
-    try std.testing.expect(std.mem.indexOf(u8, visible_slice, "mlb  CLE 9 @ BAL 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible_slice, "mlb CLE   9 @ BAL   5") != null);
     try std.testing.expect(std.mem.indexOf(u8, visible_slice, "Bot 7th") != null);
-    try std.testing.expect(std.mem.indexOf(u8, visible_slice, "nba  TRD @ FRT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible_slice, "nba TRD     @ FRT") != null);
     _ = try std.unicode.Utf8View.init(page);
 }
+

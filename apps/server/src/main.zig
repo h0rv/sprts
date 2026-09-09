@@ -121,6 +121,16 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             try respond(request, try server_app.spec.llmsTxt(arena), .text, .ok, commonHeaders());
         },
+        .favicon => {
+            // Static bytes with their own content type (not a Format:
+            // respond() only maps text/html/json).
+            status = .ok;
+            var fav_headers: [3]std.http.Header = undefined;
+            fav_headers[0] = .{ .name = "content-type", .value = "image/svg+xml" };
+            fav_headers[1] = .{ .name = "cache-control", .value = "public, max-age=86400" };
+            fav_headers[2] = .{ .name = "x-content-type-options", .value = "nosniff" };
+            try request.respond(server_app.render.favicon_svg, .{ .status = status, .extra_headers = fav_headers[0..] });
+        },
         .home => |home_route| {
             status = .ok;
             const day = try server_app.tz.resolveDay(arena, null, now_s, zone);
@@ -422,6 +432,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .openapi => arena.dupe(u8, "openapi"),
         .docs => arena.dupe(u8, "docs"),
         .llms => arena.dupe(u8, "llms"),
+        .favicon => arena.dupe(u8, "favicon"),
         .home => arena.dupe(u8, "home"),
         .leagues => arena.dupe(u8, "leagues"),
         .bad_date => arena.dupe(u8, "bad_date"),

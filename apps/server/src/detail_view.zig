@@ -125,11 +125,13 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     if (game.leaders.len > 0) {
         try w.writeByte('\n');
         try table.writeLine(w, "Leaders", cols, "2", color);
-        const rows = try keyValueLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], cols);
-        defer freeLines(allocator, rows);
-        for (rows) |line| {
-            try w.writeAll(line);
-            try w.writeByte('\n');
+        const block = try leadersLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], game.participants, cols);
+        defer freeLeadersBlock(allocator, block);
+        for (block.lines, block.is_header) |line, header| {
+            if (header) try table.writeLine(w, line, cols, "2", color) else {
+                try w.writeAll(line);
+                try w.writeByte('\n');
+            }
         }
     }
     if (game.series) |series| {
@@ -253,9 +255,11 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
     if (game.leaders.len > 0) {
         try w.writeByte('\n');
         try render.writeHtmlLine(w, allocator, "Leaders", cols, "dim", null);
-        const rows = try keyValueLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], cols);
-        defer freeLines(allocator, rows);
-        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        const block = try leadersLines(allocator, game.leaders[0..@min(game.leaders.len, 8)], game.participants, cols);
+        defer freeLeadersBlock(allocator, block);
+        for (block.lines, block.is_header) |line, header| {
+            try render.writeHtmlLine(w, allocator, line, cols, if (header) "dim" else null, null);
+        }
     }
     if (game.series) |series| {
         try w.writeByte('\n');
@@ -342,6 +346,84 @@ fn situationText(allocator: std.mem.Allocator, situation: detail.Situation) ![]u
 fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     for (lines) |line| allocator.free(line);
     allocator.free(lines);
+}
+
+/// Free a `LeadersBlock` built by `leadersLines`.
+fn freeLeadersBlock(allocator: std.mem.Allocator, block: LeadersBlock) void {
+    freeLines(allocator, block.lines);
+    allocator.free(block.is_header);
+}
+
+/// One leaders section: column-aligned rows plus a per-row team-header
+/// flag. A row whose first token is an all-caps participant abbreviation
+/// (`HOU` in `HOU H-AB 10-35`) opens that team's group and renders dim;
+/// following player rows inherit the team as a prefix column
+/// (`HOU  Jeremy Pena  1-5`) so the team is never a guess. Sections
+/// without team headers render exactly like `keyValueLines`.
+const LeadersBlock = struct {
+    lines: [][]u8,
+    is_header: []bool,
+};
+
+/// The team a leader row opens, if its first token names a participant:
+/// all-caps 2-4 characters matching an abbreviation exactly (player
+/// names are title case, so they never qualify). Null for player rows
+/// and for sections without team splits.
+fn leaderHeaderTeam(label: []const u8, participants: []const detail.DetailParticipant) ?[]const u8 {
+    const sp = std.mem.indexOfScalar(u8, label, ' ') orelse return null;
+    const token = label[0..sp];
+    if (token.len < 2 or token.len > 4) return null;
+    for (token) |c| if (c < 'A' or c > 'Z') return null;
+    for (participants) |p| if (std.mem.eql(u8, p.abbreviation, token)) return token;
+    return null;
+}
+
+fn leadersLines(
+    allocator: std.mem.Allocator,
+    leaders: []const []const u8,
+    participants: []const detail.DetailParticipant,
+    total: usize,
+) !LeadersBlock {
+    var teams: std.ArrayList(?[]const u8) = .empty;
+    defer teams.deinit(allocator);
+    var value_w: usize = 0;
+    var current: ?[]const u8 = null;
+    for (leaders) |item| {
+        const parts = splitValue(item);
+        if (leaderHeaderTeam(parts.label, participants)) |team| current = team;
+        try teams.append(allocator, current);
+        value_w = @max(value_w, table.textCells(parts.value));
+    }
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    var headers: std.ArrayList(bool) = .empty;
+    errdefer headers.deinit(allocator);
+    for (leaders, teams.items) |item, team| {
+        const parts = splitValue(item);
+        const header = leaderHeaderTeam(parts.label, participants) != null;
+        const label = if (!header and team != null)
+            try std.fmt.allocPrint(allocator, "{s}  {s}", .{ team.?, parts.label })
+        else
+            try allocator.dupe(u8, parts.label);
+        defer allocator.free(label);
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer buf.deinit();
+        if (parts.value.len == 0) {
+            try writeCell(&buf.writer, label, total, null, false);
+        } else {
+            try writeCell(&buf.writer, label, total -| value_w -| 1, null, false);
+            try buf.writer.writeByte(' ');
+            try writeCellRight(&buf.writer, parts.value, value_w, null, false);
+        }
+        const raw = try buf.toOwnedSlice();
+        defer allocator.free(raw);
+        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
+        try headers.append(allocator, header);
+    }
+    return .{ .lines = try out.toOwnedSlice(allocator), .is_header = try headers.toOwnedSlice(allocator) };
 }
 
 /// Split a "label ... value" row at its last space: leaders
@@ -614,6 +696,23 @@ test "detail text reads as aligned sections without box rules" {
         if (line.len == 0) continue;
         try std.testing.expect(table.textCells(line) <= 52);
     }
+}
+
+test "detail leaders group players under team totals" {
+    var game = testDetail();
+    game.leaders = &.{ "ATL H-AB 10-35", "Drake Baldwin 2-4", "PHI H-AB 7-32", "Kyle Schwarber 2-4" };
+    const output = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(output);
+    // Player rows inherit their team's abbreviation; team totals stay.
+    try std.testing.expect(std.mem.indexOf(u8, output, "ATL  Drake Baldwin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "PHI  Kyle Schwarber") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ATL H-AB") != null);
+    _ = try std.unicode.Utf8View.init(output);
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "ATL  Drake Baldwin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"dim\">ATL H-AB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
 
 test "detail text shows the live situation chip" {

@@ -84,6 +84,7 @@ pub const Route = union(enum) {
     openapi,
     docs,
     llms,
+    favicon,
     health,
     not_found,
     bad_date,
@@ -103,6 +104,7 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/docs")) return .docs;
+    if (std.mem.eql(u8, path, "/favicon.svg")) return .favicon;
     if (std.mem.eql(u8, path, "/llms.txt")) return .llms;
     if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
 
@@ -402,6 +404,8 @@ test "short routes parse and API targets are JSON" {
     try std.testing.expect(isJsonTarget("/api/v1/leagues"));
     try std.testing.expect(!isJsonTarget("/"));
     try std.testing.expect(parse("/docs") == .docs);
+    try std.testing.expect(parse("/favicon.svg") == .favicon);
+    try std.testing.expect(parse("/favicon.svg?v=2") == .favicon);
     try std.testing.expect(!isJsonTarget("/docs"));
 }
 

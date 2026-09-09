@@ -1203,6 +1203,35 @@ fn humanizeStatKey(arena: std.mem.Allocator, key: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Board lookup for one game id: the UTC-date board first (existing
+/// behavior — ESPN answers dateless summary lookups against it), then the
+/// Eastern-day board derived from the summary timestamp. Evening games in
+/// the Americas date next-day UTC while boards and links run Eastern, so
+/// the fallback is what keeps them viewable. Returns the game plus the
+/// day of the board that held it (callers date the detail off the match,
+/// never the raw UTC stamp). Null when both boards miss.
+fn findBoardGame(
+    self: EspnAdapter,
+    arena: std.mem.Allocator,
+    league: *const core.leagues.League,
+    game_id: []const u8,
+    utc_day: []const u8,
+    timestamp: []const u8,
+) !?struct { game: core.domain.Game, day: []const u8 } {
+    const board = try self.fetch(arena, league, utc_day);
+    for (board.games) |game| {
+        if (std.mem.eql(u8, game.id, game_id)) return .{ .game = game, .day = utc_day };
+    }
+    const epoch = core.date.parseTimestampUTC(timestamp) orelse return null;
+    const et_day = try core.date.todayInTz(arena, epoch, core.date.etOffsetMinutes(epoch));
+    if (std.mem.eql(u8, et_day, utc_day)) return null;
+    const et_board = try self.fetch(arena, league, et_day);
+    for (et_board.games) |game| {
+        if (std.mem.eql(u8, game.id, game_id)) return .{ .game = game, .day = et_day };
+    }
+    return null;
+}
+
 pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const summary_url = try espn.buildSummaryUrl(arena, self.base_url, endpoint.sport, endpoint.league, game_id);
@@ -1219,14 +1248,14 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
     if (!core.date.validate(day)) return error.UpstreamResponse;
     // Reuse the scoreboard path: the board is the source of the game row
     // (identity, state, status), so a game missing from its date's board is
-    // an unknown id even when the summary endpoint answered.
-    const board = try self.fetch(arena, league, day);
-    var board_game: ?core.domain.Game = null;
-    for (board.games) |game| if (std.mem.eql(u8, game.id, game_id)) {
-        board_game = game;
-        break;
-    };
-    const game = board_game orelse return error.GameNotFound;
+    // an unknown id even when the summary endpoint answered. Evening games
+    // in the Americas land on the next UTC day while ESPN boards — and the
+    // links rendered from them — run on Eastern days, so fall back to the
+    // ET-day board before calling the id unknown (an 8:20 PM ET kickoff is
+    // dated next-day UTC). Truly unknown ids miss both boards and still 404.
+    const hit = try findBoardGame(self, arena, league, game_id, day, competition.date) orelse
+        return error.GameNotFound;
+    const game = hit.game;
 
     var participants: std.ArrayList(core.detail.DetailParticipant) = .empty;
     for (game.participants) |participant| {
@@ -1243,7 +1272,10 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
             }
             hits = try jsonText(arena, competitor.hits);
             errors = try jsonText(arena, competitor.errors);
-            record = summaryRecord(competitor.record);
+            // Pre-game summaries often omit records; the board row already
+            // carries the same ESPN record summary, so fall back to it
+            // rather than rendering a record-less preview.
+            record = summaryRecord(competitor.record) orelse participant.record;
             if (competitor.probables.len > 0) probable = athleteName(competitor.probables[0].athlete);
         }
         try participants.append(arena, .{
@@ -1338,7 +1370,7 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
     if (try summarySeries(arena, response, game.id)) |from_summary| {
         series = from_summary;
     } else {
-        series = try seriesFromSchedules(self, arena, endpoint, day[0..4], competition, game.id);
+        series = try seriesFromSchedules(self, arena, endpoint, hit.day[0..4], competition, game.id);
     }
 
     // depth: box-score team totals ride the already-fetched summary payload.
@@ -1348,7 +1380,7 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .id = try copy(arena, game.id),
         .league = league.slug,
         .league_name = league.name,
-        .date = try copy(arena, day),
+        .date = try copy(arena, hit.day),
         .state = game.state,
         .status = game.status,
         .venue = venue,
@@ -1367,6 +1399,11 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
 const DetailFake = struct {
     summary_body: []const u8,
     board_body: []const u8,
+    /// Alternate board body served when the scoreboard URL carries
+    /// `board_alt_dates` (compact YYYYMMDD): models the ET-day board
+    /// differing from the UTC-day board for evening games.
+    board_alt_body: []const u8 = "",
+    board_alt_dates: []const u8 = "",
     sched_a_id: []const u8 = "",
     sched_a_body: []const u8 = "",
     sched_b_body: []const u8 = "",
@@ -1383,6 +1420,11 @@ const DetailFake = struct {
         }
         if (std.mem.indexOf(u8, url, "/scoreboard") != null) {
             self.board_calls += 1;
+            if (self.board_alt_body.len > 0 and self.board_alt_dates.len > 0 and
+                std.mem.indexOf(u8, url, self.board_alt_dates) != null)
+            {
+                return .{ .status = .ok, .body = try arena.dupe(u8, self.board_alt_body) };
+            }
             return .{ .status = .ok, .body = try arena.dupe(u8, self.board_body) };
         }
         if (std.mem.indexOf(u8, url, "/schedule") != null) {
@@ -1459,6 +1501,43 @@ test "fetchDetail enriches the board row with summary fields" {
     try std.testing.expect(detail.leaders.len >= 4);
     try std.testing.expectEqualStrings("ATL H-AB 10-35", detail.leaders[0]);
     try std.testing.expectEqualStrings("Drake Baldwin 2-4", detail.leaders[1]);
+}
+
+const evening_summary_fixture =
+    \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"pre","shortDetail":"9/9 - 8:20 PM EDT","description":"Scheduled"}},"competitors":[{"id":"25","homeAway":"home","winner":false,"score":0,"team":{"id":"25","displayName":"Seattle Seahawks","abbreviation":"SEA"}},{"id":"17","homeAway":"away","winner":false,"score":0,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}}]}]}}
+;
+
+const evening_board_fixture =
+    \\{"events":[{"id":"401872656","name":"New England Patriots at Seattle Seahawks","date":"2026-09-09T20:20Z","status":{"type":{"state":"pre","shortDetail":"9/9 - 8:20 PM EDT"}},"competitions":[{"competitors":[{"homeAway":"away","score":"0","winner":false,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"},"records":[{"type":"total","summary":"0-0"}]},{"homeAway":"home","score":"0","winner":false,"team":{"id":"25","displayName":"Seattle Seahawks","abbreviation":"SEA"},"records":[{"type":"total","summary":"0-0"}]}]}]}]}
+;
+
+test "fetchDetail finds evening games on the ET-day board" {
+    // 8:20 PM ET Sep 9 lands on Sep 10 UTC: the UTC-day board misses while
+    // the Eastern-day board (the one our links render from) holds the game.
+    // The pre-game summary carries no records, so the board row supplies
+    // them and the detail dates off the matched Eastern day.
+    var fake = DetailFake{
+        .summary_body = evening_summary_fixture,
+        .board_body = "{\"events\":[]}",
+        .board_alt_body = evening_board_fixture,
+        .board_alt_dates = "20260909",
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("nfl").?, "401872656");
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.board_calls);
+    try std.testing.expectEqualStrings("401872656", detail.id);
+    try std.testing.expectEqualStrings("nfl", detail.league);
+    try std.testing.expectEqualStrings("2026-09-09", detail.date);
+    try std.testing.expectEqualStrings("pre", detail.state);
+    try std.testing.expectEqualStrings("9/9 - 8:20 PM EDT", detail.status);
+    try std.testing.expectEqual(@as(usize, 2), detail.participants.len);
+    try std.testing.expectEqualStrings("NE", detail.participants[0].abbreviation);
+    try std.testing.expectEqualStrings("SEA", detail.participants[1].abbreviation);
+    try std.testing.expectEqualStrings("0-0", detail.participants[1].record.?);
+    try std.testing.expectEqual(@as(usize, 0), detail.scoring_plays.len);
+    _ = try std.unicode.Utf8View.init(detail.status);
 }
 
 test "fetchDetail reports GameNotFound when the board lacks the id" {

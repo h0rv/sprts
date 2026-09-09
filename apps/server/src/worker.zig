@@ -157,6 +157,9 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             const body = try spec.llmsTxt(alloc);
             return staticResponse(body, contentType(.text), null);
         },
+        .favicon => {
+            return staticResponse(render.favicon_svg, "image/svg+xml", null);
+        },
         .home => |home_route| {
             var transport_state = WorkerTransport{};
             const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
@@ -759,25 +762,31 @@ fn serveAll(
         .clock = workerClock,
     };
     const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
-    // Variant key for the per-league refresh puts below: the stored bodies
-    // are full renders (never one-line), so `oneline` is always false here
-    // — a digest refresh warms the full-render entries single-league routes
-    // read, never the `?0` namespace. The request zone joins the tag so the
-    // refresh warms the zone entry single-league routes actually read.
-    const tag = try variantTag(alloc, format, route.width, route.height, color, false, zone);
-    const sections = try alloc.alloc(digest.DigestSection, core.leagues.all.len);
+    // Digest-level edge entry: /all fans out one normalized fetch per
+    // league (~20 subrequests), and Workers Free allows 50 per invocation,
+    // so per-league edge traffic would blow the budget — the old code did
+    // a match + put per league (~60 ops) and prod 500d with "too many
+    // subrequests". Now the digest caches its own fully-rendered body
+    // (fresh-hit = ~2 ops) and the loop does plain fetches only: no
+    // per-league match (it never saved anything — the digest composition
+    // below re-renders regardless) and no warming puts (single-league
+    // routes fetch on their own demand at 3 ops each). First hit costs
+    // ~20 fetches + 1 put; repeats cost one match. The variant tag must
+    // include oneline: ?0 renders a different body than the full digest.
+    const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone);
+    const digest_key = try edge.boardKey(alloc, "all", day, tag);
+    const fresh_key = try edge.freshKey(alloc, digest_key, epoch_s);
     const cache = workers.Cache.default();
+    // Fresh hit: same 30s bucket, so age < 30s. Serve the stored render.
+    if (cache.match(.{ .url = fresh_key })) |hit| {
+        var resp = hit.clone();
+        resp.setHeader("cache-control", edge.client_cache_control);
+        resp.setHeader("x-sprts-cache", "hit");
+        return resp;
+    }
+    const sections = try alloc.alloc(digest.DigestSection, core.leagues.all.len);
     for (&core.leagues.all, 0..) |*league, i| {
         sections[i] = .{ .league = league };
-        const slug = try edge.canonicalSlug(alloc, league.slug);
-        const board_key = try edge.boardKey(alloc, slug, day, tag);
-        const fresh_key = try edge.freshKey(alloc, board_key, epoch_s);
-        // Edge stores renders, not boards, so the digest always does one
-        // normalized fetch per league and refreshes that league's edge
-        // entries from it. A fresh hit still saves nothing here — the
-        // render below is the digest composition, not the league render —
-        // but the per-league put() keeps single-league routes warm.
-        _ = cache.match(.{ .url = fresh_key });
         const board = adapter.fetch(alloc, league, day) catch {
             // One league's outage never fails the digest: mark the
             // section unavailable and keep the others.
@@ -785,15 +794,6 @@ fn serveAll(
             continue;
         };
         sections[i].board = board;
-        // Refresh per-league edge entries from the normalized board.
-        const body = switch (format) {
-            .text => render.textWithZone(alloc, board, color, route.width, route.height, zone) catch continue,
-            .html => render.scoreHtmlWithZone(alloc, board, route.width, route.height, zone) catch continue,
-            .json => render.json(alloc, board) catch continue,
-        };
-        var resp = boardResponse(body, format, "miss");
-        var for_fresh = resp.clone();
-        cache.put(.{ .url = fresh_key }, &for_fresh);
     }
     const body = switch (format) {
         .text => if (route.oneline)
@@ -803,7 +803,10 @@ fn serveAll(
         .html => try digest.htmlWithZone(alloc, sections, day, route.width, route.height, route.quiet, zone),
         .json => try digest.json(alloc, sections, day),
     };
-    return staticResponse(body, contentType(format), null);
+    var resp = staticResponse(body, contentType(format), "miss");
+    var for_fresh = resp.clone();
+    cache.put(.{ .url = fresh_key }, &for_fresh);
+    return resp;
 }
 
 test "edge variant tags split width, color, and one-line in one bucket" {
@@ -926,8 +929,8 @@ test "edge variant tags split ET and UTC zones in one bucket" {
     try std.testing.expect(!std.mem.eql(u8, et_tag, fixed_tag));
     try std.testing.expect(!std.mem.eql(u8, utc_tag, fixed_tag));
     // Every other variant-cached namespace rides the same tag, so detail,
-    // team, standings, and the /all per-league refresh puts inherit the
-    // zone split in the same bucket.
+    // team, standings, and the digest-level /all entry inherit the zone
+    // split in the same bucket.
     const et_detail = try edge.detailKey(arena, "mlb", "1", et_tag);
     defer arena.free(et_detail);
     const utc_detail = try edge.detailKey(arena, "mlb", "1", utc_tag);
