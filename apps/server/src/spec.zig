@@ -196,7 +196,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  JSON: curl localhost:8080/api/v1/mlb\n" ++
             "\n" ++
             "FLAGS text and HTML only, JSON ignores display flags\n" ++
-            "  ?date=YYYY-MM-DD scoreboard day, default today\n" ++
+            "  ?date=YYYY-MM-DD scoreboard day, default today (today/tomorrow/yesterday also work)\n" ++
             "  ?week=N football-only week selector, ignored elsewhere\n" ++
             "  ?color=0 color off, ?color=1 color on\n" ++
             "  ?width=N ?height=N terminal size cap\n" ++

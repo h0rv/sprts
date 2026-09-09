@@ -156,7 +156,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
     try w.writeAll(
         \\  color=0|1  width=N (52..200)  height=N (max games)
         \\  quiet=0|1 (no header/footer)  oneline=0|1 (?0, text only)  format=text|html
-        \\  date=YYYY-MM-DD (scoreboard, all)  week=N (football only)
+        \\  date=YYYY-MM-DD|today|tomorrow|yesterday (scoreboard, all)  week=N (football only)
         \\  stream=sse (scoreboard text only, curl -N)  tz=utc (default et)
         \\
     );
@@ -198,7 +198,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
     try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/standings /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
-    try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD week=N tz=utc | aliases T A q 0 (long wins; later alias wins)\n");
+    try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
 }

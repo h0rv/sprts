@@ -74,12 +74,20 @@ pub fn zoneFromWorkerRequest(target: []const u8, cf_timezone: ?[]const u8, cf_tz
 
 /// Resolve the board day: explicit `?date` verbatim, else "today" in `zone`.
 pub fn resolveDay(arena: std.mem.Allocator, date: ?[]const u8, epoch_s: i64, zone: Zone) ![]u8 {
-    if (date) |day| return arena.dupe(u8, day);
-    return switch (zone) {
-        .et => core.date.todayET(arena, epoch_s),
-        .utc => core.date.todayFromEpoch(arena, epoch_s),
-        .fixed => |offset| core.date.todayInTz(arena, epoch_s, offset),
+    // Today's calendar day in the request zone, then through the relative
+    // resolver: ?date=tomorrow/yesterday ride the same zone as headings so
+    // output never disagrees with itself by a day. Router validation gates
+    // junk first, so resolveDate cannot fail here (tokens + strict dates).
+    const today = switch (zone) {
+        .et => try core.date.todayET(arena, epoch_s),
+        .utc => try core.date.todayFromEpoch(arena, epoch_s),
+        .fixed => |offset| try core.date.todayInTz(arena, epoch_s, offset),
     };
+    if (date) |raw| {
+        defer arena.free(today);
+        return core.date.resolveDate(arena, raw, today);
+    }
+    return today;
 }
 
 /// `M/D ZONE` label for a `YYYY-MM-DD` day, e.g. `9/6 ET`.
@@ -243,6 +251,20 @@ test "resolveDay passes ?date through, derives ET by default" {
     const fixed = try resolveDay(arena, null, 1788739200, .{ .fixed = -300 });
     defer arena.free(fixed);
     try std.testing.expectEqualStrings("2026-09-06", fixed);
+}
+
+test "resolveDay honors relative tokens against the request zone" {
+    const arena = std.testing.allocator;
+    // Noon UTC Sep 8: ET morning of Sep 8, UTC midday of Sep 8.
+    const noon = try resolveDay(arena, "tomorrow", 1788825600 + 43200, .et);
+    defer arena.free(noon);
+    try std.testing.expectEqualStrings("2026-09-09", noon);
+    const yest = try resolveDay(arena, "yesterday", 1788825600 + 43200, .utc);
+    defer arena.free(yest);
+    try std.testing.expectEqualStrings("2026-09-07", yest);
+    const today = try resolveDay(arena, "today", 1788825600 + 43200, .et);
+    defer arena.free(today);
+    try std.testing.expectEqualStrings("2026-09-08", today);
 }
 
 test "zoneTag names ET/UTC/fixed offsets" {
