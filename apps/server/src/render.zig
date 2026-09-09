@@ -92,13 +92,13 @@ pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, colo
     for (board.games[0..shown]) |game| {
         try t.rule(.mid);
         try t.row(game.status, statusColor(game.state));
-        try writeGameMarks(w, allocator, board.league, &game, inner, color);
         if (game.participants.len == 0) {
             try t.row(game.name, null);
         }
         for (game.participants) |participant| {
             try t.participantRow(participant);
         }
+        try writeGameMarks(w, allocator, board.league, &game, inner, color);
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
@@ -945,12 +945,24 @@ fn writeLinkedParticipantRow(
 /// name. Mirrors `writeLinkedParticipantRow`'s miss condition exactly so
 /// the two can never disagree about what links: anything flagged here is
 /// a row the linker would have left unlinked with the cursor held.
+/// Order-agnostic: marks render AFTER the participant rows, so trailing
+/// art rows arrive with the cursor exhausted (`part_pos >= len`). Those
+/// still carry braille and match no participant's abbr/name; the pointer
+/// row also arrives with the cursor exhausted but carries no braille, so
+/// it stays unflagged. Checking every participant in the exhausted case
+/// keeps the mirror exact (the linker would miss there too).
 fn isColorArtRow(line: []const u8, game: *const domain.Game, part_pos: usize, row_prefix: []const u8, row_suffix: []const u8) bool {
-    if (part_pos >= game.participants.len) return false;
     if (!std.mem.startsWith(u8, line, row_prefix) or !std.mem.endsWith(u8, line, row_suffix)) return false;
-    const p = &game.participants[part_pos];
-    if (p.abbreviation.len > 0 and std.mem.indexOf(u8, line, p.abbreviation) != null) return false;
-    if (p.name.len > 0 and std.mem.indexOf(u8, line, p.name) != null) return false;
+    if (part_pos < game.participants.len) {
+        const p = &game.participants[part_pos];
+        if (p.abbreviation.len > 0 and std.mem.indexOf(u8, line, p.abbreviation) != null) return false;
+        if (p.name.len > 0 and std.mem.indexOf(u8, line, p.name) != null) return false;
+        return containsBraille(line);
+    }
+    for (game.participants) |*q| {
+        if (q.abbreviation.len > 0 and std.mem.indexOf(u8, line, q.abbreviation) != null) return false;
+        if (q.name.len > 0 and std.mem.indexOf(u8, line, q.name) != null) return false;
+    }
     return containsBraille(line);
 }
 
