@@ -14,6 +14,29 @@ pub fn validate(value: []const u8) bool {
     return day <= max_day;
 }
 
+/// Lowercase-exact relative date tokens accepted in `?date=` alongside
+/// strict YYYY-MM-DD. Anything else stays strict (no case folding,
+/// no whitespace trimming). The router passes the raw token through;
+/// the serve path resolves it via `resolveDate`.
+pub fn isRelativeToken(value: []const u8) bool {
+    return std.mem.eql(u8, value, "today") or
+        std.mem.eql(u8, value, "tomorrow") or
+        std.mem.eql(u8, value, "yesterday");
+}
+
+/// Resolve a raw `?date=` value against a caller-supplied calendar day.
+/// `today` is a YYYY-MM-DD day (owned or borrowed, not consumed).
+/// Returns an owned YYYY-MM-DD: tokens shift via `shift()`, other
+/// strings are validated-and-duped, invalid raises `error.InvalidDate`
+/// for the caller's existing `bad_date` mapping. Pure.
+pub fn resolveDate(allocator: std.mem.Allocator, raw: []const u8, today_value: []const u8) ![]u8 {
+    if (std.mem.eql(u8, raw, "today")) return shift(allocator, today_value, 0);
+    if (std.mem.eql(u8, raw, "tomorrow")) return shift(allocator, today_value, 1);
+    if (std.mem.eql(u8, raw, "yesterday")) return shift(allocator, today_value, -1);
+    if (!validate(raw)) return error.InvalidDate;
+    return allocator.dupe(u8, raw);
+}
+
 pub fn compact(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     if (!validate(value)) return error.InvalidDate;
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ value[0..4], value[5..7], value[8..10] });
@@ -256,4 +279,84 @@ test "todayInTz applies a fixed offset" {
     defer std.testing.allocator.free(plus);
     try std.testing.expectEqualStrings("2026-09-07", plus);
     try std.testing.expectError(error.InvalidDate, todayInTz(std.testing.allocator, -1, 0));
+}
+
+test "relative tokens are lowercase-exact" {
+    try std.testing.expect(isRelativeToken("today"));
+    try std.testing.expect(isRelativeToken("tomorrow"));
+    try std.testing.expect(isRelativeToken("yesterday"));
+    try std.testing.expect(!isRelativeToken("Today"));
+    try std.testing.expect(!isRelativeToken("TOMORROW"));
+    try std.testing.expect(!isRelativeToken("Yesterday"));
+    try std.testing.expect(!isRelativeToken("2026-09-07"));
+    try std.testing.expect(!isRelativeToken(""));
+    try std.testing.expect(!isRelativeToken(" tomorrow"));
+}
+
+test "resolveDate shifts tokens across month and year boundaries" {
+    const alloc = std.testing.allocator;
+    // Identity token.
+    const t0 = try resolveDate(alloc, "today", "2026-09-07");
+    defer alloc.free(t0);
+    try std.testing.expectEqualStrings("2026-09-07", t0);
+    // Month boundary: Jan 31 tomorrow is Feb 1; Mar 1 yesterday is Feb 28/29.
+    const feb1 = try resolveDate(alloc, "tomorrow", "2026-01-31");
+    defer alloc.free(feb1);
+    try std.testing.expectEqualStrings("2026-02-01", feb1);
+    const jan31 = try resolveDate(alloc, "yesterday", "2026-02-01");
+    defer alloc.free(jan31);
+    try std.testing.expectEqualStrings("2026-01-31", jan31);
+    // Year boundary: Dec 31 tomorrow is Jan 1; Jan 1 yesterday is Dec 31.
+    const jan1 = try resolveDate(alloc, "tomorrow", "2025-12-31");
+    defer alloc.free(jan1);
+    try std.testing.expectEqualStrings("2026-01-01", jan1);
+    const dec31 = try resolveDate(alloc, "yesterday", "2026-01-01");
+    defer alloc.free(dec31);
+    try std.testing.expectEqualStrings("2025-12-31", dec31);
+    // Non-leap February: Feb 28 tomorrow is Mar 1.
+    const mar1 = try resolveDate(alloc, "tomorrow", "2026-02-28");
+    defer alloc.free(mar1);
+    try std.testing.expectEqualStrings("2026-03-01", mar1);
+}
+
+test "resolveDate handles leap day" {
+    const alloc = std.testing.allocator;
+    // Into the leap day from Feb 28.
+    const leap = try resolveDate(alloc, "tomorrow", "2024-02-28");
+    defer alloc.free(leap);
+    try std.testing.expectEqualStrings("2024-02-29", leap);
+    // Off the leap day.
+    const off = try resolveDate(alloc, "tomorrow", "2024-02-29");
+    defer alloc.free(off);
+    try std.testing.expectEqualStrings("2024-03-01", off);
+    const back = try resolveDate(alloc, "yesterday", "2024-03-01");
+    defer alloc.free(back);
+    try std.testing.expectEqualStrings("2024-02-29", back);
+    const before = try resolveDate(alloc, "yesterday", "2024-02-29");
+    defer alloc.free(before);
+    try std.testing.expectEqualStrings("2024-02-28", before);
+    // Identity on the leap day itself.
+    const same = try resolveDate(alloc, "today", "2024-02-29");
+    defer alloc.free(same);
+    try std.testing.expectEqualStrings("2024-02-29", same);
+}
+
+test "resolveDate passes valid dates through and rejects the rest" {
+    const alloc = std.testing.allocator;
+    const passthrough = try resolveDate(alloc, "2026-09-06", "2026-09-07");
+    defer alloc.free(passthrough);
+    try std.testing.expectEqualStrings("2026-09-06", passthrough);
+    // Passthrough returns an owned copy even when today is junk.
+    const junk_today = try resolveDate(alloc, "2026-09-06", "not-a-date");
+    defer alloc.free(junk_today);
+    try std.testing.expectEqualStrings("2026-09-06", junk_today);
+    // Invalid raws raise for the caller's bad_date mapping.
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "Tomorrow", "2026-09-07"));
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "next-week", "2026-09-07"));
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "2026-13-01", "2026-09-07"));
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "2023-02-29", "2026-09-07"));
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "", "2026-09-07"));
+    // A bad caller day poisons token shifts (shift validates today).
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "today", "not-a-date"));
+    try std.testing.expectError(error.InvalidDate, resolveDate(alloc, "tomorrow", "2026-13-01"));
 }
