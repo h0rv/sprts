@@ -32,7 +32,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
         var lines = std.mem.splitScalar(u8, use_mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            try w.writeAll(line);
+            try table.writeContrastLine(w, line);
             try w.writeByte('\n');
         }
         try w.writeByte('\n');

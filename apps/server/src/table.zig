@@ -338,6 +338,17 @@ fn xtermRgb(idx: u8) [3]u16 {
     return .{ 0, 0, 0 };
 }
 
+/// Band-pass for logo ink. `isDarkXterm` (below) drops near-black runs
+/// unreadable on dark terminals; `isLightXterm` drops near-white runs
+/// unreadable on light backgrounds (our light-theme paper #f4f1e8).
+/// Mid colors (team reds, blues, oranges) pass both filters untouched,
+/// so most logo color survives while no run is ever invisible.
+fn isLightXterm(idx: u8) bool {
+    const rgb = xtermRgb(idx);
+    const luma = 2126 * @as(u32, rgb[0]) + 7152 * @as(u32, rgb[1]) + 722 * @as(u32, rgb[2]);
+    return luma > 2000000;
+}
+
 /// True when an xterm color is too dark to read on a dark terminal
 /// background (gruvbox-dark and friends): near-black logo ink rendered
 /// in SGR black is invisible, while the terminal foreground (mono mark)
@@ -353,7 +364,15 @@ fn isDarkXterm(idx: u8) bool {
 /// palette index is unreadably dark and keeping the glyphs. Other runs
 /// (resets) pass through so open spans still close. Keeps logo ink
 /// visible on dark terminals without regenerating the data files.
-fn writeContrastLine(w: *std.Io.Writer, line: []const u8) !void {
+///
+/// Terminal rule only: backgrounds out there are overwhelmingly dark, so
+/// dark ink drops to the (readable) default foreground while light ink
+/// keeps its color. Light-background terminals invert the problem and
+/// cannot be detected over curl, so no query parameter can fix them —
+/// the assumption is documented here instead of threaded through every
+/// route. HTML takes the stricter band-pass (see `writeArtLineHtml`)
+/// because the page knows both of its themes.
+pub fn writeContrastLine(w: *std.Io.Writer, line: []const u8) !void {
     var i: usize = 0;
     while (i < line.len) {
         if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
@@ -409,11 +428,20 @@ pub fn writeArtLineHtml(
             if (j >= line.len) return;
             const seq = line[i .. j + 1];
             if (parseXtermIndex(seq)) |idx| {
-                if (open) try w.writeAll("</span>");
-                const rgb = xtermRgb(idx);
-                const span = std.fmt.bufPrint(&buf, "<span style=\"color:rgb({d},{d},{d})\">", .{ rgb[0], rgb[1], rgb[2] }) catch unreachable;
-                try w.writeAll(span);
-                open = true;
+                // Band-pass (see `isLightXterm`): extremes inherit the
+                // page ink on both themes; mids get their rgb span.
+                if (isDarkXterm(idx) or isLightXterm(idx)) {
+                    if (open) {
+                        try w.writeAll("</span>");
+                        open = false;
+                    }
+                } else {
+                    if (open) try w.writeAll("</span>");
+                    const rgb = xtermRgb(idx);
+                    const span = std.fmt.bufPrint(&buf, "<span style=\"color:rgb({d},{d},{d})\">", .{ rgb[0], rgb[1], rgb[2] }) catch unreachable;
+                    try w.writeAll(span);
+                    open = true;
+                }
             } else {
                 if (open) {
                     try w.writeAll("</span>");
@@ -437,9 +465,12 @@ pub fn writeArtRow(w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     try w.writeAll(" │\n");
 }
 
-/// One braille art row as HTML: SGR color runs become rgb spans via
-/// `writeArtLineHtml`, uncolored glyphs pass through escaped. Padding
-/// uses visible cells so the frame aligns with the text renderer.
+/// One braille art row as HTML: SGR color runs become rgb spans, except
+/// unreadably dark AND unreadably light runs, which inherit the page ink
+/// instead — one markup serves both themes (dark drops would vanish on
+/// dark, light drops on light), while mid-luminance team colors span on.
+/// Uncolored glyphs pass through escaped. Padding uses visible cells so
+/// the frame aligns with the text renderer.
 pub fn writeArtRowHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, line: []const u8, inner: usize) !void {
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
@@ -524,19 +555,27 @@ pub fn writeGameMarks(w: *std.Io.Writer, allocator: std.mem.Allocator, league: [
     }
     const height = @max(rows[0].items.len, rows[1].items.len);
     for (0..height) |r| {
-        try w.writeAll("│ ");
+        // Buffer the composed pair, then filter: side-by-side rows carry
+        // both teams' SGR runs raw, so dark ink would vanish on dark
+        // terminals without the same contrast pass the stacked path gets.
+        var row: std.Io.Writer.Allocating = .init(allocator);
+        defer row.deinit();
         for (0..2) |i| {
             if (i == 1) {
                 var g: usize = 0;
-                while (g < gap) : (g += 1) try w.writeByte(' ');
+                while (g < gap) : (g += 1) try row.writer.writeByte(' ');
             }
             const line = if (r < rows[i].items.len) rows[i].items[r] else "";
-            try w.writeAll(line);
+            try row.writer.writeAll(line);
             var pad: usize = widths[i] - countCells(line);
-            while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+            while (pad > 0) : (pad -= 1) try row.writer.writeByte(' ');
         }
         var fill: usize = inner - 2 - (widths[0] + gap + widths[1]);
-        while (fill > 0) : (fill -= 1) try w.writeByte(' ');
+        while (fill > 0) : (fill -= 1) try row.writer.writeByte(' ');
+        const text = try row.toOwnedSlice();
+        defer allocator.free(text);
+        try w.writeAll("│ ");
+        try writeContrastLine(w, text);
         try w.writeAll(" │\n");
     }
 }
@@ -1017,6 +1056,31 @@ test "dark logo ink is filtered for terminal contrast" {
     try std.testing.expect(isDarkXterm(16));
     try std.testing.expect(!isDarkXterm(196));
     try std.testing.expect(!isDarkXterm(226));
+    // Light band: white and bright yellow inherit ink; pure red keeps it.
+    try std.testing.expect(isLightXterm(231));
+    try std.testing.expect(isLightXterm(226));
+    try std.testing.expect(!isLightXterm(196));
+    try std.testing.expect(!isLightXterm(16));
     try std.testing.expectEqual(@as(?u8, 196), parseXtermIndex("\x1b[38;5;196m"));
     try std.testing.expect(parseXtermIndex("\x1b[0m") == null);
+}
+
+test "art html band-passes extremes to page ink" {
+    // White (231) and near-black (16) emit plain glyphs; red (196) spans.
+    const esc = struct {
+        fn f(w: *std.Io.Writer, b: u8) !void {
+            try w.writeByte(b);
+        }
+    }.f;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeArtLineHtml(&out.writer, "\x1b[38;5;231mW\x1b[0m\x1b[38;5;196mR\x1b[0m\x1b[38;5;16mB\x1b[0m", esc);
+    const got = try out.toOwnedSlice();
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "<span style=\"color:rgb(255,0,0)\">R</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "W") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "231") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, ",0,0)\">B") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(got);
 }
