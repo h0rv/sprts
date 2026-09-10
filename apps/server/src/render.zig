@@ -12,15 +12,8 @@ const tz = @import("tz.zig");
 /// Box-table surface, re-exported from the shared `table` module so views
 /// that reached these through `render` (e.g. `team_view`) keep compiling
 /// during the migration. New code should import `table.zig` directly.
-pub const Rule = table.Rule;
-pub const Table = table.Table;
 pub const writeCell = table.writeCell;
 pub const writeCellRight = table.writeCellRight;
-pub const writeRow = table.writeRow;
-pub const writeRule = table.writeRule;
-pub const fit = table.fit;
-pub const countCells = table.countCells;
-pub const writeArtRow = table.writeArtRow;
 pub const writeGameMarks = table.writeGameMarks;
 
 /// Classic box: 52 terminal columns, 50 between the borders.
