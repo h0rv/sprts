@@ -57,7 +57,7 @@ pub fn text(
         // Rows compose in `view.entryRows` (shared composer); emit stays
         // here so the document rhythm (budget, blanks, trailer) is untouched.
         const rows = try view.entryRows(allocator, group.entries, cols, has_points);
-        defer view.freeRows(allocator, rows);
+        defer view.freeLines(allocator, rows);
         for (rows) |row| {
             if (shown >= budget) break;
             try w.writeAll(row);

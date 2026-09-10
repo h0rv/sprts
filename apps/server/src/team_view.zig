@@ -11,7 +11,7 @@ const render = @import("render.zig");
 const router = @import("router.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
-const vd = @import("view_detail.zig");
+const vd = @import("view.zig");
 
 /// Text view: logo mark, header (name, record, standing), LIVE row when
 /// present, today's upcoming games top-center, last results, then the

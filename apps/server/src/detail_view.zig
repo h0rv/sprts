@@ -1,7 +1,7 @@
 //! Per-game detail renderer: a pipe-less document, not a box grid.
 //!
 //! Built on the shared `table.zig` cell primitives (`writeLine`,
-//! `textCells`) plus the shared `view_detail` section composers that
+//! `textCells`) plus the shared `view` section composers that
 //! column-align each section (participants, scoring plays, leaders,
 //! stats). Sections breathe through blank lines, wttr.in-style; the
 //! scoreboard keeps the box, documents don't. Text and HTML share every
@@ -15,7 +15,7 @@ const router = @import("router.zig");
 const render = @import("render.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
-const vd = @import("view_detail.zig");
+const vd = @import("view.zig");
 
 pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
     // Validated through the shared `render.validatedJson` gate — see it
@@ -1188,7 +1188,7 @@ test "detail scoring plays wrap long text instead of truncating" {
 }
 
 // Phase 2: hostile-fixture visible-text equality. Every row the shared
-// `view_detail` composers produce must surface verbatim in the text page
+// `view` composers produce must surface verbatim in the text page
 // and as visible text (tags stripped, entities unescaped) in the HTML
 // page — even when ESPN strings smuggle controls, ANSI, CJK width, and
 // `&<>"'` through every field at once.
