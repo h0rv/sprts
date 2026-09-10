@@ -171,7 +171,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
                 .transport = transport_state.asTransport(),
                 .clock = workerClock,
             };
-            const day = try tz.resolveDay(alloc, null, epochSecondsNow(), zone);
+            const day = try tz.resolveDay(alloc, home_route.date, epochSecondsNow(), zone);
             const boards = try adapter.fetchAll(alloc, day);
             defer provider.EspnAdapter.releaseAll(boards);
             const color = home_route.color orelse try colorDefault(env);

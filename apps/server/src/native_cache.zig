@@ -96,7 +96,7 @@ fn freshWindowFor(kind: Kind, data: Data) i64 {
     return switch (kind) {
         .board => if (edge.isLiveBoard(data.board)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
         .detail => if (edge.isLiveDetail(data.detail)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
-        .team, .standings => edge.schedule_fresh_ttl_s,
+        .team, .standings, .teams => edge.schedule_fresh_ttl_s,
     };
 }
 
@@ -585,7 +585,7 @@ pub const NativeCache = struct {
         const live = switch (data) {
             .board => |b| edge.isLiveBoard(b),
             .detail => |d| edge.isLiveDetail(d),
-            .team, .standings => false,
+            .team, .standings, .teams => false,
         };
         cache.put(if (live) live_key else final_key, data, at) catch |err| {
             std.log.warn("native cache store failed: {t}", .{err});
