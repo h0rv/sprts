@@ -819,6 +819,107 @@ pub fn renderHelp(w: *std.Io.Writer) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Paint control (flicker fix: diffed writes, throttled footer, SSE debounce)
+//
+// The loop used to `render()` a full-screen `writeFrame` on every wakeup
+// (~1Hz via `poll_tick_ms`), and the footer `updated Ns ago` ticker changed
+// the frame bytes every second, so the MLB board visibly flickered even
+// with unchanged data. Now: full repaints happen only when the content
+// hash moves; the footer refreshes at most every `footer_throttle_s` via
+// cursor-addressed line writes (never a full repaint); back-to-back SSE
+// frames inside `sse_debounce_s` coalesce instead of refetching per frame.
+// Row/header/footer bytes are untouched, so vim keys, navigation, and
+// rendering stay byte-identical.
+// ---------------------------------------------------------------------------
+
+/// Full repaints are content-driven; the footer line refreshes at most
+/// this often (cursor-addressed, never a full repaint).
+pub const footer_throttle_s: i64 = 5;
+
+/// SSE frames landing sooner than this after the last applied frame defer
+/// their refetch (freshness still updates); the pending frame applies on
+/// the next tick past the window.
+pub const sse_debounce_s: i64 = 2;
+
+/// Stable hash of one frame's bytes; the repaint gate compares these.
+pub fn hashFrame(bytes: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(bytes);
+    return h.final();
+}
+
+/// True when the footer line is due for its cursor-addressed refresh.
+pub fn footerDue(now_s: i64, last_footer_s: ?i64) bool {
+    const last = last_footer_s orelse return true;
+    return now_s - last >= footer_throttle_s;
+}
+
+/// True when an SSE-triggered refetch may run (debounce window elapsed).
+pub fn sseApplyDue(now_s: i64, last_apply_s: ?i64) bool {
+    const last = last_apply_s orelse return true;
+    return now_s - last >= sse_debounce_s;
+}
+
+/// True when a fresh SSE snapshot hash should refetch now; false defers
+/// the frame (caller stashes it as pending) so rapid bursts coalesce.
+pub fn sseShouldApply(now_s: i64, last_apply_s: ?i64, hash_changed: bool) bool {
+    return hash_changed and sseApplyDue(now_s, last_apply_s);
+}
+
+pub const PaintDecision = enum { full, footer_only, none };
+
+/// Content change always wins a full repaint; otherwise only a due footer
+/// earns its line write; a footer tick alone never triggers a full paint.
+pub fn decidePaint(content_changed: bool, footer_due: bool) PaintDecision {
+    if (content_changed) return .full;
+    if (footer_due) return .footer_only;
+    return .none;
+}
+
+/// Counting test-double for the repaint gate: feed it one content hash per
+/// tick (plus the clock) and it counts full-screen vs footer-line writes.
+/// Steady state with unchanged data yields exactly one full paint total;
+/// footer ticks alone never add a full paint.
+pub const FrameDeduper = struct {
+    last_content_hash: ?u64 = null,
+    last_footer_s: ?i64 = null,
+    full_paints: usize = 0,
+    footer_paints: usize = 0,
+
+    pub fn observe(self: *FrameDeduper, now_s: i64, content_hash: u64) PaintDecision {
+        return self.observeMasked(now_s, content_hash, true);
+    }
+
+    /// Same gate with the footer line suppressed (the help overlay owns
+    /// every row, so a footer write would clobber its bottom lines).
+    pub fn observeMasked(self: *FrameDeduper, now_s: i64, content_hash: u64, footer_allowed: bool) PaintDecision {
+        const changed = self.last_content_hash == null or self.last_content_hash.? != content_hash;
+        const decision = decidePaint(changed, footer_allowed and footerDue(now_s, self.last_footer_s));
+        switch (decision) {
+            .full => {
+                self.last_content_hash = content_hash;
+                self.last_footer_s = now_s;
+                self.full_paints += 1;
+            },
+            .footer_only => {
+                self.last_footer_s = now_s;
+                self.footer_paints += 1;
+            },
+            .none => {},
+        }
+        return decision;
+    }
+};
+
+/// Screen row for footer line `line_index` of `line_count` footer lines:
+/// the footer always owns the bottom lines of the terminal.
+pub fn footerRow(term_rows: usize, line_index: usize, line_count: usize) usize {
+    if (line_count == 0) return term_rows;
+    if (term_rows < line_count) return line_index + 1;
+    return term_rows - line_count + 1 + line_index;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal plumbing (ported from pts ui.zig: raw mode, poll, alt screen)
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1046,9 @@ fn writeStdout(io: std.Io, bytes: []const u8) !void {
 }
 
 fn writeFrame(io: std.Io, bytes: []const u8) !void {
+    // Re-assert hidden: the filter prompt briefly shows the cursor, and a
+    // visible cursor parked on repainted cells reads as flicker.
+    try writeStdout(io, "\x1b[?25l");
     var start: usize = 0;
     for (bytes, 0..) |b, i| {
         if (b != '\n') continue;
@@ -954,6 +1058,30 @@ fn writeFrame(io: std.Io, bytes: []const u8) !void {
     }
     if (start < bytes.len) try writeStdout(io, bytes[start..]);
     try writeStdout(io, "\x1b[K\x1b[J");
+}
+
+/// Footer-only refresh: rewrite just the bottom line(s) via cursor
+/// addressing, leaving every other cell untouched (no clear, no home).
+/// `footer_bytes` is the `renderFooter` output; each non-empty line lands
+/// on its owned bottom row and the cursor parks home (still hidden).
+fn writeFooterLines(io: std.Io, allocator: Allocator, term_rows: usize, footer_bytes: []const u8) !void {
+    try writeStdout(io, "\x1b[?25l");
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var split = std.mem.splitScalar(u8, footer_bytes, '\n');
+    while (split.next()) |line| {
+        if (line.len == 0) continue;
+        try lines.append(allocator, line);
+    }
+    for (lines.items, 0..) |line, i| {
+        const row = footerRow(term_rows, i, lines.items.len);
+        var seq: std.Io.Writer.Allocating = .init(allocator);
+        defer seq.deinit();
+        try seq.writer.print("\x1b[{d};1H\x1b[K", .{row});
+        try writeStdout(io, seq.written());
+        try writeStdout(io, line);
+    }
+    try writeStdout(io, "\x1b[H");
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1105,10 @@ const Tui = struct {
     last_fetch_s: ?i64 = null,
     last_error: ?[]u8 = null,
     sse_hash: ?u64 = null,
+    last_sse_apply_s: ?i64 = null,
+    pending_sse_hash: ?u64 = null,
+    pending_sse_mtime: ?i64 = null,
+    deduper: FrameDeduper = .{},
     leagues: ?sprts_client.LeagueList = null,
     board: ?sprts_client.Scoreboard = null,
     game: ?sprts_client.DetailGame = null,
@@ -1130,7 +1262,7 @@ const Tui = struct {
         };
         self.resetView();
         self.setFilter("");
-        self.sse_hash = null;
+        self.resetSse();
         self.loadCurrent();
     }
 
@@ -1142,8 +1274,17 @@ const Tui = struct {
         if (!self.nav.back()) return;
         self.resetView();
         self.setFilter("");
-        self.sse_hash = null;
+        self.resetSse();
         self.loadCurrent();
+    }
+
+    /// Fresh view, fresh stream: drop hashes, pending frames, and the
+    /// debounce clock so the new view's first snapshot applies at once.
+    fn resetSse(self: *Tui) void {
+        self.sse_hash = null;
+        self.last_sse_apply_s = null;
+        self.pending_sse_hash = null;
+        self.pending_sse_mtime = null;
     }
 
     fn setFilter(self: *Tui, value: []const u8) void {
@@ -1292,7 +1433,7 @@ const Tui = struct {
             self.setError("out of memory", .{});
             return;
         };
-        self.sse_hash = null;
+        self.resetSse();
         self.reloadBoard();
     }
 
@@ -1322,7 +1463,21 @@ const Tui = struct {
         const live = if (board) |b| boardHasLive(b) else true;
         if (!live) {
             // Settled slate: cheap poll keeps day boundaries exact.
+            // Identical payloads repaint nothing (paint gate hashes).
             self.reloadBoard();
+            return;
+        }
+        const now = self.nowS();
+        // Flush a debounced frame once the window elapses.
+        if (self.pending_sse_hash) |pending| {
+            if (sseApplyDue(now, self.last_sse_apply_s)) {
+                self.sse_hash = pending;
+                self.last_sse_apply_s = now;
+                if (self.pending_sse_mtime) |m| self.touchUpdated(m);
+                self.pending_sse_hash = null;
+                self.pending_sse_mtime = null;
+                self.reloadBoard();
+            }
             return;
         }
         const snap = sse.fetchSnapshot(self.viewAlloc(), self.transport, self.base_url, frame.league, frame.date) catch {
@@ -1330,31 +1485,60 @@ const Tui = struct {
             return;
         };
         if (self.sse_hash != null and self.sse_hash.? == snap.hash) {
-            if (snap.mtime) |m| {
-                if (self.last_update_s == null or m > self.last_update_s.?) self.last_update_s = m;
-            }
+            if (snap.mtime) |m| self.touchUpdated(m);
+            return;
+        }
+        // Freshness moves even when the refetch itself is deferred.
+        if (snap.mtime) |m| self.touchUpdated(m);
+        if (!sseShouldApply(now, self.last_sse_apply_s, true)) {
+            // Rapid burst: coalesce into one refetch past the window.
+            self.pending_sse_hash = snap.hash;
+            self.pending_sse_mtime = snap.mtime;
             return;
         }
         self.sse_hash = snap.hash;
-        if (snap.mtime) |m| self.last_update_s = m;
+        self.last_sse_apply_s = now;
         self.reloadBoard();
     }
 
     fn tickGame(self: *Tui, league: []const u8, id: []const u8) void {
         const frame = self.nav.current;
+        const now = self.nowS();
+        if (self.pending_sse_hash) |pending| {
+            if (sseApplyDue(now, self.last_sse_apply_s)) {
+                self.sse_hash = pending;
+                self.last_sse_apply_s = now;
+                if (self.pending_sse_mtime) |m| self.touchUpdated(m);
+                self.pending_sse_hash = null;
+                self.pending_sse_mtime = null;
+                self.reloadGame(league, id);
+            }
+            return;
+        }
         const snap = sse.fetchSnapshot(self.viewAlloc(), self.transport, self.base_url, league, frame.date) catch {
             self.reloadGame(league, id); // polling fallback
             return;
         };
         if (self.sse_hash != null and self.sse_hash.? == snap.hash) {
-            if (snap.mtime) |m| {
-                if (self.last_update_s == null or m > self.last_update_s.?) self.last_update_s = m;
-            }
+            if (snap.mtime) |m| self.touchUpdated(m);
+            return;
+        }
+        if (snap.mtime) |m| self.touchUpdated(m);
+        if (!sseShouldApply(now, self.last_sse_apply_s, true)) {
+            self.pending_sse_hash = snap.hash;
+            self.pending_sse_mtime = snap.mtime;
             return;
         }
         self.sse_hash = snap.hash;
-        if (snap.mtime) |m| self.last_update_s = m;
+        self.last_sse_apply_s = now;
         self.reloadGame(league, id);
+    }
+
+    /// Freshness without visible change: monotonic, and never by itself a
+    /// reason to repaint (the footer owns its throttled line write).
+    fn touchUpdated(self: *Tui, mtime: i64) void {
+        if (self.last_update_s == null or mtime > self.last_update_s.?)
+            self.last_update_s = mtime;
     }
 
     fn timeoutMs(self: *Tui) i32 {
@@ -1368,30 +1552,25 @@ const Tui = struct {
         return @intCast(delta);
     }
 
-    fn render(self: *Tui) !void {
-        var aw = std.Io.Writer.Allocating.init(self.gpa);
-        defer aw.deinit();
-        const w = &aw.writer;
+    /// One full frame with `true`, or a content probe with `false`.
+    /// Probes render the identical bytes (sentinel age) without mutating
+    /// navigation state; only real paints commit the scroll window.
+    /// `clampSelection` runs in both: it is idempotent, so probes stay
+    /// consistent with the paint they gate.
+    fn renderInto(self: *Tui, w: *std.Io.Writer, age_text: []const u8, commit_scroll: bool) !void {
         try w.writeAll("\x1b[H");
         try renderBanner(w);
 
         if (self.show_help) {
             try renderHelp(w);
-            return try writeFrame(self.io, aw.written());
+            return;
         }
 
         const size = terminalSize();
         const visible = visibleRows(bodyRows(size.rows));
         self.clampSelection();
         const scroll = ensureVisible(self.selected, self.scroll, visible);
-        self.scroll = scroll;
-
-        const now = self.nowS();
-        const age_text = if (self.last_update_s) |updated|
-            try formatAge(self.gpa, now, updated)
-        else
-            try self.gpa.dupe(u8, "not updated yet");
-        defer self.gpa.free(age_text);
+        if (commit_scroll) self.scroll = scroll;
 
         const frame = self.nav.current;
         const label: []const u8 = switch (frame.view) {
@@ -1431,7 +1610,64 @@ const Tui = struct {
             .err = self.last_error,
             .view = frame.view,
         });
+    }
+
+    /// Force a full repaint with live footer age (byte-identical bytes).
+    fn render(self: *Tui) !void {
+        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer aw.deinit();
+        const now = self.nowS();
+        const age_text = if (self.last_update_s) |updated|
+            try formatAge(self.gpa, now, updated)
+        else
+            try self.gpa.dupe(u8, "not updated yet");
+        defer self.gpa.free(age_text);
+        try self.renderInto(&aw.writer, age_text, true);
         try writeFrame(self.io, aw.written());
+    }
+
+    /// Content bytes for the repaint gate: the exact frame with a fixed
+    /// age sentinel, so the per-second `updated Ns ago` ticker never
+    /// counts as a content change.
+    fn buildContentBytes(self: *Tui) ![]u8 {
+        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer aw.deinit();
+        try self.renderInto(&aw.writer, "", false);
+        return self.gpa.dupe(u8, aw.written());
+    }
+
+    /// Footer-only refresh: live age over cursor-addressed lines.
+    fn paintFooter(self: *Tui) !void {
+        const now = self.nowS();
+        const age_text = if (self.last_update_s) |updated|
+            try formatAge(self.gpa, now, updated)
+        else
+            try self.gpa.dupe(u8, "not updated yet");
+        defer self.gpa.free(age_text);
+        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer aw.deinit();
+        try renderFooter(&aw.writer, .{
+            .age_text = age_text,
+            .auto_refresh = self.auto_refresh,
+            .err = self.last_error,
+            .view = self.nav.current.view,
+        });
+        try writeFooterLines(self.io, self.gpa, terminalSize().rows, aw.written());
+    }
+
+    /// Repaint gate: full paint only on content change, footer line at
+    /// most every `footer_throttle_s`, silence otherwise. Returns the
+    /// decision so tests can count full-screen writes per N ticks.
+    fn paintIfNeeded(self: *Tui) !PaintDecision {
+        const content = try self.buildContentBytes();
+        defer self.gpa.free(content);
+        const decision = self.deduper.observeMasked(self.nowS(), hashFrame(content), !self.show_help);
+        switch (decision) {
+            .full => try self.render(),
+            .footer_only => try self.paintFooter(),
+            .none => {},
+        }
+        return decision;
     }
 
     fn renderLeagues(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
@@ -1596,7 +1832,10 @@ pub fn run(
 
     var running = true;
     while (running) {
-        try tui.render();
+        // Gated paint: full screen only on content change, footer line
+        // throttled, silence otherwise (the old unconditional render
+        // repainted ~1Hz and flickered on the per-second age ticker).
+        _ = try tui.paintIfNeeded();
         const key = readKey(io, tui.timeoutMs()) catch .none;
         switch (key) {
             .none => tui.tick(),
@@ -2232,4 +2471,122 @@ test "color off strips every escape and color on keeps server roles" {
     try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[1;31m") != null);
     try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[33m") != null);
     try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[32m") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Flicker-gate tests: the counting double observes one content hash per
+// tick and counts full-screen vs footer-line writes (fake transport +
+// fixtures only, no network, no TTY).
+// ---------------------------------------------------------------------------
+
+test "paint gate hashes frames stably" {
+    const a = hashFrame("MLB\nrow");
+    const b = hashFrame("MLB\nrow");
+    const c = hashFrame("MLB\nchanged");
+    try std.testing.expectEqual(a, b);
+    try std.testing.expect(a != c);
+}
+
+test "footer refresh throttles to one line write per window" {
+    try std.testing.expect(footerDue(100, null));
+    try std.testing.expect(!footerDue(101, 100));
+    try std.testing.expect(!footerDue(104, 100));
+    try std.testing.expect(footerDue(105, 100));
+    try std.testing.expect(footerDue(200, 100));
+}
+
+test "sse refetch debounces rapid frames" {
+    try std.testing.expect(sseApplyDue(50, null));
+    try std.testing.expect(sseShouldApply(50, null, true));
+    try std.testing.expect(!sseShouldApply(50, null, false));
+    // Burst 1s after the last apply defers; past the window it applies.
+    try std.testing.expect(!sseShouldApply(51, 50, true));
+    try std.testing.expect(sseShouldApply(52, 50, true));
+    // Unchanged hashes never refetch, inside the window or out.
+    try std.testing.expect(!sseShouldApply(51, 50, false));
+    try std.testing.expect(!sseShouldApply(500, 50, false));
+}
+
+test "paint decisions never spend a full repaint on the footer" {
+    try std.testing.expectEqual(PaintDecision.full, decidePaint(true, false));
+    try std.testing.expectEqual(PaintDecision.full, decidePaint(true, true));
+    try std.testing.expectEqual(PaintDecision.footer_only, decidePaint(false, true));
+    try std.testing.expectEqual(PaintDecision.none, decidePaint(false, false));
+}
+
+test "steady ticks repaint once per K observations" {
+    var gate = FrameDeduper{};
+    const content = hashFrame("mlb board bytes");
+    const ticks: i64 = 30;
+    var t: i64 = 1000;
+    while (t < 1000 + ticks) : (t += 1) _ = gate.observe(t, content);
+    // Exactly one full paint for the whole steady run...
+    try std.testing.expectEqual(@as(usize, 1), gate.full_paints);
+    // ...with the footer line throttled to its 5s cadence, never full.
+    try std.testing.expect(gate.footer_paints <= @divTrunc(@as(usize, @intCast(ticks)), @as(usize, @intCast(footer_throttle_s))) + 1);
+    // A real content change earns exactly one more full paint.
+    _ = gate.observe(1000 + ticks, hashFrame("mlb board bytes*"));
+    try std.testing.expectEqual(@as(usize, 2), gate.full_paints);
+}
+
+test "footer tick alone never triggers a full repaint" {
+    var gate = FrameDeduper{};
+    const content = hashFrame("steady board");
+    try std.testing.expectEqual(PaintDecision.full, gate.observe(1000, content));
+    var t: i64 = 1001;
+    while (t < 1100) : (t += 1) {
+        const decision = gate.observe(t, content);
+        try std.testing.expect(decision != .full);
+    }
+    try std.testing.expectEqual(@as(usize, 1), gate.full_paints);
+    try std.testing.expect(gate.footer_paints > 0);
+}
+
+test "help overlay suppresses the footer line" {
+    var gate = FrameDeduper{};
+    const help = hashFrame("help overlay");
+    try std.testing.expectEqual(PaintDecision.full, gate.observeMasked(1000, help, false));
+    // Footer due but masked: silence, no footer write over the overlay.
+    try std.testing.expectEqual(PaintDecision.none, gate.observeMasked(1006, help, false));
+    try std.testing.expectEqual(@as(usize, 0), gate.footer_paints);
+    // Same state unmasked: the footer line fires.
+    try std.testing.expectEqual(PaintDecision.footer_only, gate.observeMasked(1006, help, true));
+}
+
+test "footer owns the bottom terminal rows" {
+    try std.testing.expectEqual(@as(usize, 24), footerRow(24, 0, 1));
+    try std.testing.expectEqual(@as(usize, 23), footerRow(24, 0, 2));
+    try std.testing.expectEqual(@as(usize, 24), footerRow(24, 1, 2));
+    try std.testing.expectEqual(@as(usize, 2), footerRow(2, 1, 2));
+}
+
+test "board content bytes ignore the age ticker but move with selection" {
+    // Drives the real `Tui` content probe over the fake transport: the
+    // per-second footer age must not change the gated hash, while a vim
+    // `j` step must (navigation still repaints).
+    var fake = FakeTransportState{ .body = canned_board };
+    var tui = try Tui.init(std.testing.allocator, flowIo(), fake.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-06" });
+    defer tui.deinit();
+    tui.loadCurrent();
+    try std.testing.expect(tui.board != null);
+
+    const before = try tui.buildContentBytes();
+    defer std.testing.allocator.free(before);
+    // Thirty seconds of footer ticks: identical content bytes.
+    tui.last_update_s = (tui.last_update_s orelse 0) -| 30;
+    const after_ticks = try tui.buildContentBytes();
+    defer std.testing.allocator.free(after_ticks);
+    try std.testing.expectEqualStrings(before, after_ticks);
+
+    var gate = FrameDeduper{};
+    _ = gate.observe(1000, hashFrame(before));
+    try std.testing.expect(gate.observe(1030, hashFrame(after_ticks)) != .full);
+    try std.testing.expectEqual(@as(usize, 1), gate.full_paints);
+
+    // One `j` step moves the gutter: new bytes, full repaint due.
+    tui.selected = moveDown(tui.selected, tui.rowCount(), 1);
+    const moved = try tui.buildContentBytes();
+    defer std.testing.allocator.free(moved);
+    try std.testing.expect(!std.mem.eql(u8, before, moved));
+    try std.testing.expectEqual(PaintDecision.full, gate.observe(1031, hashFrame(moved)));
 }
