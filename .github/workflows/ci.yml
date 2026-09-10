@@ -17,6 +17,7 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: mise install
       - run: mise run check
+      - run: cd apps/cli && mise exec -- zig build test && mise exec -- zig build
 
   container-publish:
     # Builds the Docker image and pushes it to ghcr.io.

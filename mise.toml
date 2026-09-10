@@ -18,6 +18,10 @@ run = "tools/generate-sprts-client"
 [tasks."run:cli"]
 run = "cd apps/cli && zig build run"
 
+[tasks."package:cli"]
+description = "Cross-compile sprts-tui release tarballs + SHA256SUMS into apps/cli/dist/"
+run = "apps/cli/scripts/package-release.sh"
+
 [tasks.deploy]
 description = "Build wasm and deploy to Cloudflare Workers (sprts.horv.co)"
 run = "npx wrangler deploy --env wasm"
