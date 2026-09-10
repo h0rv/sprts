@@ -15,6 +15,7 @@ pub const isNotFound = errors.isNotFound;
 test {
     _ = date;
     _ = detail;
+    _ = domain;
     _ = leagues;
     _ = art;
     _ = schedule;

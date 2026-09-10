@@ -52,6 +52,49 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
     return validatedJson(domain.Scoreboard, allocator, board);
 }
 
+test "scoreboard json carries both id and slug" {
+    // Additive slug: every game row carries its day-unique human id next
+    // to the numeric one, which stays the resolution address. Parse-back
+    // through the shared gate proves the shape still validates.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "min-det",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{},
+            },
+            .{
+                .id = "race",
+                .slug = "event-2",
+                .name = "Grand Prix",
+                .starts_at = "2026-09-09T13:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
+        },
+    };
+    const body = try json(arena, board);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\": \"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"slug\": \"min-det\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"slug\": \"event-2\"") != null);
+    const parsed = try std.json.parseFromSliceLeaky(domain.Scoreboard, arena, body, .{});
+    try std.testing.expectEqualStrings("1", parsed.games[0].id);
+    try std.testing.expectEqualStrings("min-det", parsed.games[0].slug);
+    try std.testing.expectEqualStrings("event-2", parsed.games[1].slug);
+}
+
 /// `width` is total terminal columns of the document (no frame takes
 /// space). Never shrinks below the classic 52-wide page; extra room
 /// stretches names. `height` caps the games listed (`+N more` trailer);
@@ -109,8 +152,7 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
-            const first_abbr = if (game.participants.len > 0) game.participants[0].abbreviation else "";
-            const game_link = try view.scoreGameLink(allocator, board.league, game.id, first_abbr);
+            const game_link = try view.scoreGameLink(allocator, board.league, board.date, game);
             defer allocator.free(game_link);
             try table.writeLine(w, game_link, cols, "2", color);
         }
@@ -429,7 +471,7 @@ fn homeSections(
                         try table.writeLine(w, "LIVE NOW", 50, "1;31", color);
                     }
                 }
-                try homeGameLine(allocator, w, result.league, game, color and !html, html, slug_w, abbr_w);
+                try homeGameLine(allocator, w, result.league, board.date, game, color and !html, html, slug_w, abbr_w);
             }
         }
     }
@@ -458,7 +500,7 @@ fn homeSections(
         }
         for (board.games) |game| {
             if (gameIsLive(game)) continue;
-            try homeGameLine(allocator, w, result.league, game, color and !html, html, slug_w, abbr_w);
+            try homeGameLine(allocator, w, result.league, board.date, game, color and !html, html, slug_w, abbr_w);
         }
         separated = true;
     }
@@ -571,6 +613,7 @@ fn homeGameLine(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     league: *const leagues.League,
+    board_date: []const u8,
     game: domain.Game,
     color: bool,
     html: bool,
@@ -585,7 +628,7 @@ fn homeGameLine(
         // granular links. The live/upcoming color span wraps the
         // siblings (a span containing anchors is valid HTML). The
         // status word carries the live/upcoming color span.
-        const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, game.id });
+        const href = try domain.gameHref(allocator, league.slug, board_date, game);
         defer allocator.free(href);
         try writeHtmlHomeGameLine(allocator, line, league, game, w, href);
         return;
@@ -892,7 +935,7 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                 part_pos = 0;
                 name_linked = false;
                 game_idx += 1;
-                try writeGameStatusRow(w, allocator, board.league, game, line, true);
+                try writeGameStatusRow(w, allocator, board.league, board.date, game, line, true);
                 continue;
             }
             // `+N more` trailer or the empty-schedule note.
@@ -922,7 +965,7 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                     // so link it too but skip the anchor id — the status
                     // row above already owns `game-{id}`.
                     name_linked = true;
-                    try writeGameStatusRow(w, allocator, board.league, game, line, false);
+                    try writeGameStatusRow(w, allocator, board.league, board.date, game, line, false);
                     continue;
                 }
                 // Later rows in a name-only block (TV line, pointer)
@@ -945,20 +988,23 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
 }
 
 /// Status (or name-only) row for one game: the trimmed line becomes the
-/// game link and carries the per-game anchor id. Made `with_id` so a
-/// caller can reuse the wrapper for rows that already live inside a
-/// linked context without duplicating ids. Padding never enters the
-/// anchor, so underlines stop at the text.
+/// game link and carries the per-game anchor id. The href is the human
+/// `/{league}/{date}/{slug}` (numeric legacy fallback inside), while the
+/// anchor id stays the numeric game id so fragment links never rot.
+/// Made `with_id` so a caller can reuse the wrapper for rows that already
+/// live inside a linked context without duplicating ids. Padding never
+/// enters the anchor, so underlines stop at the text.
 fn writeGameStatusRow(
     w: *std.Io.Writer,
     allocator: std.mem.Allocator,
     league_slug: []const u8,
+    board_date: []const u8,
     game: *const domain.Game,
     line: []const u8,
     with_id: bool,
 ) !void {
     const trimmed = std.mem.trimEnd(u8, line, " ");
-    const href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league_slug, game.id });
+    const href = try domain.gameHref(allocator, league_slug, board_date, game.*);
     defer allocator.free(href);
     try w.writeAll("<a href=\"");
     try escapeInto(w, href);
@@ -1738,6 +1784,7 @@ test "HTML pages link and never carry ANSI" {
         .games = &.{
             .{
                 .id = "1",
+                .slug = "awy-hme",
                 .name = "Away at Home",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "post",
@@ -1756,9 +1803,9 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
-    // Game and team links: status cell links the game (with anchor id),
-    // team abbrevs link their team pages.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\" id=\"game-1\">") != null);
+    // Game and team links: status cell links the human game address
+    // (with the numeric anchor id), team abbrevs link their team pages.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/awy-hme\" id=\"game-1\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
     // Hostile status text stays escaped even inside a link (padding
@@ -2183,7 +2230,9 @@ test "scoreHtml skips the color twin when no team has color art" {
     const stripped_slice = try stripped.toOwnedSlice();
     defer std.testing.allocator.free(stripped_slice);
     try std.testing.expectEqualStrings(mono, stripped_slice);
-    // Fast-path page: no rgb spans, no escapes, same visible text.
+    // Fast-path page: no rgb spans, no escapes, same visible text. The
+    // fixture carries no stamped slug, so the status row keeps the legacy
+    // numeric href (fallback pin).
     const page = try scoreHtml(std.testing.allocator, board, null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
@@ -2199,8 +2248,8 @@ test "scoreHtml narrow width keeps links and layout" {
     defer std.testing.allocator.free(page);
     // Width 40 clamps to the classic 52-wide box; height 2 shows two
     // games plus the `+1 more` trailer with no link.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\" id=\"game-1\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2\" id=\"game-2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/awy-hme\" id=\"game-1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/sec-thi\" id=\"game-2\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "id=\"game-3\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "+1 more") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
@@ -2454,6 +2503,7 @@ test "home groups live games, then today, then idle leagues" {
         .games = &.{
             .{
                 .id = "1",
+                .slug = "awy-hme",
                 .name = "Away at Home",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "in",
@@ -2568,7 +2618,7 @@ test "home groups live games, then today, then idle leagues" {
 
     const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/awy-hme\">") != null);
     // Granular team spans inside the game link: each side links its team.
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
@@ -2834,6 +2884,7 @@ fn testBoard() domain.Scoreboard {
         .games = &.{
             .{
                 .id = "1",
+                .slug = "awy-hme",
                 .name = "Away at Home",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "post",
@@ -2845,6 +2896,7 @@ fn testBoard() domain.Scoreboard {
             },
             .{
                 .id = "2",
+                .slug = "sec-thi",
                 .name = "Second at Third",
                 .starts_at = "2026-09-06T19:00Z",
                 .state = "pre",
@@ -2856,6 +2908,7 @@ fn testBoard() domain.Scoreboard {
             },
             .{
                 .id = "3",
+                .slug = "fou-fif",
                 .name = "Fourth at Fifth",
                 .starts_at = "2026-09-06T21:00Z",
                 .state = "pre",
@@ -3106,6 +3159,7 @@ test "home html game lines use sibling anchors, never nested" {
         .games = &.{
             .{
                 .id = "401816854",
+                .slug = "cle-bal",
                 .name = "Away at Home",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "in",
@@ -3145,7 +3199,7 @@ test "home html game lines use sibling anchors, never nested" {
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     // Every game/team href from the nested layout is still present.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401816854\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/cle-bal\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/CLE\">CLE</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/BAL\">BAL</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nba/2\">") != null);
@@ -3317,6 +3371,7 @@ fn artDuelBoard() domain.Scoreboard {
         .games = &.{
             .{
                 .id = "9",
+                .slug = "phi-nym",
                 .name = "PHI at NYM",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "post",
@@ -3346,7 +3401,7 @@ test "art off strips every mark, keeps layout minus the art rows" {
         defer arena.free(off);
         try expectArtOffLayout(off, on, cols);
         // Scores, names, and pointers survive verbatim.
-        for ([_][]const u8{ "Final", "PHI", "NYM", "5 ✓", "game: /mlb/9" }) |token| {
+        for ([_][]const u8{ "Final", "PHI", "NYM", "5 ✓", "game: /mlb/2026-09-06/phi-nym" }) |token| {
             try std.testing.expect(std.mem.indexOf(u8, off, token) != null);
         }
         // Colored art-off: marks skip (not just uncolor), still no braille.
@@ -3378,6 +3433,7 @@ test "art off drops stacked marks and their interior blanks too" {
         .games = &.{
             .{
                 .id = "7",
+                .slug = "event-1",
                 .name = "ATX at HOU",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "post",
@@ -3395,7 +3451,7 @@ test "art off drops stacked marks and their interior blanks too" {
     defer arena.free(off);
     try expectArtOffLayout(off, on, 52);
     try std.testing.expect(std.mem.indexOf(u8, off, "Austin FC") != null);
-    try std.testing.expect(std.mem.indexOf(u8, off, "game: /mls/7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "game: /mls/2026-09-06/event-1") != null);
 }
 
 /// Visible-text twin of `expectVisiblePreText` for the art flag: the
@@ -3449,8 +3505,8 @@ test "art-off HTML carries no marks, no logo spans, same visible text" {
     // absence proves every mark row is gone (not merely unlinked).
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
-    // Links survive: the game anchor and both team links still navigate.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/9\" id=\"game-9\">") != null);
+    // Links survive: the human game anchor and both team links navigate.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/phi-nym\" id=\"game-9\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">PHI</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
     try expectVisiblePreTextArt(page, board, null, null, false);
@@ -3585,6 +3641,7 @@ test "dated home matches today render when every league played" {
         .games = &.{
             .{
                 .id = "1",
+                .slug = "awy-hme",
                 .name = "Away at Home",
                 .starts_at = "2025-09-10T17:00Z",
                 .state = "in",
@@ -3612,7 +3669,7 @@ test "dated home matches today render when every league played" {
     const today_html = try homeHtmlLive(arena, "example.test", &results, "2025-09-10", false, false);
     defer arena.free(today_html);
     try std.testing.expectEqualStrings(today_html, dated_html);
-    try std.testing.expect(std.mem.indexOf(u8, dated_html, "<a href=\"/mlb/1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated_html, "<a href=\"/mlb/2025-09-10/awy-hme\">") != null);
     _ = try std.unicode.Utf8View.init(dated);
     _ = try std.unicode.Utf8View.init(dated_html);
 }
@@ -3631,6 +3688,7 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
         .games = &.{
             .{
                 .id = "9",
+                .slug = "phi-nym",
                 .name = "PHI at NYM",
                 .starts_at = "2025-09-10T17:00Z",
                 .state = "post",
@@ -3654,7 +3712,7 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
     _ = try std.unicode.Utf8View.init(colored);
     const page = try scoreHtml(arena, board, null, null);
     defer arena.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/9\" id=\"game-9\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2025-09-10/phi-nym\" id=\"game-9\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">PHI</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);

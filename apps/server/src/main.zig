@@ -302,6 +302,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             cache_state = @tagName(cached.outcome);
             status = .ok;
             const game_detail = cached.data.detail;
+            // No `Link: <human>; rel=canonical` header here, by decision:
+            // the worker serves cached renders without the payload in hand,
+            // so only fresh misses could stamp one — inconsistent. The
+            // human address is one 302 away and emitted on every surface
+            // (plus the additive JSON `slug`), which carries the signal.
             // One-line fallback via the shared predicate: text + ?0 selects
             // renderTextOneLine, every other combination keeps the full box
             // (html/json ignore ?0 by team-route precedent).
@@ -317,8 +322,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         },
         .today => |today_route| {
             // Human shortcut: resolve the team's game today, then redirect
-            // to its canonical address (game id, or the team page when no
-            // game today). Fresh-only, no-store, no query carried over.
+            // to its human address (`/{league}/{date}/{slug}`, date form —
+            // the same links every renderer emits), or the team page when
+            // no game today. The `/api/v1/` twin keeps the numeric id
+            // (JSON keeps ids). Fresh-only, no-store, no query carried over.
             const league = core.leagues.find(today_route.league) orelse {
                 status = .not_found;
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
@@ -339,7 +346,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 if (today_route.api)
                     try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game.id })
                 else
-                    try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id })
+                    try server_app.view.scheduleGameHref(arena, league.slug, today_route.abbr, game)
             else if (today_route.api)
                 try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, today_route.abbr })
             else
@@ -358,8 +365,9 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         .date_alias => |alias| {
             // Human game alias, date form: resolve the day (relative tokens
             // ride the request zone via tz.resolveDay, like the scoreboard),
-            // fetch that board fresh, and redirect to the canonical game id
-            // (alias.n orelse 1 selects among doubleheader same-pair games).
+            // fetch that board fresh, and redirect to the numeric (legacy)
+            // game address (alias.n orelse 1 selects among doubleheader
+            // same-pair games). The human form stays the linked canonical;
             // A miss 404s: plain on all-duel days, duel-only hint past them.
             // Fresh-only, no-store, no query carried over (today-arm parity).
             const league = core.leagues.find(alias.league) orelse {
@@ -399,7 +407,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             // sending dates alongside empties the slate), verify the response
             // season year against the URL season (ESPN ignores unknown season
             // params — a mismatch 404s, never misleads), and redirect to the
-            // canonical game id. Fresh-only, no-store (today-arm parity).
+            // numeric (legacy) game address. Fresh-only, no-store
+            // (today-arm parity).
             const league = core.leagues.find(alias.league) orelse {
                 status = .not_found;
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);

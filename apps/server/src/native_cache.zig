@@ -200,8 +200,7 @@ pub fn clone(comptime T: type, a: std.mem.Allocator, value: T) !T {
                 for (out, value) |*dst, src| dst.* = try clone(p.child, a, src);
                 return out;
             },
-            else => @compileError("clone: non-slice pointers unsupported (" ++ @typeName(T) ++ ")"),
-        },
+            else => @compileError("clone: non-slice pointers unsupported (" ++ @typeName(T) ++ ")"),        },
         .array => |arr| {
             var out: T = undefined;
             for (&out, value) |*dst, src| dst.* = try clone(arr.child, a, src);

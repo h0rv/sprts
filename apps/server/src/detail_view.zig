@@ -368,6 +368,7 @@ fn hasProbables(game: detail.GameDetail) bool {
 fn testDetail() detail.GameDetail {
     return .{
         .id = "401816828",
+        .slug = "atl-phi",
         .league = "mlb",
         .league_name = "MLB",
         .date = "2026-09-06",
@@ -564,8 +565,12 @@ test "detail json validates and carries the schema marker" {
     const output = try json(arena, testDetail());
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "401816828") != null);
+    // Additive slug: the human id rides next to the numeric one, which
+    // stays the resolution address.
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"slug\": \"atl-phi\"") != null);
     const parsed = try std.json.parseFromSliceLeaky(detail.GameDetail, arena, output, .{});
     try std.testing.expectEqualStrings("401816828", parsed.id);
+    try std.testing.expectEqualStrings("atl-phi", parsed.slug);
     try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
     try std.testing.expectEqualStrings("Citizens Bank Park", parsed.venue.?);
 }
