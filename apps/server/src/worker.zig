@@ -262,7 +262,7 @@ fn serveBoard(
     // the request zone via tz.resolveDay), path prefix and non-date query
     // excluded from the key.
     const epoch_s = epochSecondsNow();
-    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const slug = try core.cache.canonicalSlug(alloc, league.slug);
     const day = try tz.resolveDay(alloc, route.date, epoch_s, zone);
     // Render variants join the edge key: bodies are cached fully rendered,
     // so two widths (or color on/off, art on/off, or ?0, or ?tz= zones) in one 30s bucket
@@ -348,7 +348,7 @@ fn serveBoard(
     // point, so errors are never cached.
     // Week boards are never stored (key has no week component).
     if (route.week != null) return resp;
-    const live = edge.isLiveBoard(board);
+    const live = core.cache.isLiveBoard(board);
     const fresh_key = if (live) fresh_live else fresh_final;
     const stale_key = if (live) stale_live else stale_final;
     var for_fresh = resp.clone();
@@ -381,7 +381,7 @@ fn serveDetail(
     };
 
     const epoch_s = epochSecondsNow();
-    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const slug = try core.cache.canonicalSlug(alloc, league.slug);
     // Variant edge namespace: the cached body is a render, not the
     // normalized payload (unlike the native cache), so every render variant
     // (width/height/color, plus `?0` text via the shared gameOneLine
@@ -429,26 +429,24 @@ fn serveDetail(
         .clock = workerClock,
     };
 
-    const game_detail = adapter.fetchDetail(alloc, league, route.id) catch |err| switch (err) {
-        error.GameNotFound => return errorResponse(alloc, "game not found", format, .not_found),
-        else => {
-            workers.log("upstream ESPN detail fetch failed for {s} {s}", .{ slug, route.id });
-            // Both TTL variants are probed (live first): the cached
-            // render's liveness is only known to its key.
-            if (cache.match(.{ .url = stale_live })) |stale| {
-                var resp = stale.clone();
-                resp.setHeader("cache-control", edge.client_cache_control);
-                resp.setHeader("x-sprts-cache", "stale");
-                return resp;
-            }
-            if (cache.match(.{ .url = stale_final })) |stale| {
-                var resp = stale.clone();
-                resp.setHeader("cache-control", edge.client_cache_control);
-                resp.setHeader("x-sprts-cache", "stale");
-                return resp;
-            }
-            return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
-        },
+    const game_detail = adapter.fetchDetail(alloc, league, route.id) catch |err| {
+        if (core.isNotFound(err)) return errorResponse(alloc, "game not found", format, .not_found);
+        workers.log("upstream ESPN detail fetch failed for {s} {s}", .{ slug, route.id });
+        // Both TTL variants are probed (live first): the cached
+        // render's liveness is only known to its key.
+        if (cache.match(.{ .url = stale_live })) |stale| {
+            var resp = stale.clone();
+            resp.setHeader("cache-control", edge.client_cache_control);
+            resp.setHeader("x-sprts-cache", "stale");
+            return resp;
+        }
+        if (cache.match(.{ .url = stale_final })) |stale| {
+            var resp = stale.clone();
+            resp.setHeader("cache-control", edge.client_cache_control);
+            resp.setHeader("x-sprts-cache", "stale");
+            return resp;
+        }
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
     // Text dispatch via the shared predicate (mirrors the native game arm):
     // text + ?0 selects renderTextOneLine, every other combination keeps
@@ -465,7 +463,7 @@ fn serveDetail(
 
     // Fresh window follows the rendered detail: 10s when the game is live,
     // else 30s; stale stays 300s.
-    const live = edge.isLiveDetail(game_detail);
+    const live = core.cache.isLiveDetail(game_detail);
     const fresh_key = if (live) fresh_live else fresh_final;
     const stale_key = if (live) stale_live else stale_final;
     var for_fresh = resp.clone();
@@ -681,7 +679,7 @@ fn serveToday(
         .clock = workerClock,
     };
     const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
-        if (err == error.TeamNotFound) {
+        if (core.isNotFound(err)) {
             return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
         }
         workers.log("upstream ESPN team fetch failed for {s} {s}", .{ league.slug, route.abbr });
@@ -915,8 +913,8 @@ fn serveTeam(
     };
 
     const epoch_s = epochSecondsNow();
-    const slug = try edge.canonicalSlug(alloc, league.slug);
-    const abbr = try edge.canonicalAbbr(alloc, route.abbr);
+    const slug = try core.cache.canonicalSlug(alloc, league.slug);
+    const abbr = try core.cache.canonicalAbbr(alloc, route.abbr);
     const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone, route.art, false);
     const key = try edge.teamKey(alloc, slug, abbr, tag);
     const fresh_key = try edge.teamFreshKey(alloc, key, epoch_s);
@@ -942,7 +940,7 @@ fn serveTeam(
     };
 
     const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
-        if (err == error.TeamNotFound) {
+        if (core.isNotFound(err)) {
             return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
         }
         workers.log("upstream ESPN team fetch failed for {s} {s}", .{ slug, abbr });
@@ -993,7 +991,7 @@ fn serveStandings(
     };
 
     const epoch_s = epochSecondsNow();
-    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const slug = try core.cache.canonicalSlug(alloc, league.slug);
     // Standings has no one-line renderer (the flag never changes the body),
     // so `oneline` keys as false and `?0` shares the full entry. The zone
     // still namespaces the key so a `?tz=` render never shadows the default.
@@ -1023,7 +1021,7 @@ fn serveStandings(
     };
 
     const table_data = provider.fetchStandings(adapter, alloc, league) catch |err| {
-        if (err == error.UnsupportedLeague) {
+        if (core.isNotFound(err)) {
             return errorResponse(alloc, "standings unavailable for this league; see /api/v1/leagues", format, .not_found);
         }
         workers.log("upstream ESPN standings fetch failed for {s}", .{league.slug});
@@ -1068,7 +1066,7 @@ fn serveTeams(
     };
 
     const epoch_s = epochSecondsNow();
-    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const slug = try core.cache.canonicalSlug(alloc, league.slug);
     const key = try edge.teamsKey(alloc, slug);
     const fresh_key = try edge.teamsFreshKey(alloc, key, epoch_s);
     const stale_key = try edge.teamsStaleKey(alloc, key, epoch_s);

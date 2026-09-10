@@ -81,23 +81,7 @@ pub const EspnAdapter = struct {
         const week_int: ?i64 = if (week) |w| @intCast(w) else null;
         const season_int: ?i64 = if (season_type) |t| @intCast(t) else null;
         const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, week_int, season_int, null);
-        var status: std.http.Status = undefined;
-        var body: []const u8 = undefined;
-        if (self.transport) |transport| {
-            const result = try transport.fetch(arena, url, espn.default_headers);
-            status = result.status;
-            body = result.body;
-        } else {
-            var std_transport = espn.StdTransport{ .allocator = self.allocator, .io = self.io, .timeout_ms = self.upstream_timeout_ms };
-            const result = try std_transport.fetch(arena, url, espn.default_headers);
-            status = result.status;
-            body = result.body;
-        }
-        if (status != .ok) {
-            std.log.warn("ESPN returned HTTP {d}", .{@intFromEnum(status)});
-            return error.UpstreamResponse;
-        }
-        return body;
+        return fetchUrl(self, arena, url);
     }
 
     pub fn fetchDetail(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
@@ -151,7 +135,7 @@ pub const EspnAdapter = struct {
         const results = try arena.alloc(LeagueResult, core.leagues.all.len);
         for (&core.leagues.all, 0..) |*league, i| {
             results[i] = .{ .league = league };
-            const slug = try edge_cache.canonicalSlug(arena, league.slug);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
             var ctx = BoardCacheCtx{ .adapter = self, .league = league, .day = day };
             if (cache.getOrFetchBoard(arena, slug, day, at, &ctx, fetchBoardCached)) |cached| {
                 results[i].board = cached.data.board;
@@ -508,6 +492,50 @@ fn assembleBoardGame(args: BoardGameArgs) core.domain.Game {
     };
 }
 
+/// One normalized board game from an event plus one competition (or one
+/// tennis `groupings` match, which reuses `Competition`). `game_id` carries
+/// the caller's id fallback rule; `tennis` selects sets-won scores and the
+/// day filter (a tennis match boards only when dated the requested `day`;
+/// dateless callers match nothing, never everything). Returns null for a
+/// filtered-out tennis match; event-level competitions always build.
+fn buildBoardGame(
+    arena: std.mem.Allocator,
+    event: Event,
+    competition: Competition,
+    day: []const u8,
+    game_id: []const u8,
+    tennis: bool,
+) !?core.domain.Game {
+    if (tennis) {
+        if (competition.date.len < 10) return null;
+        if (!std.mem.eql(u8, competition.date[0..10], day)) return null;
+    }
+    var participants: std.ArrayList(core.domain.Participant) = .empty;
+    for (competition.competitors) |competitor| {
+        const score_override = if (tennis) try setsWon(arena, competitor) else null;
+        if (try boardParticipant(arena, competitor, competition.competitors.len, score_override)) |participant| {
+            try participants.append(arena, participant);
+        }
+    }
+    const status_type = if (competition.status) |status|
+        status.type
+    else if (event.status) |status|
+        status.type
+    else
+        StatusType{};
+    return assembleBoardGame(.{
+        .id = game_id,
+        .name = if (event.name.len > 0) event.name else event.shortName,
+        .starts_at = if (competition.date.len > 0) competition.date else event.date,
+        .state = status_type.state,
+        .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
+        .participants = try participants.toOwnedSlice(arena),
+        .network = competitionNetwork(competition),
+        .venue = competitionVenue(competition, event),
+        .leaders = try boardLeaders(arena, competition.leaders),
+    });
+}
+
 pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, body: []const u8) !core.domain.Scoreboard {
     const response = try std.json.parseFromSliceLeaky(ScoreboardResponse, arena, body, .{
         .ignore_unknown_fields = true,
@@ -516,30 +544,10 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
     var games: std.ArrayList(core.domain.Game) = .empty;
     for (response.events) |event| {
         for (event.competitions, 0..) |competition, competition_index| {
-            var participants: std.ArrayList(core.domain.Participant) = .empty;
-            for (competition.competitors) |competitor| {
-                if (try boardParticipant(arena, competitor, competition.competitors.len, null)) |participant| {
-                    try participants.append(arena, participant);
-                }
-            }
-            const status_type = if (competition.status) |status|
-                status.type
-            else if (event.status) |status|
-                status.type
-            else
-                StatusType{};
             const game_id = if (competition.id.len > 0) competition.id else if (competition_index == 0) event.id else try std.fmt.allocPrint(arena, "{s}-{d}", .{ event.id, competition_index });
-            try games.append(arena, assembleBoardGame(.{
-                .id = game_id,
-                .name = if (event.name.len > 0) event.name else event.shortName,
-                .starts_at = if (competition.date.len > 0) competition.date else event.date,
-                .state = status_type.state,
-                .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
-                .participants = try participants.toOwnedSlice(arena),
-                .network = competitionNetwork(competition),
-                .venue = competitionVenue(competition, event),
-                .leaders = try boardLeaders(arena, competition.leaders),
-            }));
+            if (try buildBoardGame(arena, event, competition, day, game_id, false)) |game| {
+                try games.append(arena, game);
+            }
         }
         // Tennis tournaments carry no event-level competitions: the
         // draws live under `groupings`. Only matches dated the requested
@@ -547,32 +555,10 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
         if (event.groupings) |groupings| {
             for (groupings) |grouping| {
                 for (grouping.competitions) |match| {
-                    if (match.date.len < 10) continue;
-                    if (!std.mem.eql(u8, match.date[0..10], day)) continue;
-                    var participants: std.ArrayList(core.domain.Participant) = .empty;
-                    for (match.competitors) |competitor| {
-                        const sets = try setsWon(arena, competitor);
-                        if (try boardParticipant(arena, competitor, match.competitors.len, sets)) |participant| {
-                            try participants.append(arena, participant);
-                        }
+                    const game_id = if (match.id.len > 0) match.id else event.id;
+                    if (try buildBoardGame(arena, event, match, day, game_id, true)) |game| {
+                        try games.append(arena, game);
                     }
-                    const status_type = if (match.status) |status|
-                        status.type
-                    else if (event.status) |status|
-                        status.type
-                    else
-                        StatusType{};
-                    try games.append(arena, assembleBoardGame(.{
-                        .id = if (match.id.len > 0) match.id else event.id,
-                        .name = if (event.name.len > 0) event.name else event.shortName,
-                        .starts_at = if (match.date.len > 0) match.date else event.date,
-                        .state = status_type.state,
-                        .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
-                        .participants = try participants.toOwnedSlice(arena),
-                        .network = competitionNetwork(match),
-                        .venue = competitionVenue(match, event),
-                        .leaders = try boardLeaders(arena, match.leaders),
-                    }));
                 }
             }
         }
@@ -1341,7 +1327,12 @@ fn valuePresent(value: ?std.json.Value) bool {
     };
 }
 
-fn adapterFetchUrl(self: EspnAdapter, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
+/// Single upstream GET used by every provider fetch: honors the injected
+/// transport with a `StdTransport` fallback, and maps any non-200 to
+/// `error.UpstreamResponse`. URL construction stays with the callers
+/// (`fetchWeekBody` builds scoreboard URLs; detail/schedule/teams build
+/// theirs); only the transport-fallback + status check live here.
+fn fetchUrl(self: EspnAdapter, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     var status: std.http.Status = undefined;
     var body: []const u8 = undefined;
     if (self.transport) |transport| {
@@ -1597,7 +1588,7 @@ fn seriesFromSchedules(
         const self_id = team_ids[side];
         const other_id = team_ids[1 - side];
         const url = espn.buildScheduleUrl(arena, self.base_url, endpoint.sport, endpoint.league, self_id, season) catch continue;
-        const body = adapterFetchUrl(self, arena, url) catch continue;
+        const body = fetchUrl(self, arena, url) catch continue;
         const schedule = std.json.parseFromSliceLeaky(SeriesScheduleResponse, arena, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -1927,7 +1918,7 @@ fn findBoardGame(
 pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const summary_url = try espn.buildSummaryUrl(arena, self.base_url, endpoint.sport, endpoint.league, game_id);
-    const summary_body = try adapterFetchUrl(self, arena, summary_url);
+    const summary_body = try fetchUrl(self, arena, summary_url);
     const response = try std.json.parseFromSliceLeaky(SummaryResponse, arena, summary_body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -2751,10 +2742,10 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
     // limit returns the whole membership (761 for NCAAF) in one fetch;
     // pro leagues are unaffected beyond a bigger (cached) body.
     const teams_url = try std.fmt.allocPrint(arena, "{s}?limit=1000", .{try espn.buildTeamsUrl(arena, self.base_url, endpoint.sport, endpoint.league)});
-    const teams_body = try adapterFetchUrl(self, arena, teams_url);
+    const teams_body = try fetchUrl(self, arena, teams_url);
     const team_id = (try resolveTeamId(teams_body, arena, abbrev)) orelse return error.TeamNotFound;
 
-    var parsed = try parseSchedule(arena, try adapterFetchUrl(
+    var parsed = try parseSchedule(arena, try fetchUrl(
         self,
         arena,
         try espn.buildScheduleUrl(arena, self.base_url, endpoint.sport, endpoint.league, team_id, season),
@@ -2762,7 +2753,7 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
     if (parsed.events.len == 0) {
         const year = try std.fmt.parseInt(u16, season, 10);
         const previous = try std.fmt.allocPrint(arena, "{d}", .{year - 1});
-        parsed = try parseSchedule(arena, try adapterFetchUrl(
+        parsed = try parseSchedule(arena, try fetchUrl(
             self,
             arena,
             try espn.buildScheduleUrl(arena, self.base_url, endpoint.sport, endpoint.league, team_id, previous),
@@ -2994,7 +2985,7 @@ const team_fixture_schedule_empty =
 pub fn fetchTeams(adapter: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League) !core.schedule.TeamList {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const url = try std.fmt.allocPrint(arena, "{s}?limit=1000", .{try espn.buildTeamsUrl(arena, adapter.base_url, endpoint.sport, endpoint.league)});
-    return parseTeamList(arena, league, try adapterFetchUrl(adapter, arena, url));
+    return parseTeamList(arena, league, try fetchUrl(adapter, arena, url));
 }
 
 pub fn parseTeamList(arena: std.mem.Allocator, league: *const core.leagues.League, body: []const u8) !core.schedule.TeamList {
@@ -3104,7 +3095,7 @@ pub fn fetchStandings(adapter: EspnAdapter, arena: std.mem.Allocator, league: *c
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     if (!standingsSupported(endpoint.sport)) return error.UnsupportedLeague;
     const url = try buildStandingsUrl(arena, adapter.base_url, endpoint.sport, endpoint.league);
-    const body = try adapterFetchUrl(adapter, arena, url);
+    const body = try fetchUrl(adapter, arena, url);
     const today = try adapter.today(arena);
     return parseStandings(arena, league, today[0..4], body);
 }

@@ -36,15 +36,18 @@ const core = @import("sprts_core");
 const espn = @import("espn_client");
 const router = @import("router.zig");
 
-/// Fresh window in seconds (`TTL max-age=30`).
-pub const fresh_ttl_s: i64 = 30;
+/// Fresh window in seconds (`TTL max-age=30`). Defined in `core.cache`;
+/// re-exported here so existing key expressions stay byte-identical.
+pub const fresh_ttl_s: i64 = core.cache.fresh_ttl_s;
 /// Fresh window for live boards/details: any `in` game on the board (or an
 /// `in` detail game) refreshes every 10s instead of 30s. Keyed as a
 /// separate `fl<epoch/10>` bucket under a `/v/live` variant tag (see the
 /// module docs); the 300s stale window below is shared by both variants.
-pub const live_fresh_ttl_s: i64 = 10;
+/// Defined in `core.cache`; re-exported here (see `fresh_ttl_s`).
+pub const live_fresh_ttl_s: i64 = core.cache.live_fresh_ttl_s;
 /// Stale window in seconds (serve stale on upstream error up to 300s).
-pub const stale_ttl_s: i64 = 300;
+/// Defined in `core.cache`; re-exported here (see `fresh_ttl_s`).
+pub const stale_ttl_s: i64 = core.cache.stale_ttl_s;
 
 /// Client-facing cache header; mirrors the native server's common headers.
 /// (The Cache API ignores `stale-if-error` on match/put, hence the manual
@@ -67,10 +70,10 @@ pub fn targetFromUrl(url: []const u8) []const u8 {
 }
 
 /// Lowercase a league slug for cache-key canonicalization.
+/// Defined in `core.cache`; this wrapper keeps existing call sites
+/// compiling while the canonical form lives in one place.
 pub fn canonicalSlug(arena: std.mem.Allocator, slug: []const u8) ![]u8 {
-    const out = try arena.dupe(u8, slug);
-    for (out) |*byte| byte.* = std.ascii.toLower(byte.*);
-    return out;
+    return core.cache.canonicalSlug(arena, slug);
 }
 
 /// Resolve the board day: an explicit `?date` is used verbatim (the router
@@ -103,19 +106,19 @@ pub fn detailKey(arena: std.mem.Allocator, slug: []const u8, id: []const u8, tag
 
 /// True when any game on the board is in progress (`state == "in"`). A
 /// mixed board (one live game among finals) counts as live.
+/// Defined in `core.cache`; this wrapper keeps existing call sites
+/// compiling while liveness lives in one place.
 pub fn isLiveBoard(board: core.domain.Scoreboard) bool {
-    for (board.games) |game| {
-        if (std.mem.eql(u8, game.state, "in")) return true;
-    }
-    return false;
+    return core.cache.isLiveBoard(board);
 }
 
 /// True when the detail game is in progress: `state == "in"`, or a live
 /// situation is present (the provider only attaches one to `in` games, so
 /// both readings agree in practice; either suffices).
+/// Defined in `core.cache`; this wrapper keeps existing call sites
+/// compiling while liveness lives in one place.
 pub fn isLiveDetail(detail: core.detail.GameDetail) bool {
-    if (std.mem.eql(u8, detail.state, "in")) return true;
-    return detail.situation != null;
+    return core.cache.isLiveDetail(detail);
 }
 
 /// Fresh detail key: detail key + bucket. Final content uses the 30s `f`
@@ -310,18 +313,20 @@ test "detail fresh and stale buckets bound entry age" {
 //   request. The league slug and abbrev are lowercased before keying.
 
 /// Teams-list window: 24h fresh + 24h stale (resolution barely changes).
-pub const teams_fresh_ttl_s: i64 = 24 * 60 * 60;
-pub const teams_stale_ttl_s: i64 = 24 * 60 * 60;
+/// Defined in `core.cache`; re-exported here (see `fresh_ttl_s`).
+pub const teams_fresh_ttl_s: i64 = core.cache.teams_fresh_ttl_s;
+pub const teams_stale_ttl_s: i64 = core.cache.teams_stale_ttl_s;
 
 /// Schedule window: 60s fresh + 600s stale (game states move; payload heavy).
-pub const schedule_fresh_ttl_s: i64 = 60;
-pub const schedule_stale_ttl_s: i64 = 600;
+/// Defined in `core.cache`; re-exported here (see `fresh_ttl_s`).
+pub const schedule_fresh_ttl_s: i64 = core.cache.schedule_fresh_ttl_s;
+pub const schedule_stale_ttl_s: i64 = core.cache.schedule_stale_ttl_s;
 
 /// Lowercase a team abbreviation for cache-key canonicalization.
+/// Defined in `core.cache`; this wrapper keeps existing call sites
+/// compiling while the canonical form lives in one place.
 pub fn canonicalAbbr(arena: std.mem.Allocator, abbr: []const u8) ![]u8 {
-    const out = try arena.dupe(u8, abbr);
-    for (out) |*byte| byte.* = std.ascii.toLower(byte.*);
-    return out;
+    return core.cache.canonicalAbbr(arena, abbr);
 }
 
 /// Teams-list namespace: `sprts/v1/teams/<slug>`.
