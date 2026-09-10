@@ -21,6 +21,7 @@
 const std = @import("std");
 const core = @import("sprts_core");
 const render = @import("render.zig");
+const view = @import("view.zig");
 const tz = @import("tz.zig");
 
 /// Games shown per league section before the `+N more` pointer.
@@ -52,10 +53,12 @@ pub const DigestJson = struct {
     };
 };
 
-/// Text digest: one `render.text` section per league, capped at
-/// `games_per_league` via the existing `height` param, plus a
-/// `+N more → /<slug>?date=<day>` pointer line when capped. Missing boards
-/// render a one-line `unavailable` section; output is always valid UTF-8
+/// Text digest: one shared-composer section per league (Phase 5 rides
+/// `render.text`, which composes every row through the `view` section
+/// composers, so digest text and HTML can never drift from the
+/// scoreboard), capped at `games_per_league` via the existing `height`
+/// param, plus a `+N more → /<slug>?date=<day>` pointer line when
+/// capped. Missing boards render a one-line `unavailable` section; output is always valid UTF-8
 /// (it only concatenates `render.text` output and ASCII pointers) and
 /// strips all color when `color` is false (same flag as `render.text`).
 /// The heading names its zone (`sprts all  2026-09-06 ET`). `dated`
@@ -83,13 +86,15 @@ pub fn textWithZoneArt(
     if (!quiet) {
         const tag = try tz.zoneTag(allocator, zone);
         defer allocator.free(tag);
-        const heading = try std.fmt.allocPrint(allocator, "sprts all  {s} {s}", .{ day, tag });
+        const heading = try view.digestHeading(allocator, day, tag);
         defer allocator.free(heading);
         if (color) try w.print("\x1b[2m{s}\x1b[0m\n", .{heading}) else try w.print("{s}\n", .{heading});
     }
     for (sections) |section| {
         const board = section.board orelse {
-            try w.print("/{s}?date={s}: unavailable\n", .{ section.league.slug, day });
+            const marker = try view.digestUnavailable(allocator, section.league.slug, day);
+            defer allocator.free(marker);
+            try w.print("{s}\n", .{marker});
             continue;
         };
         // Dated past view: an answered-but-empty board is an off-day —
@@ -585,4 +590,68 @@ test "dated digest matches today render when every league played" {
     try std.testing.expect(std.mem.indexOf(u8, dated_html, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(dated_text);
     _ = try std.unicode.Utf8View.init(dated_html);
+}
+
+test "digest hostile fixture keeps text and HTML visible text equal" {
+    // Phase 5 lock: digest sections ride `render.text` (which composes
+    // every row through the shared `view` composers), so hostile
+    // provider text must read identically in the digest text body and
+    // the HTML page's visible `<pre>` text — cap pointer, outage
+    // marker, and all. Seven games also pins the `+2 more` pointer
+    // through the escape round-trip (`>` becomes `&gt;` and back).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const games = try arena.alloc(core.domain.Game, 7);
+    for (games, 0..) |*game, i| {
+        game.* = .{
+            .id = try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .name = "Away <b>&\"quoted\"</b> at Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = if (i == 0) "in" else "post",
+            .status = if (i == 0) "Top 7th <live>" else "Final <OT> & \"extra\"",
+            .participants = &.{
+                .{ .id = "a", .name = "Atlético Madrid Club de Fútbol with an extremely long tail that never ends", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
+                .{ .id = "h", .name = "Home\tTeam 漢字", .abbreviation = "HME", .score = "5", .winner = true, .record = "80-63" },
+            },
+        };
+    }
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = games,
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = board },
+        .{ .league = core.leagues.find("nfl").?, .board = null },
+    };
+    // Quiet text body: the same flags the HTML page escapes.
+    const body = try text(arena, &sections, "2026-09-06", false, null, null, true, false);
+    try std.testing.expect(std.mem.indexOf(u8, body, "+2 more -> /mlb?date=2026-09-06") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "/nfl?date=2026-09-06: unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    const page = try html(arena, &sections, "2026-09-06", null, null, false, false);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt; &amp; &quot;extra&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<OT>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    // Visible `<pre>` text (tags stripped, entities decoded) matches
+    // the text body line for line.
+    const open = std.mem.indexOf(u8, page, "<pre>").? + "<pre>".len;
+    const close = std.mem.indexOf(u8, page, "</pre>").?;
+    const pre = page[open..close];
+    var pre_lines = std.mem.splitScalar(u8, pre, '\n');
+    var text_lines = std.mem.splitScalar(u8, body, '\n');
+    while (true) {
+        const h = pre_lines.next();
+        const t = text_lines.next();
+        try std.testing.expectEqual(h == null, t == null);
+        if (h == null) break;
+        const clean = try view.stripHtmlVisible(arena, h.?);
+        defer arena.free(clean);
+        try std.testing.expectEqualStrings(t.?, clean);
+    }
 }

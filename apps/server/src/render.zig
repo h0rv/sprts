@@ -8,6 +8,7 @@ const router = @import("router.zig");
 const provider = @import("provider.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
+const view = @import("view.zig");
 
 /// Box-table surface, re-exported from the shared `table` module so views
 /// that reached these through `render` (e.g. `team_view`) keep compiling
@@ -81,7 +82,7 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
     const w = &out.writer;
     const tag = try tz.zoneTag(allocator, zone);
     defer allocator.free(tag);
-    const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ board.league_name, board.date, tag });
+    const heading = try view.scoreboardHeading(allocator, board.league_name, board.date, tag);
     defer allocator.free(heading);
     try table.writeLine(w, heading, cols, "2", color);
     try table.writeSeparator(w, cols);
@@ -89,12 +90,12 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
         try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
     for (board.games[0..shown]) |game| {
-        try table.writeLine(w, game.status, cols, statusColor(game.state), color);
+        try table.writeLine(w, game.status, cols, view.statusAnsi(game.state), color);
         if (game.participants.len == 0) {
             try table.writeLine(w, game.name, cols, null, color);
         }
         for (game.participants) |participant| {
-            const line = try scoreParticipantLine(allocator, participant, cols);
+            const line = try view.scoreParticipantLine(allocator, participant, cols);
             defer allocator.free(line);
             if (color and participant.winner) try w.writeAll("\x1b[32m");
             try w.writeAll(line);
@@ -105,10 +106,8 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
-            const game_link = try std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{
-                board.league,                                                             game.id, board.league,
-                if (game.participants.len > 0) game.participants[0].abbreviation else "",
-            });
+            const first_abbr = if (game.participants.len > 0) game.participants[0].abbreviation else "";
+            const game_link = try view.scoreGameLink(allocator, board.league, game.id, first_abbr);
             defer allocator.free(game_link);
             try table.writeLine(w, game_link, cols, "2", color);
         }
@@ -146,47 +145,10 @@ pub fn textArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bo
     return textWithZoneArt(allocator, board, color, width, height, .et, art);
 }
 
-/// One scoreboard participant row, column-aligned like the old table
-/// interior (abbr, name, score, winner tick, record) but borderless and
-/// unpadded. Winner coloring wraps at emit time, never inside.
-fn scoreParticipantLine(allocator: std.mem.Allocator, p: domain.Participant, cols: usize) ![]u8 {
-    var rec_w: usize = 0;
-    if (p.record) |r| rec_w = table.textCells(r);
-    rec_w = @min(rec_w, 10);
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    errdefer buf.deinit();
-    const b = &buf.writer;
-    if (p.abbreviation.len > 0) {
-        try writeCell(b, p.abbreviation, 4, null, false);
-        try b.writeByte(' ');
-        try writeCell(b, p.name, cols -| 4 -| 2 -| 4 -| 2 -| (if (p.record != null) rec_w + 3 else 0), null, false);
-    } else {
-        // Athlete identities carry no abbreviation: the name absorbs it.
-        try writeCell(b, p.name, cols -| 7 -| (if (p.record != null) rec_w + 3 else 0), null, false);
-    }
-    try b.writeByte(' ');
-    try writeCellRight(b, p.score, 4, null, false);
-    if (p.record) |r| {
-        try b.writeAll(" (");
-        try writeCell(b, r, rec_w, null, false);
-        try b.writeByte(')');
-    }
-    if (p.winner) try b.writeAll(" ✓") else try b.writeAll("  ");
-    const raw = try buf.toOwnedSlice();
-    defer allocator.free(raw);
-    return allocator.dupe(u8, std.mem.trimEnd(u8, raw, " "));
-}
-
 /// ET-default wrapper: no `?tz=` means the Eastern day, so existing
 /// callers (and the digest sections they compose) keep rendering.
 pub fn text(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16) ![]u8 {
     return textWithZone(allocator, board, color, width, height, .et);
-}
-
-fn statusColor(state: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, state, "in")) return "1;31";
-    if (std.mem.eql(u8, state, "pre")) return "33";
-    return null;
 }
 
 fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !void {
@@ -453,198 +415,13 @@ pub fn homeOneLine(
     return homeOneLineWithZone(allocator, boards, color, .et);
 }
 
-/// Compact one-liner per game, column-aligned across the page: leagues,
-/// teams, and scores share fixed columns so days scan vertically; only
-/// the trailing status is ragged. `mlb  CLE   9 @ BAL   5 ✓  Bot 7th`.
-/// `slug_w`/`abbr_w` are page-wide maxima (computed in `homeSections`).
-/// A two-participant game always reads as a duel: team sides are
-/// `{abbr} {score}`; athlete sides (empty abbreviation, e.g. UFC) read
-/// as bare names joined with ` v `. Records stay out: they would drown
-/// the line (`ufc  Name 9-0-0` reads like a score). Non-duels fall back
-/// to the game name. Returns null for nothing to show.
-fn gameLine(allocator: std.mem.Allocator, league: *const leagues.League, game: domain.Game, slug_w: usize, abbr_w: usize) !?[]u8 {
-    if (game.participants.len == 2) {
-        const first = game.participants[0];
-        const second = game.participants[1];
-        const away, const home_team = if (std.mem.eql(u8, second.home_away orelse "", "home"))
-            .{ first, second }
-        else if (std.mem.eql(u8, first.home_away orelse "", "home"))
-            .{ second, first }
-        else
-            .{ first, second };
-        // Winner tick rides a fixed 2-cell column so scores align whether
-        // or not the game is decided yet.
-        const mark: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
-        const date_part = splitStatus(shortStatus(game.status));
-        const date = date_part.date;
-        const rest = date_part.rest;
-        if (away.abbreviation.len > 0 and home_team.abbreviation.len > 0) {
-            // Column duel: slug, sides, scores, tick, then the date word
-            // (if any) and the status tail. Callers fit to the frame.
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            const b = &buf.writer;
-            try writeCell(b, league.slug, slug_w, null, false);
-            try b.writeByte(' ');
-            try writeCell(b, away.abbreviation, abbr_w, null, false);
-            try b.writeByte(' ');
-            try writeCellRight(b, away.score, 3, null, false);
-            try b.writeAll(" @ ");
-            try writeCell(b, home_team.abbreviation, abbr_w, null, false);
-            try b.writeByte(' ');
-            try writeCellRight(b, home_team.score, 3, null, false);
-            try b.writeAll(mark);
-            try b.writeAll("  ");
-            try writeCell(b, date, 5, null, false);
-            const norm = try tz.normalizeEastern(allocator, rest);
-            defer allocator.free(norm);
-            try b.writeAll(norm);
-            return try buf.toOwnedSlice();
-        }
-        if (away.abbreviation.len > 0 or home_team.abbreviation.len > 0) {
-            const away_side = try sideText(allocator, away);
-            defer allocator.free(away_side);
-            const home_side = try sideText(allocator, home_team);
-            defer allocator.free(home_side);
-            const mark2: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            if (away_side.len > 0 and home_side.len > 0) {
-                const joiner: []const u8 = " v ";
-                try buf.writer.writeAll(away_side);
-                try buf.writer.writeAll(joiner);
-                try buf.writer.writeAll(home_side);
-            } else {
-                const side = if (away_side.len > 0) away_side else home_side;
-                try buf.writer.writeAll(side);
-            }
-            try buf.writer.writeAll(mark2);
-            try gameLineTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
-        }
-        if (away.name.len > 0 or home_team.name.len > 0) {
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            try buf.writer.writeAll(away.name);
-            try buf.writer.writeAll(" v ");
-            try buf.writer.writeAll(home_team.name);
-            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
-            try gameLineTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
-        }
-        if (away.score.len > 0 or home_team.score.len > 0) {
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            try writeCell(&buf.writer, away.abbreviation, abbr_w, null, false);
-            try buf.writer.writeByte(' ');
-            try writeCellRight(&buf.writer, away.score, 3, null, false);
-            try buf.writer.writeAll(" @ ");
-            try writeCell(&buf.writer, home_team.abbreviation, abbr_w, null, false);
-            try buf.writer.writeByte(' ');
-            try writeCellRight(&buf.writer, home_team.score, 3, null, false);
-            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
-            try gameLineTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
-        }
-        var tail_buf: std.Io.Writer.Allocating = .init(allocator);
-        errdefer tail_buf.deinit();
-        try writeCell(&tail_buf.writer, league.slug, slug_w, null, false);
-        try tail_buf.writer.writeByte(' ');
-        try tail_buf.writer.writeAll(away.abbreviation);
-        try tail_buf.writer.writeAll(" @ ");
-        try tail_buf.writer.writeAll(home_team.abbreviation);
-        try tail_buf.writer.writeAll("  ");
-        const tail_part = splitStatus(shortStatus(game.status));
-        const tail_date = tail_part.date;
-        const tail_rest = tail_part.rest;
-        try writeCell(&tail_buf.writer, tail_date, 5, null, false);
-        try tail_buf.writer.writeAll(tail_rest);
-        return try tail_buf.toOwnedSlice();
-    }
-    if (game.participants.len == 0 and game.name.len == 0) return null;
-    var name_buf: std.Io.Writer.Allocating = .init(allocator);
-    errdefer name_buf.deinit();
-    try writeCell(&name_buf.writer, league.slug, slug_w, null, false);
-    try name_buf.writer.writeByte(' ');
-    try name_buf.writer.writeAll(game.name);
-    try name_buf.writer.writeAll("  ");
-    const name_part = splitStatus(shortStatus(game.status));
-    const name_date = name_part.date;
-    const name_rest = name_part.rest;
-    try writeCell(&name_buf.writer, name_date, 5, null, false);
-    try name_buf.writer.writeAll(name_rest);
-    return try name_buf.toOwnedSlice();
-}
-
-/// Short date: `2026-09-08` becomes `09-08`. The year is implicit in
-/// the page heading; anything not shaped like a date passes through.
-fn shortDate(day: []const u8) []const u8 {
-    if (day.len >= 10 and day[4] == '-' and day[7] == '-') return day[5..10];
-    return day;
-}
-
-/// Split a home status into its leading date word and the tail: `9/9 -
-/// 8:20 PM EDT` becomes date `9/9` + `8:20 PM EDT`; anything else
-/// (`Final`, `Bot 7th`, `Scheduled`) has no date word. The date column
-/// aligns kickoff times down the page.
-fn splitStatus(status: []const u8) struct { date: []const u8, rest: []const u8 } {
-    var i: usize = 0;
-    while (i < status.len and status[i] >= '0' and status[i] <= '9') : (i += 1) {}
-    var j = i;
-    if (j < status.len and (status[j] == '/' or status[j] == '-')) {
-        j += 1;
-        const k = j;
-        while (j < status.len and status[j] >= '0' and status[j] <= '9') : (j += 1) {}
-        if (j > k and j + 2 < status.len and status[j] == ' ' and status[j + 1] == '-' and status[j + 2] == ' ') {
-            return .{ .date = status[0..j], .rest = status[j + 3 ..] };
-        }
-    }
-    return .{ .date = "", .rest = status };
-}
-
-/// Shared tail for home game lines: two spaces, the date word in its
-/// fixed column, then the status tail. Keeps every gameLine branch in
-/// the same rhythm without repeating the separators.
-fn gameLineTail(allocator: std.mem.Allocator, w: *std.Io.Writer, date: []const u8, rest: []const u8) !void {
-    try w.writeAll("  ");
-    try writeCell(w, date, 5, null, false);
-    const norm = try tz.normalizeEastern(allocator, rest);
-    defer allocator.free(norm);
-    try w.writeAll(norm);
-}
-
-/// Short status: strip a leading `YYYY-` year prefix (`2026-09-08`
-/// becomes `09-08`) so home lines stay compact. The year is implicit
-/// in the page heading; anything not shaped like a date passes through.
-fn shortStatus(status: []const u8) []const u8 {
-    if (status.len >= 5 and status[4] == '-' and status[0] >= '0' and status[0] <= '9') {
-        var i: usize = 0;
-        while (i + 4 < status.len and status[i] >= '0' and status[i] <= '9' and status[i + 4] == '-') i += 1;
-        if (i >= 4) return status[5..];
-    }
-    return status;
-}
-
-/// One side of a duel: `{abbr} {score}`, falling back to the full name
-/// when the abbreviation is missing (UFC-style bouts). Records stay
-/// out: they would drown the line (`ufc  Name 9-0-0` reads like a
-/// score). An abbr side always duels; a fully empty side collapses so
-/// a lone named side never prints a bare `@` opponent.
-fn sideText(allocator: std.mem.Allocator, p: domain.Participant) ![]u8 {
-    if (p.abbreviation.len > 0 and p.score.len > 0) {
-        return std.fmt.allocPrint(allocator, "{s} {s}", .{ p.abbreviation, p.score });
-    }
-    if (p.abbreviation.len > 0) return allocator.dupe(u8, p.abbreviation);
-    if (p.name.len > 0) return std.fmt.allocPrint(allocator, "@{s}", .{p.name});
-    if (p.score.len > 0) return allocator.dupe(u8, p.score);
-    return allocator.dupe(u8, "");
-}
+/// Home row composers live in the shared `view` module now (Phase 4):
+/// `view.homeGameLine` (+ `homeSplitStatus`/`homeGameTail`/
+/// `homeShortStatus`/`homeSideText`), `view.homeColumnWidths`, and
+/// `view.homeLeagueHeader`. The emitters below (`homeGameLine`,
+/// `homeSections`, the HTML linkifier) own links, spans, and section
+/// breathing and call those for composition, so text and HTML share
+/// every row string.
 
 fn gameIsLive(game: domain.Game) bool {
     return std.mem.eql(u8, game.state, "in");
@@ -670,18 +447,9 @@ fn homeSections(
     // down the whole page: widest slug/abbreviation among leagues with
     // shown games (idle-league rows keep their own fixed cells). Floors
     // keep narrow days compact; caps bound exotic abbreviations.
-    var slug_w: usize = 3;
-    var abbr_w: usize = 2;
-    for (boards) |result| {
-        const board = result.board orelse continue;
-        if (board.games.len == 0) continue;
-        slug_w = @max(slug_w, table.textCells(result.league.slug));
-        for (board.games) |game| {
-            for (game.participants) |p| abbr_w = @max(abbr_w, table.textCells(p.abbreviation));
-        }
-    }
-    slug_w = @min(slug_w, 10);
-    abbr_w = @min(abbr_w, 5);
+    const widths = view.homeColumnWidths(boards);
+    const slug_w = widths.slug_w;
+    const abbr_w = widths.abbr_w;
     var separated = false;
     var live = false;
     for (boards) |result| {
@@ -714,7 +482,7 @@ fn homeSections(
         if (separated) try w.writeByte('\n');
         // League header: name plus M/D date (year is implicit in the
         // page heading). Whole line links to the league page in HTML.
-        const header = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ result.league.name, shortDate(day) });
+        const header = try view.homeLeagueHeader(allocator, result.league.name, day);
         defer allocator.free(header);
         if (html) {
             const href = try homeLeagueHref(allocator, result.league.slug, day);
@@ -830,7 +598,7 @@ fn writeHtmlGameLine(allocator: std.mem.Allocator, line: []const u8, game: domai
     try w.writeAll("<a href=\"");
     try escapeInto(w, href);
     try w.writeAll("\">");
-    try writeHtmlCell(allocator, line, stateClass(game.state), w);
+    try writeHtmlCell(allocator, line, view.statusCssClass(game.state), w);
     try w.writeAll("</a> │\n");
 }
 
@@ -844,7 +612,7 @@ fn homeGameLine(
     slug_w: usize,
     abbr_w: usize,
 ) !void {
-    const line = try gameLine(allocator, league, game, slug_w, abbr_w) orelse return;
+    const line = try view.homeGameLine(allocator, league, game, slug_w, abbr_w) orelse return;
     defer allocator.free(line);
     if (html) {
         // Sibling anchors only: non-team text links the game view,
@@ -857,7 +625,7 @@ fn homeGameLine(
         try writeHtmlHomeGameLine(allocator, line, league, game, w, href);
         return;
     }
-    try table.writeLine(w, line, 50, statusColor(game.state), color);
+    try table.writeLine(w, line, 50, view.statusAnsi(game.state), color);
 }
 
 /// HTML home game line: `│ <span><a game>..</a><a team>abbr</a>..</span> │`.
@@ -881,7 +649,7 @@ fn writeHtmlHomeGameLine(allocator: std.mem.Allocator, line: []const u8, league:
 /// concatenates back to the same line, so visible text matches the text
 /// renderer byte for byte.
 fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *const leagues.League, game: domain.Game, w: *std.Io.Writer, game_href: []const u8) !void {
-    const css = stateClass(game.state);
+    const css = view.statusCssClass(game.state);
     if (css) |class| {
         try w.writeAll("<span class=\"");
         try w.writeAll(class);
@@ -962,7 +730,7 @@ fn writeShortDate(w: *std.Io.Writer, date: []const u8) !void {
 }
 
 fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date: []const u8, game: domain.Game, color: bool, zone_tag: []const u8) !void {
-    const code: ?[]const u8 = if (color) statusColor(game.state) else null;
+    const code: ?[]const u8 = if (color) view.statusAnsi(game.state) else null;
     if (code) |c| try w.print("\x1b[{s}m", .{c});
     try w.writeAll(league_slug);
     try w.writeByte(' ');
@@ -1836,14 +1604,6 @@ pub fn themeNavSuffix() []const u8 {
 pub fn closePageWithNav(w: *std.Io.Writer) !void {
     try w.writeAll(themeNavSuffix());
     try w.writeAll("</nav></main></body></html>");
-}
-
-/// CSS class matching the ANSI role for a game state: live games glow
-/// red, upcoming games read yellow, finished games stay plain.
-fn stateClass(state: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, state, "in")) return "live";
-    if (std.mem.eql(u8, state, "pre")) return "upcoming";
-    return null;
 }
 
 pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
@@ -2752,7 +2512,7 @@ test "home groups live games, then today, then idle leagues" {
             },
         },
     };
-    const ufc_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, ufc_board.games[0], 3, 3);
+    const ufc_line = try view.homeGameLine(std.testing.allocator, core.leagues.find("ufc").?, ufc_board.games[0], 3, 3);
     defer std.testing.allocator.free(ufc_line.?);
     // Athlete sides join with " v "; records stay out of the line.
     try std.testing.expect(std.mem.indexOf(u8, ufc_line.?, " v ") != null);
@@ -2781,7 +2541,7 @@ test "home groups live games, then today, then idle leagues" {
             },
         },
     };
-    const half_line = try gameLine(std.testing.allocator, core.leagues.find("ufc").?, half_board.games[0], 3, 4);
+    const half_line = try view.homeGameLine(std.testing.allocator, core.leagues.find("ufc").?, half_board.games[0], 3, 4);
     defer std.testing.allocator.free(half_line.?);
     try std.testing.expect(std.mem.indexOf(u8, half_line.?, "LOUD") != null);
     try std.testing.expect(std.mem.indexOf(u8, half_line.?, "Christian Natividad") != null);
@@ -3894,4 +3654,82 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try expectVisiblePreText(page, board, null, null);
+}
+
+test "scoreboard hostile fixture keeps text and HTML visible text equal" {
+    // Phase 4 lock: scoreboard rows compose in `view` (shared by text
+    // and the HTML linkifier post-pass), so hostile provider text must
+    // read identically in both. Long multibyte names, markup-looking
+    // statuses, empty scores/abbreviations, records, a name-only game,
+    // and an athlete-style game ride one board through both emitters.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away <b>&\"quoted\"</b> at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final <OT> & \"extra\"",
+                .participants = &.{
+                    .{ .id = "a", .name = "Atlético Madrid Club de Fútbol with an extremely long tail that never ends", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
+                    .{ .id = "h", .name = "Home\tTeam 漢字", .abbreviation = "HME", .score = "5", .winner = true, .record = "80-63" },
+                },
+            },
+            .{
+                .id = "2",
+                .name = "Contender Series <pre>",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "9/8 - 7:00 PM EDT",
+                .participants = &.{
+                    .{ .id = "x", .name = "Colton Loud & Partners", .abbreviation = "", .score = "", .winner = false },
+                    .{ .id = "y", .name = "Christian Natividad", .abbreviation = "", .score = "", .winner = false },
+                },
+            },
+            .{
+                .id = "3",
+                .name = "Rain-delayed <i>showcase</i> & friends",
+                .starts_at = "2026-09-06T19:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
+        },
+    };
+    // No raw markup or escapes leak into the text body; every content
+    // line fits the frame and stays valid UTF-8.
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<OT>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    try expectNoBrokenLines(body, 52);
+    // The HTML page escapes the hostile bytes and its visible `<pre>`
+    // text still matches the text renderer byte for byte.
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt; &amp; &quot;extra&quot;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<OT>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    // Same contract through the view helper the new suites use: strip
+    // each HTML pre line and compare against the text lines.
+    const pre = preBody(page);
+    var pre_lines = std.mem.splitScalar(u8, pre, '\n');
+    var text_lines = std.mem.splitScalar(u8, body, '\n');
+    while (true) {
+        const h = pre_lines.next();
+        const t = text_lines.next();
+        try std.testing.expectEqual(h == null, t == null);
+        if (h == null) break;
+        const clean = try view.stripHtmlVisible(arena, h.?);
+        defer arena.free(clean);
+        try std.testing.expectEqualStrings(t.?, clean);
+    }
+    _ = try std.unicode.Utf8View.init(page);
 }
