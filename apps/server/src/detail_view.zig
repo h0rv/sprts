@@ -49,7 +49,7 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     try table.writeLine(w, heading, cols, "2", color);
     const status = try tz.normalizeEastern(allocator, game.status);
     defer allocator.free(status);
-    try table.writeLine(w, status, cols, statusColor(game.state), color);
+    try table.writeLine(w, status, cols, vd.statusAnsi(game.state), color);
     // TV broadcaster the provider copied from the scoreboard row (same
     // ESPN payload, no extra fetch): one `TV:` line under the status,
     // skipped when the provider supplies none. The HTML path below
@@ -226,7 +226,7 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     defer allocator.free(status_href);
     const status = try tz.normalizeEastern(allocator, game.status);
     defer allocator.free(status);
-    try render.writeHtmlLine(w, allocator, status, cols, stateClass(game.state), status_href);
+    try render.writeHtmlLine(w, allocator, status, cols, vd.statusCssClass(game.state), status_href);
     if (game.network) |network| {
         const tv_line = try std.fmt.allocPrint(allocator, "TV: {s}", .{network});
         defer allocator.free(tv_line);
@@ -358,19 +358,6 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ game.league, game.id });
     try render.closePageWithNav(w);
     return out.toOwnedSlice();
-}
-
-/// CSS class matching the ANSI role for a game state.
-fn stateClass(state: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, state, "in")) return "live";
-    if (std.mem.eql(u8, state, "pre")) return "upcoming";
-    return null;
-}
-
-fn statusColor(state: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, state, "in")) return "1;31";
-    if (std.mem.eql(u8, state, "pre")) return "33";
-    return null;
 }
 
 fn hasProbables(game: detail.GameDetail) bool {
@@ -675,7 +662,7 @@ pub fn renderTextOneLine(arena: std.mem.Allocator, game: detail.GameDetail, colo
 // cross-module import would couple the two owners). Adapted: detail has
 // no game `.name`, so non-duels list abbrevs.
 fn writeDetailOneLine(w: *std.Io.Writer, arena: std.mem.Allocator, game: detail.GameDetail, color: bool) !void {
-    if (color) try w.print("\x1b[{s}m", .{oneLineStateColor(game.state)});
+    if (color) try w.print("\x1b[{s}m", .{vd.statusAnsi(game.state) orelse "2"});
     try w.writeAll(game.state);
     if (color) try w.writeAll("\x1b[0m");
     try w.writeByte(' ');
@@ -711,13 +698,6 @@ fn writeDetailOneLine(w: *std.Io.Writer, arena: std.mem.Allocator, game: detail.
         if (won) try w.writeAll(" ✓");
     }
     try w.writeByte('\n');
-}
-
-// one-line: state palette duplicated from `help.stateColor` (see above).
-fn oneLineStateColor(state: []const u8) []const u8 {
-    if (std.mem.eql(u8, state, "in")) return "1;31";
-    if (std.mem.eql(u8, state, "pre")) return "33";
-    return "2";
 }
 
 // one-line: dim-heading colorizer (same shape as `help.colorize`).

@@ -1,0 +1,71 @@
+{
+  "nextId": 7,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Item 1: dedupe detail_view state colors",
+      "description": "Delete detail_view local stateClass/statusColor/oneLineStateColor, call view.statusCssClass/statusAnsi (orelse \"2\"); run tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707524,
+      "updatedAt": 1789074838273
+    },
+    {
+      "id": "2",
+      "subject": "Item 2: one-line path uses shared shortDate",
+      "description": "render.zig writeBoardGameOneLine calls view.shortDate; delete writeShortDate; update render tests/doc pinned on M/D form",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707524,
+      "updatedAt": 1789074876781
+    },
+    {
+      "id": "3",
+      "subject": "Item 3: delete stale render re-exports",
+      "description": "Delete render.zig:16-18 re-exports; rewrite internal uses as table.X; run tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707524,
+      "updatedAt": 1789074941492
+    },
+    {
+      "id": "4",
+      "subject": "Item 4: delete superseded big banner",
+      "description": "Delete text_home_banner const + docs; trim big-banner half of wordmark test; run tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707525,
+      "updatedAt": 1789075152724
+    },
+    {
+      "id": "5",
+      "subject": "Item 5: collapse homeGameLine branches",
+      "description": "Collapse 4 homeGameLine duel branches into one builder with optional middle slots; keep homeGameTail; byte-identical output; run tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707525,
+      "updatedAt": 1789075241792
+    },
+    {
+      "id": "6",
+      "subject": "Item 6: keyValueLines prefix fn + concrete widths",
+      "description": "keyValueLines gains optional label-prefix fn used by leadersLines; homeColumnWidths takes concrete slice instead of anytype; run tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074707525,
+      "updatedAt": 1789075537907
+    }
+  ]
+}
