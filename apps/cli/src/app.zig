@@ -1,17 +1,27 @@
-/// One-shot dispatch for `sprts-tui` (wave 2).
+/// Dispatch for `sprts-tui` (waves 2-3).
 ///
 /// Pure orchestration over the client's `HttpTransport` seam: resolve the
 /// date, fetch typed structs (or the raw body for `--json`), render with
-/// `plain`. Diagnostics go to `err`; success output to `out`. The entrypoint
-/// maps any error to a nonzero exit without stack traces.
-
+/// `plain` — or hand off to the interactive `tui` loop when `--tui` is set
+/// or stdout is a TTY and no one-shot flag was given. Diagnostics go to
+/// `err`; success output to `out`. The entrypoint maps any error to a
+/// nonzero exit without stack traces.
 const std = @import("std");
 const core = @import("sprts_core");
 const sprts_client = @import("sprts_client");
 const cli = @import("cli.zig");
 const plain = @import("plain.zig");
+const tui = @import("tui.zig");
+
+/// Interactive when forced (`--tui`) or defaulted (TTY stdout with no
+/// one-shot flag). Pure so the defaulting rule is unit-testable; `main`
+/// supplies the real TTY probe while tests inject `tty` directly.
+pub fn shouldUseTui(opts: cli.Options, tty: bool) bool {
+    return opts.tui or (!opts.plain and !opts.json and tty);
+}
 
 pub fn run(
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     transport: sprts_client.HttpTransport,
     base_url: []const u8,
@@ -19,16 +29,25 @@ pub fn run(
     today: ?[]const u8,
     out: *std.Io.Writer,
     err: *std.Io.Writer,
+    io: std.Io,
+    tty: bool,
 ) !void {
-    if (opts.tui) {
-        try err.writeAll("sprts-tui: tui mode is not yet implemented (coming in wave 3)\n");
-        return error.TuiNotImplemented;
-    }
     if (opts.league) |slug| {
         if (core.leagues.find(slug) == null) {
             try err.print("sprts-tui: unknown league '{s}' (see --help)\n", .{slug});
             return error.UnknownLeague;
         }
+    }
+    if (shouldUseTui(opts, tty)) {
+        if (!tty) {
+            try err.writeAll("sprts-tui: --tui needs an interactive terminal\n");
+            return error.NotATerminal;
+        }
+        _ = cli.resolveQueryDate(arena, opts.date, today) catch {
+            try err.writeAll("sprts-tui: invalid date (want YYYY-MM-DD, today, tomorrow, yesterday)\n");
+            return error.InvalidDate;
+        };
+        return tui.run(gpa, io, transport, base_url, opts, today);
     }
     const date = cli.resolveQueryDate(arena, opts.date, today) catch {
         try err.writeAll("sprts-tui: invalid date (want YYYY-MM-DD, today, tomorrow, yesterday)\n");
@@ -128,6 +147,13 @@ const canned_digest =
     \\{"id":"h","name":"Home Club","abbreviation":"HME","score":"5","winner":true,"home_away":"home","record":null}]}],"schema_version":"1","league":"nfl","league_name":"NFL"}]}
 ;
 
+fn testIo() std.Io {
+    const S = struct {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+    };
+    return S.threaded.io();
+}
+
 fn runCase(
     arena: std.mem.Allocator,
     fake: *FakeTransportState,
@@ -136,7 +162,7 @@ fn runCase(
 ) !struct { out: []u8, err: []u8 } {
     var out_alloc: std.Io.Writer.Allocating = .init(arena);
     var err_alloc: std.Io.Writer.Allocating = .init(arena);
-    run(arena, fake.asTransport(), "https://example.test", opts, today, &out_alloc.writer, &err_alloc.writer) catch |e| {
+    run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", opts, today, &out_alloc.writer, &err_alloc.writer, testIo(), false) catch |e| {
         return e;
     };
     return .{ .out = out_alloc.written(), .err = err_alloc.written() };
@@ -181,7 +207,7 @@ test "fetch failure exits nonzero with a readable message" {
     var fake = FakeTransportState{ .fail = error.ConnectionRefused };
     var out_alloc: std.Io.Writer.Allocating = .init(arena);
     var err_alloc: std.Io.Writer.Allocating = .init(arena);
-    const result = run(arena, fake.asTransport(), "https://example.test", .{ .league = "mlb" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer);
+    const result = run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", .{ .league = "mlb" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer, testIo(), false);
     try std.testing.expectError(error.FetchFailed, result);
     try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "fetch failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "ConnectionRefused") != null);
@@ -194,22 +220,44 @@ test "http error status exits nonzero with the status code" {
     var fake = FakeTransportState{ .body = "oops", .status = .bad_gateway };
     var out_alloc: std.Io.Writer.Allocating = .init(arena);
     var err_alloc: std.Io.Writer.Allocating = .init(arena);
-    const result = run(arena, fake.asTransport(), "https://example.test", .{ .league = "mlb" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer);
+    const result = run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", .{ .league = "mlb" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer, testIo(), false);
     try std.testing.expectError(error.BadResponse, result);
     try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "HTTP 502") != null);
 }
 
-test "tui flag is a not-yet stub error" {
+test "tui without a terminal errors cleanly before fetching" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var fake = FakeTransportState{};
     var out_alloc: std.Io.Writer.Allocating = .init(arena);
     var err_alloc: std.Io.Writer.Allocating = .init(arena);
-    const result = run(arena, fake.asTransport(), "https://example.test", .{ .tui = true }, "2026-09-06", &out_alloc.writer, &err_alloc.writer);
-    try std.testing.expectError(error.TuiNotImplemented, result);
-    try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "not yet") != null);
+    const result = run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", .{ .tui = true }, "2026-09-06", &out_alloc.writer, &err_alloc.writer, testIo(), false);
+    try std.testing.expectError(error.NotATerminal, result);
+    try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "terminal") != null);
     try std.testing.expect(fake.seen_url == null);
+}
+
+test "tui mode still validates the league first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeTransportState{};
+    var out_alloc: std.Io.Writer.Allocating = .init(arena);
+    var err_alloc: std.Io.Writer.Allocating = .init(arena);
+    const result = run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", .{ .league = "quidditch", .tui = true }, "2026-09-06", &out_alloc.writer, &err_alloc.writer, testIo(), false);
+    try std.testing.expectError(error.UnknownLeague, result);
+    try std.testing.expect(fake.seen_url == null);
+}
+
+test "tui dispatch defaults to a tty without one-shot flags" {
+    try std.testing.expect(shouldUseTui(.{ .tui = true }, false));
+    try std.testing.expect(shouldUseTui(.{ .tui = true }, true));
+    try std.testing.expect(shouldUseTui(.{}, true));
+    try std.testing.expect(shouldUseTui(.{ .league = "mlb" }, true));
+    try std.testing.expect(!shouldUseTui(.{}, false));
+    try std.testing.expect(!shouldUseTui(.{ .plain = true }, true));
+    try std.testing.expect(!shouldUseTui(.{ .json = true }, true));
 }
 
 test "unknown league never touches the network" {
@@ -219,7 +267,7 @@ test "unknown league never touches the network" {
     var fake = FakeTransportState{ .body = canned_scoreboard };
     var out_alloc: std.Io.Writer.Allocating = .init(arena);
     var err_alloc: std.Io.Writer.Allocating = .init(arena);
-    const result = run(arena, fake.asTransport(), "https://example.test", .{ .league = "quidditch" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer);
+    const result = run(std.testing.allocator, arena, fake.asTransport(), "https://example.test", .{ .league = "quidditch" }, "2026-09-06", &out_alloc.writer, &err_alloc.writer, testIo(), false);
     try std.testing.expectError(error.UnknownLeague, result);
     try std.testing.expect(std.mem.indexOf(u8, err_alloc.written(), "unknown league") != null);
     try std.testing.expect(fake.seen_url == null);
