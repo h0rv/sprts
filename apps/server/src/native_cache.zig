@@ -49,7 +49,7 @@ pub fn realClock(io: std.Io) i64 {
     return std.Io.Clock.real.now(io).toSeconds();
 }
 
-pub const Kind = enum { board, detail, team, standings };
+pub const Kind = enum { board, detail, team, standings, teams };
 
 fn kindOf(key: Key) Kind {
     return switch (key) {
@@ -57,6 +57,7 @@ fn kindOf(key: Key) Kind {
         .detail => .detail,
         .team => .team,
         .standings => .standings,
+        .teams => .teams,
     };
 }
 
@@ -67,7 +68,7 @@ fn kindOf(key: Key) Kind {
 pub fn freshTtl(kind: Kind) i64 {
     return switch (kind) {
         .board, .detail => edge.fresh_ttl_s,
-        .team, .standings => edge.schedule_fresh_ttl_s,
+        .team, .standings, .teams => edge.schedule_fresh_ttl_s,
     };
 }
 
@@ -77,7 +78,7 @@ pub fn freshTtl(kind: Kind) i64 {
 pub fn staleTtl(kind: Kind) i64 {
     return switch (kind) {
         .board, .detail => edge.stale_ttl_s,
-        .team, .standings => edge.schedule_stale_ttl_s,
+        .team, .standings, .teams => edge.schedule_stale_ttl_s,
     };
 }
 
@@ -88,6 +89,7 @@ pub const Key = union(enum) {
     detail: struct { slug: []const u8, id: []const u8 },
     team: struct { slug: []const u8, abbr: []const u8 },
     standings: struct { slug: []const u8 },
+    teams: struct { slug: []const u8 },
 };
 
 const KeyContext = struct {
@@ -110,6 +112,9 @@ const KeyContext = struct {
             .standings => |s| {
                 h.update(s.slug);
             },
+            .teams => |t| {
+                h.update(t.slug);
+            },
         }
         return h.final();
     }
@@ -121,6 +126,7 @@ const KeyContext = struct {
             .detail => |x| std.mem.eql(u8, x.slug, b.detail.slug) and std.mem.eql(u8, x.id, b.detail.id),
             .team => |x| std.mem.eql(u8, x.slug, b.team.slug) and std.mem.eql(u8, x.abbr, b.team.abbr),
             .standings => |x| std.mem.eql(u8, x.slug, b.standings.slug),
+            .teams => |x| std.mem.eql(u8, x.slug, b.teams.slug),
         };
     }
 };
@@ -131,6 +137,7 @@ pub const Data = union(enum) {
     detail: core.detail.GameDetail,
     team: core.schedule.TeamView,
     standings: core.standings.LeagueStandings,
+    teams: core.schedule.TeamList,
 };
 
 pub const Outcome = enum { hit, miss, stale };
@@ -172,6 +179,7 @@ pub fn cloneScoreboard(a: std.mem.Allocator, board: domain.Scoreboard) !domain.S
             .state = try a.dupe(u8, game.state),
             .status = try a.dupe(u8, game.status),
             .participants = participants,
+            .network = try dupeOpt(a, game.network),
         };
     }
     return .{
@@ -244,6 +252,7 @@ pub fn cloneGameDetail(a: std.mem.Allocator, detail: core.detail.GameDetail) !co
         .venue = try dupeOpt(a, detail.venue),
         .attendance = detail.attendance,
         .series = try dupeOpt(a, detail.series),
+        .network = try dupeOpt(a, detail.network),
         .participants = participants,
         .situation = situation,
         .decisions = decisions,
@@ -325,12 +334,31 @@ pub fn cloneStandings(a: std.mem.Allocator, st: core.standings.LeagueStandings) 
     };
 }
 
+pub fn cloneTeamList(a: std.mem.Allocator, list: core.schedule.TeamList) !core.schedule.TeamList {
+    const teams = try a.alloc(core.schedule.TeamListEntry, list.teams.len);
+    for (list.teams, 0..) |entry, i| {
+        teams[i] = .{
+            .id = try a.dupe(u8, entry.id),
+            .abbrev = try a.dupe(u8, entry.abbrev),
+            .name = try a.dupe(u8, entry.name),
+        };
+    }
+    return .{
+        .schema_version = try a.dupe(u8, list.schema_version),
+        .league = try a.dupe(u8, list.league),
+        .league_name = try a.dupe(u8, list.league_name),
+        .teams = teams,
+        .source = try a.dupe(u8, list.source),
+    };
+}
+
 fn cloneData(a: std.mem.Allocator, data: Data) !Data {
     return switch (data) {
         .board => |b| .{ .board = try cloneScoreboard(a, b) },
         .detail => |d| .{ .detail = try cloneGameDetail(a, d) },
         .team => |t| .{ .team = try cloneTeamView(a, t) },
         .standings => |s| .{ .standings = try cloneStandings(a, s) },
+        .teams => |t| .{ .teams = try cloneTeamList(a, t) },
     };
 }
 
@@ -414,6 +442,9 @@ pub const NativeCache = struct {
             } },
             .standings => |s| .{ .standings = .{
                 .slug = try store.allocator().dupe(u8, s.slug),
+            } },
+            .teams => |t| .{ .teams = .{
+                .slug = try store.allocator().dupe(u8, t.slug),
             } },
         };
         const owned_data = try cloneData(store.allocator(), data);

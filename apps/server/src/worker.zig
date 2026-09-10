@@ -219,6 +219,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .date_alias => |route| return serveDateAlias(env, alloc, route, format, zone),
         .week_alias => |route| return serveWeekAlias(env, alloc, route, format),
         .standings => |route| return serveStandings(env, alloc, route, format, zone),
+        .teams => |route| return serveTeams(env, alloc, route, format),
     }
 }
 
@@ -868,6 +869,69 @@ fn serveStandings(
     };
 
     var resp = boardResponse(body, format, "miss");
+
+    var for_fresh = resp.clone();
+    cache.put(.{ .url = fresh_key }, &for_fresh);
+    var for_stale = resp.clone();
+    for_stale.setHeader("cache-control", edge.stale_cache_control);
+    for_stale.setHeader("x-sprts-cache", "stale");
+    cache.put(.{ .url = stale_key }, &for_stale);
+    return resp;
+}
+
+/// League team list through the edge cache. JSON-only like the native
+/// arm (no text table exists for a picker): every format serves the same
+/// JSON body. Edge scheme uses the dedicated 24h teams namespace (see
+/// `edge.teamsKey`): membership barely changes, so fresh serves 24h and
+/// stale covers 24h on upstream failure (else 502); errors never cached.
+fn serveTeams(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TeamsRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+
+    const epoch_s = epochSecondsNow();
+    const slug = try edge.canonicalSlug(alloc, league.slug);
+    const key = try edge.teamsKey(alloc, slug);
+    const fresh_key = try edge.teamsFreshKey(alloc, key, epoch_s);
+    const stale_key = try edge.teamsStaleKey(alloc, key, epoch_s);
+
+    const cache = workers.Cache.default();
+
+    if (cache.match(.{ .url = fresh_key })) |hit| {
+        var resp = hit.clone();
+        resp.setHeader("cache-control", edge.client_cache_control);
+        resp.setHeader("x-sprts-cache", "hit");
+        return resp;
+    }
+
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+
+    const list = provider.fetchTeams(adapter, alloc, league) catch {
+        workers.log("upstream ESPN teams fetch failed for {s}", .{league.slug});
+        if (cache.match(.{ .url = stale_key })) |stale| {
+            var resp = stale.clone();
+            resp.setHeader("cache-control", edge.client_cache_control);
+            resp.setHeader("x-sprts-cache", "stale");
+            return resp;
+        }
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const body = try render.teamsJson(alloc, list);
+
+    var resp = boardResponse(body, .json, "miss");
 
     var for_fresh = resp.clone();
     cache.put(.{ .url = fresh_key }, &for_fresh);

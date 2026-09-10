@@ -146,9 +146,10 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  aliases match two team abbreviations only: cards, races, tournaments without abbrs 404 (browse the day board for the id)
         \\  /{league}/{abbr}/today        today's game, redirects to it
         \\  /{league}/standings            current table, no date
+        \\  /{league}/teams                 team list as JSON (no text twin: picker payload)
         \\  /api/v1/leagues                leagues as JSON
         \\  /api/v1/{league}[/{id|abbr}]   same shapes as JSON
-        \\  /api/v1/all, .../standings     digest and table as JSON
+        \\  /api/v1/all, .../standings, .../teams  digest, table, and team list as JSON
         \\  /openapi.json                  API spec
         \\  /docs                          human API reference
         \\  /llms.txt                      agent API guide, plain text
@@ -205,7 +206,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
-    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
+    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /{league}/teams(JSON only) /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
     try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
@@ -257,9 +258,10 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "/{league}/{date}/{away}-{home}", .description = "One game by date and teams, 302 to the game (date or today|tomorrow|yesterday; -N = doubleheader game N, 1 = first; curl -L; duel-only, cards/races 404 with the day board)" },
             .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, 302 to the game (-N = doubleheader game N; curl -L)" },
             .{ .name = "/{league}/standings", .description = "Current table, no date" },
+            .{ .name = "/{league}/teams", .description = "Team list: id, abbrev, name per team. JSON-only (no text twin: picker payload); the human path serves the same JSON body" },
             .{ .name = "/api/v1/leagues", .description = "Leagues as JSON" },
             .{ .name = "/api/v1/{league}[/{id|abbr}]", .description = "Same shapes as JSON" },
-            .{ .name = "/api/v1/all, .../standings", .description = "Digest and table as JSON" },
+            .{ .name = "/api/v1/all, .../standings, .../teams", .description = "Digest, table, and team list as JSON" },
             .{ .name = "/openapi.json", .description = "API spec" },
             .{ .name = "/docs", .description = "Human API reference" },
             .{ .name = "/llms.txt", .description = "Agent API guide, plain text" },
@@ -441,6 +443,9 @@ test "help text documents every route, flag, alias, install, and example" {
         "else team",
         "/{league}/{abbr}",
         "standings",
+        "/{league}/teams",
+        "no text twin",
+        "picker",
         "/api/v1/",
         "/api/v1/all",
         "/openapi.json",
@@ -499,7 +504,7 @@ test "help quiet strips framing, oneline compacts, color toggles ANSI" {
     try std.testing.expectEqual(@as(usize, 4), count);
     // Compact page carries the same surface: digest, standings, agent
     // guide, week/tz flags, and the digits rule, not just the basics.
-    for ([_][]const u8{ "/all", "/{league}/{id}", "digits=game", "standings", "/llms.txt", "/docs", "week=N", "tz=utc", "text only", "art=off" }) |token| {
+    for ([_][]const u8{ "/all", "/{league}/{id}", "digits=game", "standings", "/{league}/teams", "/llms.txt", "/docs", "week=N", "tz=utc", "text only", "art=off" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, compact, token) != null);
     }
 }
@@ -527,7 +532,7 @@ test "help JSON parses with routes, flags, links, install, and examples" {
     try std.testing.expect(root.get("examples").?.array.items.len > 0);
     // Drift pins: every route/flag the text page documents lives here too.
     const route_names = root.get("routes").?.array.items;
-    for ([_][]const u8{ "/all", "/{league}?week=N", "/{league}/{id}", "/{league}/standings", "/api/v1/all, .../standings", "/llms.txt", "/docs" }) |want| {
+    for ([_][]const u8{ "/all", "/{league}?week=N", "/{league}/{id}", "/{league}/standings", "/{league}/teams", "/api/v1/all, .../standings, .../teams", "/llms.txt", "/docs" }) |want| {
         var found = false;
         for (route_names) |entry| {
             if (std.mem.eql(u8, entry.object.get("name").?.string, want)) {

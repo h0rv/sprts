@@ -24,12 +24,16 @@ pub const Game = struct {
     state: []const u8,
     status: []const u8,
     participants: []const Participant,
+    /// TV broadcaster (first ESPN `broadcasts[].names` entry, geo feed
+    /// short name as fallback); null when the provider supplies none.
+    network: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "Game",
         .description = "One game, bout, race, tournament, or other competition.",
         .fields = .{
             .starts_at = .{ .format = "date-time" },
+            .network = .{ .description = "TV broadcaster when the provider supplies one." },
         },
     };
 };

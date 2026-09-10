@@ -150,6 +150,25 @@ pub const ApiSpec = z.Spec(.{
             z.case(.bad_gateway, z.ErrorBody),
         },
     }),
+    // Team-list tab: the picker behind schedule browsing. One ESPN teams
+    // fetch per league (provider order, id/abbrev/name rows); no record —
+    // the teams payload carries none and per-team records would cost one
+    // schedule fetch per team. JSON-only by design: the picker is a
+    // JSON-client affordance with no text table, so both the human path
+    // and the /api/v1/ twin serve the same JSON body. Unknown slugs 404;
+    // upstream failure is 502.
+    z.endpoint(.GET, "/api/v1/{league}/teams", .{
+        .operation_id = "listTeams",
+        .summary = "Team list for one league",
+        .description = "Every member team's id, abbrev, and name in provider order. " ++
+            "JSON-only: the human path serves the same JSON body (no text table exists for a picker).",
+        .path = ScoreboardPath,
+        .responses = .{
+            z.case(.ok, core.schedule.TeamList),
+            z.case(.not_found, z.ErrorBody),
+            z.case(.bad_gateway, z.ErrorBody),
+        },
+    }),
 });
 
 pub fn openApiJson(allocator: std.mem.Allocator) ![]u8 {
@@ -182,9 +201,13 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
             "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
             "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only. (getScoreboard)\n" ++
-            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. (getGame)\n" ++
+            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
             "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
+            "  GET /api/v1/league/teams - Team list: id, abbrev, name per team. JSON-only, same body on the human path. (listTeams)\n" ++
+            "\n" ++
+            "NETWORK\n" ++
+            "  Scoreboard games and game detail carry network when ESPN lists broadcasts (first broadcasts[].names entry, geo-feed fallback); null/absent otherwise.\n" ++
             "\n" ++
             "DIGITS RULE\n" ++
             "  Second segment all digits is a game: /mlb/401816828.\n" ++
@@ -225,6 +248,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/api/v1/leagues\n" ++
             "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
+            "  curl localhost:8080/api/v1/mlb/teams\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det-2\n" ++
@@ -258,10 +282,10 @@ const team_view = @import("team_view.zig");
 test "spec emits all five JSON operations" {
     const doc = try openApiJson(std.testing.allocator);
     defer std.testing.allocator.free(doc);
-    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings" }) |id| {
+    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings", "listTeams" }) |id| {
         try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
     }
-    for ([_][]const u8{ "LeagueList", "DigestJson", "Scoreboard", "DetailGame", "ScheduleTeamView", "LeagueStandings", "ErrorBody" }) |name| {
+    for ([_][]const u8{ "LeagueList", "DigestJson", "Scoreboard", "DetailGame", "ScheduleTeamView", "LeagueStandings", "ScheduleTeamList", "ErrorBody" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, doc, name) != null);
     }
     // Digest envelope is Scoreboard shapes plus the additive `degraded`
@@ -274,10 +298,10 @@ test "spec emits all five JSON operations" {
 test "llms.txt is plain agent surface with every operation" {
     const doc = try llmsTxt(std.testing.allocator);
     defer std.testing.allocator.free(doc);
-    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings" }) |id| {
+    for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings", "listTeams" }) |id| {
         try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
     }
-    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "?art=off", "digits", "mlb", "nfl", "Base URL" }) |token| {
+    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "?art=off", "digits", "mlb", "nfl", "Base URL", "listTeams", "network", "/api/v1/league/teams" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, doc, token) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, doc, "\x1b") == null);
@@ -307,11 +331,14 @@ test "served openapi.json parses and covers every JSON route" {
     try std.testing.expect(router.parse("/api/v1/mlb/401816828") == .game);
     try std.testing.expect(router.parse("/api/v1/mlb/PHI") == .team);
     try std.testing.expect(router.parse("/api/v1/nfl/standings") == .standings);
+    try std.testing.expect(router.parse("/api/v1/nfl/teams") == .teams);
+    try std.testing.expect(router.parse("/nfl/teams") == .teams);
     try std.testing.expect(router.isJsonTarget("/api/v1/leagues"));
     try std.testing.expect(router.isJsonTarget("/api/v1/all?date=2026-09-06"));
     try std.testing.expect(router.isJsonTarget("/api/v1/mlb/401816828"));
     try std.testing.expect(router.isJsonTarget("/api/v1/mlb/PHI"));
     try std.testing.expect(router.isJsonTarget("/api/v1/nfl/standings"));
+    try std.testing.expect(router.isJsonTarget("/api/v1/nfl/teams"));
     try std.testing.expect(router.parse("/mlb/401816828") == .game);
     try std.testing.expectEqual(router.Format.json, router.formatFor("/mlb/401816828", "application/json"));
 
@@ -332,6 +359,7 @@ test "served openapi.json parses and covers every JSON route" {
         .{ .path = "/api/v1/{league}/{id}", .operation_id = "getGame", .errors = &.{ "404", "502" } },
         .{ .path = "/api/v1/{league}/{abbr}", .operation_id = "getTeam", .errors = &.{ "404", "502" } },
         .{ .path = "/api/v1/{league}/standings", .operation_id = "getStandings", .errors = &.{ "404", "502" } },
+        .{ .path = "/api/v1/{league}/teams", .operation_id = "listTeams", .errors = &.{ "404", "502" } },
     };
     for (cases) |c| {
         try std.testing.expect(paths.get(c.path) != null);
@@ -457,6 +485,37 @@ test "all JSON renderers validate in one process" {
     const list_json = try render.leaguesJson(arena);
     try std.testing.expect(std.mem.indexOf(u8, list_json, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_json, "\"slug\": \"mlb\"") != null);
+
+    // New additive shapes validate in the same process: a board carrying
+    // the network field plus the team-list picker payload.
+    const net_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "pre",
+                .status = "7:05 PM ET",
+                .participants = &.{},
+                .network = "ESPN",
+            },
+        },
+    };
+    const net_json = try render.json(arena, net_board);
+    try std.testing.expect(std.mem.indexOf(u8, net_json, "\"network\": \"ESPN\"") != null);
+    const teams: core.schedule.TeamList = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .teams = &.{.{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" }},
+        .source = "test",
+    };
+    const teams_json = try render.teamsJson(arena, teams);
+    try std.testing.expect(std.mem.indexOf(u8, teams_json, "\"schema_version\": \"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, teams_json, "\"abbrev\": \"PHI\"") != null);
 }
 
 test "llms.txt examples all route" {

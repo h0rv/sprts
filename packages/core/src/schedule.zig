@@ -78,6 +78,39 @@ pub const TeamView = struct {
     };
 };
 
+/// One entry in a league's team list: ESPN identity only. No record:
+/// the teams endpoint carries none, and per-team records would cost one
+/// schedule fetch per team (N+1) instead of the single list fetch.
+pub const TeamListEntry = struct {
+    id: []const u8,
+    abbrev: []const u8,
+    name: []const u8,
+
+    pub const jsonschema = .{
+        .name = "ScheduleTeamListEntry",
+        .description = "One team's identity in a league team list.",
+    };
+};
+
+/// A league's full team membership in provider order: the picker payload
+/// behind `GET /api/v1/{league}/teams`. One ESPN teams fetch, no
+/// per-team fan-out; empty when the provider lists no teams.
+pub const TeamList = struct {
+    schema_version: []const u8 = "1",
+    league: []const u8,
+    league_name: []const u8,
+    teams: []const TeamListEntry = &.{},
+    source: []const u8 = "",
+
+    pub const jsonschema = .{
+        .name = "ScheduleTeamList",
+        .description = "Team list for one league: identity rows for every member team.",
+        .fields = .{
+            .schema_version = .{ .@"const" = "1" },
+        },
+    };
+};
+
 /// Raw schedule row used by the pure helpers below. The provider builds
 /// these from the ESPN schedule payload (competition level) before mapping
 /// to `GameRef`s.
@@ -208,6 +241,31 @@ fn testEvent(id: []const u8, date: []const u8, state: []const u8) ScheduleEvent 
         .state = state,
         .status = "Scheduled",
     };
+}
+
+test "team list wire shape round-trips with the schema marker" {
+    const list: TeamList = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .teams = &.{
+            .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+            .{ .id = "12", .abbrev = "ATL", .name = "Atlanta Braves" },
+        },
+        .source = "test",
+    };
+    var tmp = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer tmp.deinit();
+    const raw = try std.json.Stringify.valueAlloc(tmp.allocator(), list, .{});
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"schema_version\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"abbrev\":\"PHI\"") != null);
+    const parsed = try std.json.parseFromSliceLeaky(TeamList, tmp.allocator(), raw, .{});
+    try std.testing.expectEqual(@as(usize, 2), parsed.teams.len);
+    try std.testing.expectEqualStrings("22", parsed.teams[0].id);
+    try std.testing.expectEqualStrings("Philadelphia Phillies", parsed.teams[0].name);
+    // Empty membership parses to an empty list, never an error.
+    const empty: TeamList = .{ .league = "mlb", .league_name = "MLB" };
+    try std.testing.expectEqual(@as(usize, 0), empty.teams.len);
+    try std.testing.expectEqualStrings("1", empty.schema_version);
 }
 
 test "splitSchedule partitions past and upcoming around today" {

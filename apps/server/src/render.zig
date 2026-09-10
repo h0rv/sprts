@@ -1496,6 +1496,12 @@ pub fn leaguesJson(allocator: std.mem.Allocator) ![]u8 {
     return validatedJson(leagues.LeagueList, allocator, .{ .leagues = &leagues.all });
 }
 
+/// Team-list JSON (`GET /api/v1/{league}/teams`), through the same
+/// shared validation gate as every other JSON renderer.
+pub fn teamsJson(allocator: std.mem.Allocator, list: core.schedule.TeamList) ![]u8 {
+    return validatedJson(core.schedule.TeamList, allocator, list);
+}
+
 pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: router.Format) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
