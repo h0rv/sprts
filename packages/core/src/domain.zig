@@ -48,12 +48,6 @@ pub const Game = struct {
     /// Venue full name from the ESPN competition (racing falls back to
     /// the event circuit); null when the provider supplies none.
     venue: ?[]const u8 = null,
-    /// Betting line from the first ESPN odds entry (`details`, e.g.
-    /// "LAR -3.5"); null when the provider supplies none.
-    odds: ?[]const u8 = null,
-    /// Over/under total from the same odds entry (e.g. "48.5"); null
-    /// when the provider supplies none.
-    over_under: ?[]const u8 = null,
     /// Per-game statistical leaders (e.g. "Drew Lock 16/22, 187 YDS");
     /// empty when the provider supplies none.
     leaders: []const []const u8 = &.{},
@@ -65,8 +59,6 @@ pub const Game = struct {
             .starts_at = .{ .format = "date-time" },
             .network = .{ .description = "TV broadcaster when the provider supplies one." },
             .venue = .{ .description = "Venue full name when the provider supplies one." },
-            .odds = .{ .description = "Betting line when the provider supplies one." },
-            .over_under = .{ .description = "Over/under total when the provider supplies one." },
             .leaders = .{ .description = "Per-game statistical leader strings when the provider supplies them." },
         },
     };
