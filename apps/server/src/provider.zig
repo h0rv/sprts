@@ -357,6 +357,17 @@ fn competitionVenue(competition: Competition, event: Event) ?[]const u8 {
     return null;
 }
 
+/// One period/set display shared by the board and detail paths: display
+/// text wins, else the numeric value, else "-" (never blank). Tennis
+/// sets append their tiebreak ("7(7)"). Both pages read the same so a
+/// set score can never render "7(7)" on the board and "-" on detail.
+fn linescoreDisplay(arena: std.mem.Allocator, display_value: std.json.Value, value: std.json.Value, tiebreak: std.json.Value) ![]const u8 {
+    const base = (try jsonText(arena, display_value)) orelse (try jsonText(arena, value)) orelse "-";
+    const points = try jsonText(arena, tiebreak);
+    if (points) |p| if (p.len > 0) return try std.fmt.allocPrint(arena, "{s}({s})", .{ base, p });
+    return base;
+}
+
 /// Per-period display for one board competitor: display text, else the
 /// numeric value, else "-" (the detail fallback). Tennis sets append
 /// their tiebreak ("7(7)"); explicit periods win, else payload order.
@@ -364,12 +375,7 @@ fn competitorLines(arena: std.mem.Allocator, linescores: ?[]const BoardLinescore
     const list = linescores orelse return &.{};
     var out: std.ArrayList(core.domain.LineScore) = .empty;
     for (list, 0..) |line, index| {
-        const base = (try jsonText(arena, line.displayValue)) orelse (try jsonText(arena, line.value)) orelse "-";
-        const tiebreak = try jsonText(arena, line.tiebreak);
-        const display = if (tiebreak) |points|
-            (if (points.len > 0) try std.fmt.allocPrint(arena, "{s}({s})", .{ base, points }) else base)
-        else
-            base;
+        const display = try linescoreDisplay(arena, line.displayValue, line.value, line.tiebreak);
         try out.append(arena, .{
             .period = line.period orelse @as(i64, @intCast(index + 1)),
             .display = display,
@@ -1097,6 +1103,11 @@ const SummaryTeam = struct {
 
 const SummaryLinescore = struct {
     displayValue: std.json.Value = .null,
+    // Tennis sets carry numeric values with optional tiebreaks and no
+    // display text (same wire shape as the board path); the detail
+    // mapping renders them with the shared board semantics ("7(7)").
+    value: std.json.Value = .null,
+    tiebreak: std.json.Value = .null,
 };
 
 const SummaryRecord = struct {
@@ -1950,7 +1961,11 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         var probable: ?[]const u8 = null;
         if (match) |competitor| {
             for (competitor.linescores, 0..) |line, index| {
-                const display = (try jsonText(arena, line.displayValue)) orelse "-";
+                // Board semantics (display, else value, else "-", plus
+                // tiebreak): tennis summaries carry numeric set values
+                // with no display text, which the old display-only read
+                // rendered as "-" per set.
+                const display = try linescoreDisplay(arena, line.displayValue, line.value, line.tiebreak);
                 try lines.append(arena, .{ .period = @intCast(index + 1), .display = display });
             }
             hits = try jsonText(arena, competitor.hits);
@@ -5114,6 +5129,46 @@ test "tennis draws board only their day, else nothing" {
     try std.testing.expectEqual(@as(usize, 0), dateless.games.len);
 }
 
+test "fetchDetail resolves tennis matches listed under groupings" {
+    // Live ATP shape: the board event carries no event-level
+    // competitions (the key is absent), the draw lives under
+    // `groupings`, and both board and summary competitors are athletes
+    // with numeric set values plus tiebreaks (no display text).
+    const board =
+        \\{"events":[{"id":"189-2026","name":"US Open","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"groupings":[{"grouping":{"displayName":"Men's Singles"},"competitions":[{"id":"184607","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"1","order":2,"winner":false,"athlete":{"displayName":"Roberto Carballes Baena"},"linescores":[{"value":6,"tiebreak":3,"winner":false},{"value":3,"winner":false}]},{"id":"2","order":1,"winner":true,"athlete":{"displayName":"Jacob Fearnley"},"linescores":[{"value":7,"tiebreak":7,"winner":true},{"value":6,"winner":true}]}]}]}]}]}
+    ;
+    const summary =
+        \\{"header":{"competitions":[{"id":"184607","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"1","homeAway":"away","winner":false,"score":0,"linescores":[{"value":6,"tiebreak":3},{"value":3}]},{"id":"2","homeAway":"home","winner":true,"score":2,"linescores":[{"value":7,"tiebreak":7},{"value":6}]}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("atp").?, "184607");
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.board_calls);
+    try std.testing.expectEqualStrings("184607", detail.id);
+    try std.testing.expectEqualStrings("atp", detail.league);
+    try std.testing.expectEqualStrings("2026-08-24", detail.date);
+    try std.testing.expectEqualStrings("post", detail.state);
+    try std.testing.expectEqualStrings("Final", detail.status);
+    try std.testing.expectEqual(@as(usize, 2), detail.participants.len);
+    // Athlete identities carry no abbreviation; sets won score the row.
+    try std.testing.expectEqualStrings("Roberto Carballes Baena", detail.participants[0].name);
+    try std.testing.expectEqualStrings("", detail.participants[0].abbreviation);
+    try std.testing.expectEqualStrings("0", detail.participants[0].score);
+    try std.testing.expectEqualStrings("Jacob Fearnley", detail.participants[1].name);
+    try std.testing.expectEqualStrings("", detail.participants[1].abbreviation);
+    try std.testing.expectEqualStrings("2", detail.participants[1].score);
+    try std.testing.expect(detail.participants[1].winner);
+    // Set linescores render with tiebreaks, never "-" per set.
+    try std.testing.expectEqual(@as(usize, 2), detail.participants[0].lines.len);
+    try std.testing.expectEqualStrings("6(3)", detail.participants[0].lines[0].display);
+    try std.testing.expectEqualStrings("3", detail.participants[0].lines[1].display);
+    try std.testing.expectEqual(@as(usize, 2), detail.participants[1].lines.len);
+    try std.testing.expectEqualStrings("7(7)", detail.participants[1].lines[0].display);
+    try std.testing.expectEqualStrings("6", detail.participants[1].lines[1].display);
+}
+
 test "board leaders map the combined table, absent stays empty" {
     // Live NFL post-game shape: combined categories, team refs ignored.
     const with_leaders =
@@ -5194,4 +5249,3 @@ test "detail win probability reads the last sample, absent stays null" {
     const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
     try std.testing.expect(bare.win_probability == null);
 }
-
