@@ -15,7 +15,7 @@
     {
       "id": "2",
       "subject": "Core model additions (domain+detail)",
-      "description": "Additive fields only: domain Game (venue, odds, over_under, leaders) + Participant (lines, form) + LineScore struct; detail GameDetail (odds, over_under, injuries, win_probability). jsonschema descriptions per pattern.",
+      "description": "Additive fields only: domain Game (venue, leaders) + Participant (lines, form) + LineScore struct; detail GameDetail (injuries, win_probability). jsonschema descriptions per pattern.",
       "status": "completed",
       "metadata": {},
       "blocks": [],
@@ -26,7 +26,7 @@
     {
       "id": "3",
       "subject": "Provider parsing + tests for gap fixes",
-      "description": "Board: venue (comp, circuit fallback), odds/over_under, competitor linescores incl. tennis tiebreaks, comp-level leaders, soccer form, tennis groupings day-filtered with sets-won scores. Detail: injuries, win_probability, pickcenter/odds. Fixture tests present+absent per field.",
+      "description": "Board: venue (comp, circuit fallback), competitor linescores incl. tennis tiebreaks, comp-level leaders, soccer form, tennis groupings day-filtered with sets-won scores. Detail: injuries, win_probability. Fixture tests present+absent per field.",
       "status": "completed",
       "metadata": {},
       "blocks": [],

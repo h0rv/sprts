@@ -258,7 +258,6 @@ const Competition = struct {
     broadcasts: []const ScoreboardBroadcast = &.{},
     geoBroadcasts: []const ScoreboardGeoBroadcast = &.{},
     venue: ?BoardVenue = null,
-    odds: ?[]const BoardOdds = null,
     leaders: ?[]const BoardLeaderCat = null,
 };
 /// ESPN competition venue: only `fullName` is surfaced (city + court
@@ -270,12 +269,6 @@ const BoardVenue = struct {
 /// competition venue on sessions that carry none of their own.
 const BoardCircuit = struct {
     fullName: []const u8 = "",
-};
-/// ESPN odds entry: `details` is the line ("LAR -3.5", "BOU +150"),
-/// `overUnder` the total (48.5, 2.5). Either may be absent per sport.
-const BoardOdds = struct {
-    details: []const u8 = "",
-    overUnder: std.json.Value = .null,
 };
 /// ESPN board linescore: quarter/period/set score. Display text wins,
 /// else the numeric value; tennis sets add `tiebreak` ("7(7)").
@@ -378,24 +371,6 @@ fn competitionVenue(competition: Competition, event: Event) ?[]const u8 {
     if (competition.venue) |venue| if (venue.fullName.len > 0) return venue.fullName;
     if (event.circuit) |circuit| if (circuit.fullName.len > 0) return circuit.fullName;
     return null;
-}
-
-const OddsFields = struct {
-    odds: ?[]const u8 = null,
-    over_under: ?[]const u8 = null,
-};
-
-/// First odds entry that carries anything wins (details and total stay
-/// coherent: both come from the same book entry). Null/absent entries
-/// and empty details fall through; nothing yields nulls.
-fn oddsFields(arena: std.mem.Allocator, entries: ?[]const BoardOdds) !OddsFields {
-    const list = entries orelse return .{};
-    for (list) |entry| {
-        const over = try jsonText(arena, entry.overUnder);
-        if (entry.details.len > 0) return .{ .odds = entry.details, .over_under = over };
-        if (over != null) return .{ .over_under = over };
-    }
-    return .{};
 }
 
 /// Per-period display for one board competitor: display text, else the
@@ -516,7 +491,6 @@ const BoardGameArgs = struct {
     participants: []const core.domain.Participant,
     network: ?[]const u8,
     venue: ?[]const u8,
-    odds: OddsFields,
     leaders: []const []const u8,
 };
 
@@ -530,8 +504,6 @@ fn assembleBoardGame(args: BoardGameArgs) core.domain.Game {
         .participants = args.participants,
         .network = args.network,
         .venue = args.venue,
-        .odds = args.odds.odds,
-        .over_under = args.odds.over_under,
         .leaders = args.leaders,
     };
 }
@@ -566,7 +538,6 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                 .participants = try participants.toOwnedSlice(arena),
                 .network = competitionNetwork(competition),
                 .venue = competitionVenue(competition, event),
-                .odds = try oddsFields(arena, competition.odds),
                 .leaders = try boardLeaders(arena, competition.leaders),
             }));
         }
@@ -600,7 +571,6 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                         .participants = try participants.toOwnedSlice(arena),
                         .network = competitionNetwork(match),
                         .venue = competitionVenue(match, event),
-                        .odds = try oddsFields(arena, match.odds),
                         .leaders = try boardLeaders(arena, match.leaders),
                     }));
                 }
@@ -1084,10 +1054,6 @@ const SummaryResponse = struct {
     // Win-probability samples across the game; the last entry is the
     // current (live) or final probability. Empty when ESPN ships none.
     winprobability: ?[]const SummaryWinProb = null,
-    // Game odds: `pickcenter` when ESPN centers them there (football
-    // post-game), else `odds`. Same entry shape as the board odds.
-    pickcenter: ?[]const BoardOdds = null,
-    odds: ?[]const BoardOdds = null,
 };
 
 const SummaryHeader = struct {
@@ -2155,11 +2121,6 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         }
     }
 
-    // Detail odds ride the summary payload: pickcenter first (football
-    // centers post-game odds there), then `odds`. The board row may
-    // carry none (post-game boards drop them), so no board fallback.
-    const detail_odds = try oddsFields(arena, response.pickcenter orelse response.odds);
-
     return .{
         .id = try copy(arena, game.id),
         .league = league.slug,
@@ -2181,8 +2142,6 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .lineups = try lineups.toOwnedSlice(arena),
         // depth: box-score team totals (optional; empty when not supplied).
         .team_stats = team_stats,
-        .odds = detail_odds.odds,
-        .over_under = detail_odds.over_under,
         .injuries = try injuries.toOwnedSlice(arena),
         .win_probability = win_probability,
     };
@@ -5093,34 +5052,6 @@ test "board venue reads competition first, circuit fallback, else null" {
     try std.testing.expect(plain.games[0].venue == null);
 }
 
-test "board odds thread details and total, null stays null" {
-    // NFL pre-game: details plus a numeric total.
-    const pre =
-        \\{"events":[{"id":"401872657","name":"SF at LAR","date":"2026-09-11T00:35Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitions":[{"id":"401872657","date":"2026-09-11T00:35Z","odds":[{"details":"LAR -3.5","overUnder":48.5}],"competitors":[{"homeAway":"away","team":{"id":"25","displayName":"49ers","abbreviation":"SF"}},{"homeAway":"home","team":{"id":"11","displayName":"Rams","abbreviation":"LAR"}}]}]}]}
-    ;
-    // Total without a line: odds stays null, the total still threads.
-    const total_only =
-        \\{"events":[{"id":"8","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"id":"8","date":"2026-09-06T17:00Z","odds":[{"overUnder":2.5}],"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
-    ;
-    // NFL post-game: ESPN drops odds entirely (null), never a stale line.
-    const post =
-        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","odds":null,"competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"25","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
-    ;
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const nfl = core.leagues.find("nfl").?;
-    const lined = try parseAndNormalize(arena, nfl, "2026-09-10", pre);
-    try std.testing.expectEqualStrings("LAR -3.5", lined.games[0].odds.?);
-    try std.testing.expectEqualStrings("48.5", lined.games[0].over_under.?);
-    const totals = try parseAndNormalize(arena, nfl, "2026-09-06", total_only);
-    try std.testing.expect(totals.games[0].odds == null);
-    try std.testing.expectEqualStrings("2.5", totals.games[0].over_under.?);
-    const final = try parseAndNormalize(arena, nfl, "2026-09-09", post);
-    try std.testing.expect(final.games[0].odds == null);
-    try std.testing.expect(final.games[0].over_under == null);
-}
-
 test "board linescores thread quarters, absent stays empty" {
     // NFL post-game quarters ride the board payload itself.
     const final =
@@ -5271,36 +5202,5 @@ test "detail win probability reads the last sample, absent stays null" {
     var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
     const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
     try std.testing.expect(bare.win_probability == null);
-}
-
-test "detail odds prefer pickcenter, fall back to odds, absent stays null" {
-    const board =
-        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]}]}
-    ;
-    const summary_both =
-        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"pickcenter":[{"details":"SEA -3","overUnder":44.5}],"odds":[{"details":"NE +3","overUnder":44.5}]}
-    ;
-    const summary_odds =
-        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"odds":[{"details":"NE +3"}]}
-    ;
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const nfl = core.leagues.find("nfl").?;
-    // Pickcenter wins over `odds` when both ship.
-    var both = DetailFake{ .summary_body = summary_both, .board_body = board };
-    const centered = try detailAdapter(&both).fetchDetail(arena, nfl, "401872656");
-    try std.testing.expectEqualStrings("SEA -3", centered.odds.?);
-    try std.testing.expectEqualStrings("44.5", centered.over_under.?);
-    // Odds alone still threads.
-    var fallback = DetailFake{ .summary_body = summary_odds, .board_body = board };
-    const via_odds = try detailAdapter(&fallback).fetchDetail(arena, nfl, "401872656");
-    try std.testing.expectEqualStrings("NE +3", via_odds.odds.?);
-    try std.testing.expect(via_odds.over_under == null);
-    // Neither: nulls, never an error.
-    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
-    const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
-    try std.testing.expect(bare.odds == null);
-    try std.testing.expect(bare.over_under == null);
 }
 
