@@ -14,6 +14,7 @@ const standings = core.standings;
 const router = @import("router.zig");
 const render = @import("render.zig");
 const table = @import("table.zig");
+const view = @import("view.zig");
 
 /// `width` is total terminal columns of the document. Never shrinks below
 /// the classic 52-wide page. `height` caps the entries listed (`+N more`
@@ -27,7 +28,7 @@ pub fn text(
 ) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     const budget: usize = height orelse std.math.maxInt(usize);
-    const has_points = countPoints(st);
+    const has_points = view.hasPoints(st);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -53,9 +54,14 @@ pub fn text(
             try table.writeLine(w, "No entries.", cols, null, color);
             continue;
         }
-        for (group.entries) |entry| {
+        // Rows compose in `view.entryRows` (shared composer); emit stays
+        // here so the document rhythm (budget, blanks, trailer) is untouched.
+        const rows = try view.entryRows(allocator, group.entries, cols, has_points);
+        defer view.freeRows(allocator, rows);
+        for (rows) |row| {
             if (shown >= budget) break;
-            try writeEntryRow(w, allocator, entry, cols, has_points);
+            try w.writeAll(row);
+            try w.writeByte('\n');
             shown += 1;
         }
     }
@@ -65,54 +71,6 @@ pub fn text(
         try table.writeLine(w, more, cols, "2", color);
     }
     return out.toOwnedSlice();
-}
-
-fn countPoints(st: standings.LeagueStandings) bool {
-    for (st.groups) |group| {
-        for (group.entries) |entry| {
-            if (entry.points != null) return true;
-        }
-    }
-    return false;
-}
-
-fn writeEntryRow(
-    w: *std.Io.Writer,
-    allocator: std.mem.Allocator,
-    entry: standings.StandingEntry,
-    cols: usize,
-    has_points: bool,
-) !void {
-    // Fixed cells around the name: abbr 4 + spaces + record 9 + points 4
-    // when the column shows; the name absorbs the rest. Ragged, never
-    // padded.
-    const record_width: usize = 9;
-    const points_width: usize = 4;
-    const fixed: usize = 4 + 2 + record_width + (if (has_points) 1 + points_width else 0);
-    const name_width: usize = cols -| fixed;
-    var record_buf: [32]u8 = undefined;
-    const wins = entry.wins orelse "-";
-    const losses = entry.losses orelse "-";
-    const record: []const u8 = if (entry.ties) |ties|
-        std.fmt.bufPrint(&record_buf, "{s}-{s}-{s}", .{ wins, losses, ties }) catch "-"
-    else
-        std.fmt.bufPrint(&record_buf, "{s}-{s}", .{ wins, losses }) catch "-";
-    var buf: std.Io.Writer.Allocating = .init(allocator);
-    errdefer buf.deinit();
-    const b = &buf.writer;
-    try table.writeCell(b, entry.abbrev, 4, null, false);
-    try b.writeByte(' ');
-    try table.writeCell(b, entry.name, name_width, null, false);
-    try b.writeByte(' ');
-    try table.writeCellRight(b, record, record_width, null, false);
-    if (has_points) {
-        try b.writeByte(' ');
-        try table.writeCellRight(b, entry.points orelse "-", points_width, null, false);
-    }
-    const raw = try buf.toOwnedSlice();
-    defer allocator.free(raw);
-    try w.writeAll(std.mem.trimEnd(u8, raw, " "));
-    try w.writeByte('\n');
 }
 
 /// HTML view: the same table as text (color off), never ANSI, inside
@@ -343,4 +301,69 @@ test "standings renders no team marks in text or HTML" {
         try std.testing.expect(!(page[j] == 0xE2 and page[j + 1] >= 0xA0 and page[j + 1] <= 0xA3));
     }
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+}
+
+/// Strip every `<...>` tag: what remains is the page's visible text.
+fn stripHtmlTags(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var in_tag = false;
+    for (s) |c| {
+        if (in_tag) {
+            if (c == '>') in_tag = false;
+            continue;
+        }
+        if (c == '<') {
+            in_tag = true;
+            continue;
+        }
+        try out.writer.writeByte(c);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Unescape the five entities `render.escapeInto` emits. Single pass so
+/// `&amp;lt;` never double-decodes.
+fn unescapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            inline for (.{ .{ "&amp;", "&" }, .{ "&lt;", "<" }, .{ "&gt;", ">" }, .{ "&quot;", "\"" }, .{ "&#39;", "'" } }) |pair| {
+                if (std.mem.startsWith(u8, s[i..], pair[0])) {
+                    try out.writer.writeAll(pair[1]);
+                    i += pair[0].len;
+                    break;
+                }
+            } else {
+                try out.writer.writeByte(s[i]);
+                i += 1;
+            }
+            continue;
+        }
+        try out.writer.writeByte(s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+test "standings HTML visible text equals the text output" {
+    // `html()` derives from `text(color=false)` (same shared composer
+    // via `view.entryRows`): only invisible tags separate them, so the
+    // `<pre>` block with tags stripped and entities unescaped reads back
+    // byte for byte. Inline fixture only, never live ESPN.
+    const st = testStandings();
+    const body = try text(std.testing.allocator, st, false, null, null);
+    defer std.testing.allocator.free(body);
+    const page = try html(std.testing.allocator, st, null, null);
+    defer std.testing.allocator.free(page);
+    const pre_open = std.mem.indexOf(u8, page, "<pre>").? + "<pre>".len;
+    const pre_close = std.mem.indexOf(u8, page, "</pre>").?;
+    try std.testing.expect(pre_open <= pre_close);
+    const stripped = try stripHtmlTags(std.testing.allocator, page[pre_open..pre_close]);
+    defer std.testing.allocator.free(stripped);
+    const visible = try unescapeHtml(std.testing.allocator, stripped);
+    defer std.testing.allocator.free(visible);
+    try std.testing.expectEqualStrings(body, visible);
 }

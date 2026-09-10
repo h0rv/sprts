@@ -8,6 +8,7 @@ pub const tz = @import("tz.zig");
 pub const help = @import("help.zig");
 pub const team_view = @import("team_view.zig");
 pub const standings_view = @import("standings_view.zig");
+pub const view = @import("view.zig");
 pub const native_cache = @import("native_cache.zig");
 pub const stream = @import("stream.zig");
 pub const digest = @import("digest.zig");
@@ -24,6 +25,7 @@ test {
     _ = help;
     _ = team_view;
     _ = standings_view;
+    _ = view;
     _ = native_cache;
     _ = stream;
     _ = digest;
