@@ -329,9 +329,82 @@ pub fn boardHasLive(board: sprts_client.Scoreboard) bool {
 /// uses the same width so participant rows match byte for byte.
 pub const board_cols: usize = 52;
 
-/// Team-mark height cap: braille cards stay a glanceable block instead of
-/// pushing games off the viewport (checked-in xs marks are ~4 rows).
-pub const mark_cap_height: usize = 6;
+/// Render-cost control (keypress latency: cursor moves must feel instant).
+///
+/// Profile notes (counting double over the fake transport + fixtures):
+/// a cursor `j`/`k` step never fetched (no load on the move arms) but
+/// rebuilt the whole frame — `participantRow` per visible game plus
+/// `gameMarks` per game (art lookup, SGR strip, split, cell-count) —
+/// doubled again by the probe-then-paint double render
+/// (`buildContentBytes` + `render`). Status colors and winner tints are
+/// a few string compares (negligible); nothing refetches on cursor
+/// moves. Fix: `BoardCache` memoizes per-game participant rows and mark
+/// cards across frames within one load (cleared in `resetView`, keyed by
+/// game + color + width), so cursor moves cost cache hits only — zero
+/// fetches, zero row/mark rebuilds. `RenderCost` counts every category
+/// so tests pin it.
+pub const RenderCost = struct {
+    fetches: usize = 0,
+    row_builds: usize = 0,
+    row_hits: usize = 0,
+    mark_builds: usize = 0,
+    mark_hits: usize = 0,
+};
+
+/// Per-load memo of board cards: participant rows and mark rows keyed by
+/// `r:`/`m:` key strings (game + league + abbreviations + color + cols).
+/// Borrowed slices stay valid until `clear` (every view reset).
+pub const BoardCache = struct {
+    alloc: Allocator,
+    cards: std.StringHashMap([][]u8),
+
+    pub fn init(alloc: Allocator) BoardCache {
+        return .{ .alloc = alloc, .cards = std.StringHashMap([][]u8).init(alloc) };
+    }
+
+    pub fn deinit(self: *BoardCache) void {
+        self.clear();
+        self.cards.deinit();
+    }
+
+    /// Drop every cached card (view data is arena-owned and gone).
+    pub fn clear(self: *BoardCache) void {
+        var it = self.cards.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            for (entry.value_ptr.*) |row| self.alloc.free(row);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.cards.clearRetainingCapacity();
+    }
+
+    pub fn get(self: *BoardCache, key: []const u8) ?[][]u8 {
+        return self.cards.get(key);
+    }
+
+    pub fn put(self: *BoardCache, key: []const u8, rows: [][]u8) !void {
+        // First build wins: a miss always precedes its put, so a present
+        // key is an identical card — never leak by overwriting it.
+        if (self.cards.get(key) != null) return;
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        const owned = try self.alloc.alloc([]u8, rows.len);
+        errdefer self.alloc.free(owned);
+        for (rows, 0..) |row, i| owned[i] = try self.alloc.dupe(u8, row);
+        errdefer {
+            for (owned) |row| self.alloc.free(row);
+            self.alloc.free(owned);
+        }
+        try self.cards.put(owned_key, owned);
+    }
+};
+
+/// Optional paint memoization for `renderBoardRows`: null renders purely
+/// (test-friendly); the live loop passes the view cache + cost counters.
+pub const BoardPaint = struct {
+    cache: ?*BoardCache = null,
+    cost: ?*RenderCost = null,
+};
 
 /// Block `sprts` wordmark topping every TUI screen. Letterforms duplicated
 /// from the server's `text_home_banner_small` in
@@ -551,15 +624,8 @@ pub fn participantRow(allocator: Allocator, p: anytype, cols: usize) ![]u8 {
     return allocator.dupe(u8, std.mem.trimEnd(u8, raw, " "));
 }
 
-/// Both teams' braille marks as terminal rows, mirroring the server's
-/// `writeGameMarks` card in `apps/server/src/table.zig`: direct
-/// `core.art.teamArt(league, abbr, .xs)` lookups, side by side with a
-/// 2-cell gap when the pair fits in `cols`, stacked otherwise. Color on
-/// resolves the color sidecar and strips its SGR runs (the TUI owns its
-/// own palette, so mark escapes never reach the frame); color off takes
-/// the mono mark. Height is capped at `mark_cap_height` rows; a side with
-/// no mark is skipped, so unknown abbrevs yield zero rows. Caller frees
-/// each row and the slice.
+/// Two-abbreviation card: the common board case (first two participants).
+/// Caller frees each row and the slice.
 pub fn gameMarks(
     allocator: Allocator,
     league: []const u8,
@@ -568,6 +634,39 @@ pub fn gameMarks(
     color: bool,
     cols: usize,
 ) ![][]u8 {
+    return gameMarksList(allocator, league, &.{ first_abbr, second_abbr }, color, cols);
+}
+
+/// General mark card over an abbreviation list, mirroring the server's
+/// `writeGameMarks` in `apps/server/src/table.zig`: the FIRST TWO entries
+/// WITH marks render (the server scans participants and keeps the first
+/// two marked sides), side by side with a 2-cell gap when the pair fits
+/// in `cols`, stacked otherwise. Full height like the server (no cap).
+/// Color on resolves the color sidecar and strips its SGR runs (the TUI
+/// owns its own palette, so mark escapes never reach the frame); color
+/// off takes the mono mark. A side with no mark is skipped, so unknown
+/// abbrevs yield zero rows. Caller frees each row and the slice.
+pub fn gameMarksList(
+    allocator: Allocator,
+    league: []const u8,
+    abbrs: []const []const u8,
+    color: bool,
+    cols: usize,
+) ![][]u8 {
+    var chosen: [2][]const u8 = undefined;
+    var n_chosen: usize = 0;
+    for (abbrs) |abbr| {
+        if (n_chosen == chosen.len) break;
+        const has = if (color)
+            core.art.teamArtColor(league, abbr, .xs) orelse
+                core.art.teamArt(league, abbr, .xs)
+        else
+            core.art.teamArt(league, abbr, .xs);
+        if (has != null) {
+            chosen[n_chosen] = abbr;
+            n_chosen += 1;
+        }
+    }
     var sides: [2]std.ArrayList([]u8) = .{ .empty, .empty };
     var widths: [2]usize = .{ 0, 0 };
     var n: usize = 0;
@@ -577,7 +676,7 @@ pub fn gameMarks(
             side.deinit(allocator);
         }
     }
-    for ([2][]const u8{ first_abbr, second_abbr }) |abbr| {
+    for (chosen[0..n_chosen]) |abbr| {
         if (n == sides.len) break;
         const raw = if (color)
             core.art.teamArtColor(league, abbr, .xs) orelse
@@ -598,7 +697,9 @@ pub fn gameMarks(
         // interior blanks are real logo rows.
         if (collected.items.len > 0 and collected.items[collected.items.len - 1].len == 0)
             _ = collected.pop();
-        for (collected.items[0..@min(collected.items.len, mark_cap_height)]) |line| {
+        // Full height like the server: every logo row renders (checked-in
+        // xs marks are ~4 rows; the scroll window owns overflow).
+        for (collected.items) |line| {
             widths[n] = @max(widths[n], core.art.countCells(line));
             try sides[n].append(allocator, try allocator.dupe(u8, line));
         }
@@ -722,9 +823,12 @@ pub const BoardOptions = struct {
 /// Scoreboard blocks in the server's section rhythm (`textWithZoneArt` in
 /// `apps/server/src/render.zig`): dim `GAMES` heading, then per game the
 /// status line (red live, yellow upcoming), columnar participant rows
-/// (`participantRow`), the braille mark card, and a separator rule. Only
-/// the status line carries the selection gutter, so participant rows stay
+/// (`participantRow`), the braille mark card (first two marked sides,
+/// `gameMarksList`), and a separator rule (`renderRule`). Only the status
+/// line carries the selection gutter, so participant rows stay
 /// byte-identical to the server. Nothing emits ANSI with `color == false`.
+/// `paint` memoizes rows + marks across frames (cursor moves re-emit);
+/// null renders purely.
 pub fn renderBoardRows(
     w: *std.Io.Writer,
     allocator: Allocator,
@@ -735,6 +839,7 @@ pub fn renderBoardRows(
     scroll: usize,
     visible: usize,
     opts: BoardOptions,
+    paint: ?*BoardPaint,
 ) !void {
     try colorize(w, "2", "GAMES", opts.color);
     try w.writeByte('\n');
@@ -761,25 +866,87 @@ pub fn renderBoardRows(
             const label = if (game.name.len > 0) game.name else game.id;
             try w.print("  {s}\n", .{label});
         }
-        for (game.participants) |p| {
-            const row = try participantRow(allocator, p, opts.cols);
-            defer allocator.free(row);
-            if (opts.color and p.winner) try w.writeAll("\x1b[32m");
+        // Cached participant rows: data-static within one load, so cursor
+        // moves re-emit instead of rebuilding. Winner tint still wraps at
+        // emit time (indexed per row, never stored).
+        var rows_scratch: std.ArrayList([]u8) = .empty;
+        defer {
+            for (rows_scratch.items) |r| allocator.free(r);
+            rows_scratch.deinit(allocator);
+        }
+        var rows_key: ?[]u8 = null;
+        defer if (rows_key) |k| allocator.free(k);
+        var rows_borrowed: ?[][]u8 = null;
+        if (paint) |pt| {
+            if (pt.cache) |cache| {
+                rows_key = try std.fmt.allocPrint(allocator, "r:{s}:{d}:{d}", .{ game.id, @intFromBool(opts.color), opts.cols });
+                if (cache.get(rows_key.?)) |hit| {
+                    rows_borrowed = hit;
+                    if (pt.cost) |c| c.row_hits += hit.len;
+                }
+            }
+        }
+        const prows: [][]u8 = rows_borrowed orelse blk: {
+            for (game.participants) |p| {
+                try rows_scratch.append(allocator, try participantRow(allocator, p, opts.cols));
+            }
+            if (paint) |pt| {
+                if (pt.cost) |c| c.row_builds += rows_scratch.items.len;
+                if (pt.cache) |cache| try cache.put(rows_key.?, rows_scratch.items);
+            }
+            break :blk rows_scratch.items;
+        };
+        for (prows, 0..) |row, i| {
+            const win = if (i < game.participants.len) game.participants[i].winner else false;
+            if (opts.color and win) try w.writeAll("\x1b[32m");
             try w.writeAll(row);
-            if (opts.color and p.winner) try w.writeAll("\x1b[0m");
+            if (opts.color and win) try w.writeAll("\x1b[0m");
             try w.writeByte('\n');
         }
-        const first = if (game.participants.len > 0) game.participants[0].abbreviation else "";
-        const second = if (game.participants.len > 1) game.participants[1].abbreviation else "";
-        const marks = try gameMarks(allocator, league, first, second, opts.color, opts.cols);
+        // Mark card over every participant abbreviation: the first two
+        // WITH marks render (server parity), cached like the rows above.
+        var abbrs: std.ArrayList([]const u8) = .empty;
+        defer abbrs.deinit(allocator);
+        for (game.participants) |p| try abbrs.append(allocator, p.abbreviation);
+        var marks_scratch: [][]u8 = undefined;
+        var marks_owned = false;
+        var marks_key: ?[]u8 = null;
         defer {
-            for (marks) |line| allocator.free(line);
-            allocator.free(marks);
+            if (marks_key) |k| allocator.free(k);
+            if (marks_owned) {
+                for (marks_scratch) |line| allocator.free(line);
+                allocator.free(marks_scratch);
+            }
         }
+        var marks_borrowed: ?[][]u8 = null;
+        if (paint) |pt| {
+            if (pt.cache) |cache| {
+                var kb: std.Io.Writer.Allocating = .init(allocator);
+                defer kb.deinit();
+                try kb.writer.print("m:{s}:{d}:{d}:", .{ league, @intFromBool(opts.color), opts.cols });
+                for (abbrs.items, 0..) |a, i| {
+                    if (i > 0) try kb.writer.writeByte(0);
+                    try kb.writer.writeAll(a);
+                }
+                marks_key = try allocator.dupe(u8, kb.written());
+                if (cache.get(marks_key.?)) |hit| {
+                    marks_borrowed = hit;
+                    if (pt.cost) |c| c.mark_hits += 1;
+                }
+            }
+        }
+        const marks: [][]u8 = marks_borrowed orelse blk: {
+            const built = try gameMarksList(allocator, league, abbrs.items, opts.color, opts.cols);
+            if (paint) |pt| {
+                if (pt.cost) |c| c.mark_builds += 1;
+                if (pt.cache) |cache| try cache.put(marks_key.?, built);
+            }
+            marks_scratch = built;
+            marks_owned = true;
+            break :blk built;
+        };
         for (marks) |line| try w.print("{s}\n", .{line});
-        var i: usize = 0;
-        while (i < opts.cols) : (i += 1) try w.writeAll("─");
-        try w.writeByte('\n');
+        try renderRule(w, opts.cols);
         filtered += 1;
         emitted += 1;
     }
@@ -817,6 +984,180 @@ pub fn renderHelp(w: *std.Io.Writer) !void {
         \\
     );
 }
+
+/// Full-width `─` rule closing each game block: the server's
+/// `writeSeparator` at the same width, so rules match byte for byte.
+pub fn renderRule(w: *std.Io.Writer, cols: usize) !void {
+    var i: usize = 0;
+    while (i < cols) : (i += 1) try w.writeAll("─");
+    try w.writeByte('\n');
+}
+
+/// Footer line count for viewport layout: the error line plus the key
+/// line, or just the key line when quiet.
+pub fn footerLineCount(ctx: ViewContext) usize {
+    return if (ctx.err != null) 2 else 1;
+}
+
+/// Slug cell matching the server home list (`homeDay` pads slugs to 13).
+pub const league_slug_w: usize = 13;
+
+/// Compose a viewport-fitted frame: top (banner + heading) and footer
+/// (commands) are never sacrificed — the footer ALWAYS owns the bottom
+/// terminal rows, even on tiny terminals. The body is clipped from the
+/// end and padded with blanks so the frame is exactly `term_rows` lines.
+/// Absurd heights (top + footer overfull) drop banner lines first; the
+/// key line is the LAST footer line, so it survives down to 1 row.
+pub fn layoutFrame(
+    allocator: Allocator,
+    term_rows: usize,
+    top: []const u8,
+    body: []const u8,
+    footer: []const u8,
+) ![]u8 {
+    var top_lines: std.ArrayList([]const u8) = .empty;
+    defer top_lines.deinit(allocator);
+    var body_lines: std.ArrayList([]const u8) = .empty;
+    defer body_lines.deinit(allocator);
+    var foot_lines: std.ArrayList([]const u8) = .empty;
+    defer foot_lines.deinit(allocator);
+    try splitFrameLines(&top_lines, allocator, top);
+    try splitFrameLines(&body_lines, allocator, body);
+    try splitFrameLines(&foot_lines, allocator, footer);
+    const fkeep: usize = @min(foot_lines.items.len, term_rows);
+    const fstart: usize = foot_lines.items.len - fkeep;
+    var rem: usize = term_rows - fkeep;
+    const tkeep: usize = @min(top_lines.items.len, rem);
+    const tstart: usize = top_lines.items.len - tkeep;
+    rem -= tkeep;
+    const bkeep: usize = @min(body_lines.items.len, rem);
+    const pad: usize = rem - bkeep;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (top_lines.items[tstart..]) |line| {
+        try out.writer.writeAll(line);
+        try out.writer.writeByte('\n');
+    }
+    for (body_lines.items[0..bkeep]) |line| {
+        try out.writer.writeAll(line);
+        try out.writer.writeByte('\n');
+    }
+    var p: usize = 0;
+    while (p < pad) : (p += 1) try out.writer.writeByte('\n');
+    for (foot_lines.items[fstart..]) |line| {
+        try out.writer.writeAll(line);
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
+}
+
+fn splitFrameLines(list: *std.ArrayList([]const u8), allocator: Allocator, bytes: []const u8) !void {
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| try list.append(allocator, line);
+    // Single trailing empty from the final newline is framing, not a row.
+    if (list.items.len > 0 and list.items[list.items.len - 1].len == 0) _ = list.pop();
+}
+
+/// Loading label per view for transition frames.
+pub fn loadingLabel(view: ViewTag) []const u8 {
+    return switch (view) {
+        .leagues => "leagues",
+        .board => "scores",
+        .game => "game",
+        .team => "team",
+        .standings => "standings",
+    };
+}
+
+/// Transition body: zero game rows (never stale content), always
+/// followed by the bottom-anchored footer at the call site.
+pub fn renderLoadingBody(w: *std.Io.Writer, label: []const u8) !void {
+    try w.print("Loading {s}…\n", .{label});
+}
+
+/// True for transition frames (capital-L body line; the footer's
+/// lowercase `loading…` age never matches).
+pub fn isLoadingFrame(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, "Loading ") != null;
+}
+
+/// View sections where at most one may appear per frame: two in one
+/// frame means half-old/half-new content got painted. (The team view
+/// always prints both LAST and NEXT, so only LAST marks it.)
+const view_markers: []const []const u8 = &.{
+    "GAMES",
+    "TEAMS (enter opens schedule)",
+    "LEAGUES",
+    "STANDINGS (enter opens team)",
+    "LAST",
+};
+
+/// Clean-transition predicate over a recorded frame sequence, possibly
+/// spanning several navigations: every frame is clear-then-paint;
+/// loading frames carry zero game rows; content frames carry at most one
+/// view section each; and a content frame may only change sections after
+/// an intervening loading frame (that gap is what rules out
+/// half-old/half-new paints). Steady polls (same section repeated) and
+/// section-less frames (help overlay) pass through.
+pub fn transitionIsClean(frames: []const []const u8) bool {
+    if (frames.len < 2) return false;
+    var saw_loading = false;
+    var saw_content = false;
+    var current_section: ?[]const u8 = null;
+    var loading_since_section = false;
+    for (frames) |frame| {
+        if (!std.mem.startsWith(u8, frame, "\x1b[2J\x1b[H")) return false;
+        if (isLoadingFrame(frame)) {
+            if (std.mem.indexOf(u8, frame, "✓") != null) return false;
+            saw_loading = true;
+            loading_since_section = true;
+            continue;
+        }
+        if (!saw_loading) return false;
+        saw_content = true;
+        var sections: usize = 0;
+        var found: ?[]const u8 = null;
+        for (view_markers) |marker| {
+            if (std.mem.indexOf(u8, frame, marker) != null) {
+                sections += 1;
+                found = marker;
+            }
+        }
+        if (sections > 1) return false;
+        if (found) |section| {
+            if (current_section) |prev| {
+                if (!std.mem.eql(u8, prev, section) and !loading_since_section) return false;
+            }
+            current_section = section;
+            loading_since_section = false;
+        }
+    }
+    return saw_loading and saw_content;
+}
+
+/// Counting test-double for transitions: record one frame per navigation
+/// step, then assert the whole sequence painted cleanly.
+pub const TransitionLog = struct {
+    alloc: Allocator,
+    frames: std.ArrayList([]u8) = .empty,
+
+    pub fn init(alloc: Allocator) TransitionLog {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *TransitionLog) void {
+        for (self.frames.items) |frame| self.alloc.free(frame);
+        self.frames.deinit(self.alloc);
+    }
+
+    pub fn push(self: *TransitionLog, bytes: []const u8) !void {
+        try self.frames.append(self.alloc, try self.alloc.dupe(u8, bytes));
+    }
+
+    pub fn isClean(self: *TransitionLog) bool {
+        return transitionIsClean(self.frames.items);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Paint control (flicker fix: diffed writes, throttled footer, SSE debounce)
@@ -1109,6 +1450,8 @@ const Tui = struct {
     pending_sse_hash: ?u64 = null,
     pending_sse_mtime: ?i64 = null,
     deduper: FrameDeduper = .{},
+    cache: BoardCache,
+    cost: RenderCost = .{},
     leagues: ?sprts_client.LeagueList = null,
     board: ?sprts_client.Scoreboard = null,
     game: ?sprts_client.DetailGame = null,
@@ -1134,10 +1477,12 @@ const Tui = struct {
             .view_arena = std.heap.ArenaAllocator.init(gpa),
             .nav = nav,
             .filter = filter,
+            .cache = BoardCache.init(gpa),
         };
     }
 
     fn deinit(self: *Tui) void {
+        self.cache.deinit();
         self.view_arena.deinit();
         self.nav.deinit();
         self.gpa.free(self.filter);
@@ -1149,7 +1494,10 @@ const Tui = struct {
     }
 
     /// Wipe per-view fetched data (all view slices are arena-owned).
+    /// Cached board cards die with the view (stale rows must never
+    /// survive a navigation); cost counters accumulate for the session.
     fn resetView(self: *Tui) void {
+        self.cache.clear();
         self.view_arena.deinit();
         self.view_arena = std.heap.ArenaAllocator.init(self.gpa);
         self.leagues = null;
@@ -1197,6 +1545,7 @@ const Tui = struct {
     }
 
     fn reloadLeagues(self: *Tui) void {
+        self.cost.fetches += 1;
         self.resetView();
         self.leagues = loadLeagues(self.viewAlloc(), self.transport, self.base_url) catch |err| {
             self.setError("leagues failed: {t}", .{err});
@@ -1208,6 +1557,7 @@ const Tui = struct {
 
     fn reloadBoard(self: *Tui) void {
         const frame = self.nav.current;
+        self.cost.fetches += 1;
         self.resetView();
         self.board = loadBoard(self.viewAlloc(), self.transport, self.base_url, frame.league, frame.date) catch |err| {
             self.setError("scoreboard failed: {t}", .{err});
@@ -1226,6 +1576,7 @@ const Tui = struct {
     }
 
     fn reloadGame(self: *Tui, league: []const u8, id: []const u8) void {
+        self.cost.fetches += 1;
         self.resetView();
         self.game = loadGame(self.viewAlloc(), self.transport, self.base_url, league, id) catch |err| {
             self.setError("game failed: {t}", .{err});
@@ -1236,6 +1587,7 @@ const Tui = struct {
     }
 
     fn reloadTeam(self: *Tui, league: []const u8, abbr: []const u8) void {
+        self.cost.fetches += 1;
         self.resetView();
         self.team = loadTeam(self.viewAlloc(), self.transport, self.base_url, league, abbr) catch |err| {
             self.setError("team failed: {t}", .{err});
@@ -1246,6 +1598,7 @@ const Tui = struct {
     }
 
     fn reloadStandings(self: *Tui, league: []const u8) void {
+        self.cost.fetches += 1;
         self.resetView();
         self.standings = loadStandings(self.viewAlloc(), self.transport, self.base_url, league) catch |err| {
             self.setError("standings failed: {t}", .{err});
@@ -1558,16 +1911,36 @@ const Tui = struct {
     /// `clampSelection` runs in both: it is idempotent, so probes stay
     /// consistent with the paint they gate.
     fn renderInto(self: *Tui, w: *std.Io.Writer, age_text: []const u8, commit_scroll: bool) !void {
-        try w.writeAll("\x1b[H");
-        try renderBanner(w);
+        try self.renderIntoSized(w, age_text, commit_scroll, terminalSize().rows);
+    }
 
-        if (self.show_help) {
-            try renderHelp(w);
-            return;
-        }
+    /// Viewport-fitted frame: banner + heading on top, the view body in
+    /// the middle, commands bottom-anchored via `layoutFrame` — every
+    /// view including the help overlay and error states, at any height.
+    /// Full paints are clear-then-paint (`\x1b[2J\x1b[H`); only the
+    /// throttled footer path writes cursor-addressed lines.
+    fn renderIntoSized(self: *Tui, w: *std.Io.Writer, age_text: []const u8, commit_scroll: bool, term_rows: usize) !void {
+        const frame = try self.frameAlloc(age_text, commit_scroll, term_rows);
+        defer self.gpa.free(frame);
+        try w.writeAll(frame);
+    }
 
-        const size = terminalSize();
-        const visible = visibleRows(bodyRows(size.rows));
+    /// One full frame with `true`, or a content probe with `false`.
+    /// Probes render the identical bytes (sentinel age) without mutating
+    /// navigation state; only real paints commit the scroll window.
+    /// `clampSelection` runs in both: it is idempotent, so probes stay
+    /// consistent with the paint they gate.
+    fn frameAlloc(self: *Tui, age_text: []const u8, commit_scroll: bool, term_rows: usize) ![]u8 {
+        var top: std.Io.Writer.Allocating = .init(self.gpa);
+        defer top.deinit();
+        var body: std.Io.Writer.Allocating = .init(self.gpa);
+        defer body.deinit();
+        var foot: std.Io.Writer.Allocating = .init(self.gpa);
+        defer foot.deinit();
+
+        try renderBanner(&top.writer);
+
+        const visible = visibleRows(bodyRows(term_rows));
         self.clampSelection();
         const scroll = ensureVisible(self.selected, self.scroll, visible);
         if (commit_scroll) self.scroll = scroll;
@@ -1587,29 +1960,38 @@ const Tui = struct {
             .standings => if (self.standings) |s| s.league_name else "",
             .leagues => "",
         };
-        try renderHeader(w, .{
-            .league_name = league_name,
-            .league = frame.league,
-            .date = frame.date orelse "",
-            .view_label = label,
-            .filter = self.filter,
-            .color = self.color,
-        });
-
-        switch (frame.view) {
-            .leagues => try self.renderLeagues(w, scroll, visible),
-            .board => try self.renderBoard(w, scroll, visible),
-            .game => try self.renderGame(w, scroll, visible),
-            .team => try self.renderTeam(w),
-            .standings => try self.renderStandings(w, scroll, visible),
+        if (!self.show_help) {
+            try renderHeader(&top.writer, .{
+                .league_name = league_name,
+                .league = frame.league,
+                .date = frame.date orelse "",
+                .view_label = label,
+                .filter = self.filter,
+                .color = self.color,
+            });
         }
 
-        try renderFooter(w, .{
+        // Help owns the body but never the footer: commands stay
+        // bottom-anchored even over the overlay.
+        if (self.show_help) {
+            try renderHelp(&body.writer);
+        } else switch (frame.view) {
+            .leagues => try self.renderLeagues(&body.writer, scroll, visible),
+            .board => try self.renderBoard(&body.writer, scroll, visible),
+            .game => try self.renderGame(&body.writer, scroll, visible),
+            .team => try self.renderTeam(&body.writer),
+            .standings => try self.renderStandings(&body.writer, scroll, visible),
+        }
+
+        try renderFooter(&foot.writer, .{
             .age_text = age_text,
             .auto_refresh = self.auto_refresh,
             .err = self.last_error,
             .view = frame.view,
         });
+        const laid = try layoutFrame(self.gpa, term_rows, top.written(), body.written(), foot.written());
+        defer self.gpa.free(laid);
+        return std.fmt.allocPrint(self.gpa, "\x1b[2J\x1b[H{s}", .{laid});
     }
 
     /// Force a full repaint with live footer age (byte-identical bytes).
@@ -1630,10 +2012,37 @@ const Tui = struct {
     /// age sentinel, so the per-second `updated Ns ago` ticker never
     /// counts as a content change.
     fn buildContentBytes(self: *Tui) ![]u8 {
-        var aw = std.Io.Writer.Allocating.init(self.gpa);
-        defer aw.deinit();
-        try self.renderInto(&aw.writer, "", false);
-        return self.gpa.dupe(u8, aw.written());
+        return self.frameAlloc("", false, terminalSize().rows);
+    }
+
+    /// Sized probe for tests (no TTY needed): the exact frame bytes at a
+    /// fixed height, sentinel age, scroll uncommitted.
+    fn buildContentBytesSized(self: *Tui, term_rows: usize) ![]u8 {
+        return self.frameAlloc("", false, term_rows);
+    }
+
+    /// Transition frame for navigating to `view`: banner + loading body
+    /// (zero game rows) + bottom-anchored footer, clear-then-paint.
+    /// Callers paint this BEFORE the blocking fetch so slow views never
+    /// linger on stale content; tests record it in a `TransitionLog`.
+    fn loadingBytes(self: *Tui, view: ViewTag, term_rows: usize) ![]u8 {
+        var top: std.Io.Writer.Allocating = .init(self.gpa);
+        defer top.deinit();
+        var body: std.Io.Writer.Allocating = .init(self.gpa);
+        defer body.deinit();
+        var foot: std.Io.Writer.Allocating = .init(self.gpa);
+        defer foot.deinit();
+        try renderBanner(&top.writer);
+        try renderLoadingBody(&body.writer, loadingLabel(view));
+        try renderFooter(&foot.writer, .{
+            .age_text = "loading…",
+            .auto_refresh = self.auto_refresh,
+            .err = self.last_error,
+            .view = view,
+        });
+        const laid = try layoutFrame(self.gpa, term_rows, top.written(), body.written(), foot.written());
+        defer self.gpa.free(laid);
+        return std.fmt.allocPrint(self.gpa, "\x1b[2J\x1b[H{s}", .{laid});
     }
 
     /// Footer-only refresh: live age over cursor-addressed lines.
@@ -1670,9 +2079,16 @@ const Tui = struct {
         return decision;
     }
 
+    /// League picker in the web home's rhythm (the banner lives in the
+    /// frame top): dim section heading, separator rule, one padded row
+    /// per league, blank air, then a dim hint — the footer follows via
+    /// layout. Slugs ride a fixed `league_slug_w` cell like the server's
+    /// `homeDay`, so names align down the page; only the 2-cell selection
+    /// gutter differs (the server has no cursor).
     fn renderLeagues(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
         try colorize(w, "2", "LEAGUES", self.color);
         try w.writeByte('\n');
+        try renderRule(w, board_cols);
         const list = self.leagues orelse {
             try w.writeAll("No leagues loaded. Press r to retry.\n");
             return;
@@ -1686,11 +2102,16 @@ const Tui = struct {
                 continue;
             }
             if (emitted >= visible) return;
-            try w.print("{s}{s} — {s}\n", .{ if (filtered == self.selected) "> " else "  ", entry.slug, entry.name });
+            try w.writeAll(if (filtered == self.selected) "> " else "  ");
+            try writeCell(w, entry.slug, league_slug_w);
+            try w.print(" {s}\n", .{entry.name});
             filtered += 1;
             emitted += 1;
         }
         if (filtered == 0) try w.writeAll("No leagues match filter. Press / to change.\n");
+        try w.writeByte('\n');
+        try colorize(w, "2", "enter opens a league", self.color);
+        try w.writeByte('\n');
     }
 
     fn renderBoard(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
@@ -1699,7 +2120,8 @@ const Tui = struct {
             try w.writeAll("\nNo games loaded. Press r to retry.\n");
             return;
         };
-        try renderBoardRows(w, self.gpa, board.league, board.games, self.filter, self.selected, scroll, visible, .{ .color = self.color });
+        var paint = BoardPaint{ .cache = &self.cache, .cost = &self.cost };
+        try renderBoardRows(w, self.gpa, board.league, board.games, self.filter, self.selected, scroll, visible, .{ .color = self.color }, &paint);
     }
 
     fn renderGame(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
@@ -2158,7 +2580,7 @@ test "board blocks follow the server rhythm with a selected status line" {
 
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
-    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 1, 0, 10, .{ .color = false });
+    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 1, 0, 10, .{ .color = false }, null);
     const text = out.written();
     // Selected game carries the gutter on its status line; the settled
     // game keeps a plain gutter. No legacy LIVE text marker remains.
@@ -2180,19 +2602,19 @@ test "board rows honor filter and scroll windows" {
 
     var filtered: std.Io.Writer.Allocating = .init(arena);
     defer filtered.deinit();
-    try renderBoardRows(&filtered.writer, arena, board.league, board.games, "bee", 0, 0, 10, .{ .color = false });
+    try renderBoardRows(&filtered.writer, arena, board.league, board.games, "bee", 0, 0, 10, .{ .color = false }, null);
     try std.testing.expect(std.mem.indexOf(u8, filtered.written(), "BEE") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered.written(), "AWY") == null);
 
     var scrolled: std.Io.Writer.Allocating = .init(arena);
     defer scrolled.deinit();
-    try renderBoardRows(&scrolled.writer, arena, board.league, board.games, "", 1, 1, 1, .{ .color = false });
+    try renderBoardRows(&scrolled.writer, arena, board.league, board.games, "", 1, 1, 1, .{ .color = false }, null);
     try std.testing.expect(std.mem.indexOf(u8, scrolled.written(), "BEE") != null);
     try std.testing.expect(std.mem.indexOf(u8, scrolled.written(), "AWY") == null);
 
     var empty: std.Io.Writer.Allocating = .init(arena);
     defer empty.deinit();
-    try renderBoardRows(&empty.writer, arena, board.league, board.games, "quidditch", 0, 0, 10, .{ .color = false });
+    try renderBoardRows(&empty.writer, arena, board.league, board.games, "quidditch", 0, 0, 10, .{ .color = false }, null);
     try std.testing.expect(std.mem.indexOf(u8, empty.written(), "No games match filter") != null);
 }
 
@@ -2329,7 +2751,7 @@ test "banner opens every board screen above the heading" {
         .view_label = "scores",
         .color = false,
     });
-    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false });
+    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false }, null);
     const text = out.written();
     // Same block wordmark on top, then the heading, then the sections.
     try std.testing.expect(std.mem.startsWith(u8, text, tui_banner));
@@ -2458,14 +2880,14 @@ test "color off strips every escape and color on keeps server roles" {
 
     var plain: std.Io.Writer.Allocating = .init(arena);
     defer plain.deinit();
-    try renderBoardRows(&plain.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false });
+    try renderBoardRows(&plain.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false }, null);
     try std.testing.expect(std.mem.indexOf(u8, plain.written(), "\x1b") == null);
     // Winners still read without color: the tick survives the strip.
     try std.testing.expect(std.mem.indexOf(u8, plain.written(), "✓") != null);
 
     var vivid: std.Io.Writer.Allocating = .init(arena);
     defer vivid.deinit();
-    try renderBoardRows(&vivid.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = true });
+    try renderBoardRows(&vivid.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = true }, null);
     // Dim heading, red live status, yellow upcoming status, green winner.
     try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[2mGAMES\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[1;31m") != null);
@@ -2589,4 +3011,538 @@ test "board content bytes ignore the age ticker but move with selection" {
     defer std.testing.allocator.free(moved);
     try std.testing.expect(!std.mem.eql(u8, before, moved));
     try std.testing.expectEqual(PaintDecision.full, gate.observe(1031, hashFrame(moved)));
+}
+
+// ---------------------------------------------------------------------------
+// Round-2 tests: clean transitions, keypress render-cost, anchored
+// commands, server byte-parity, winner ticks. Fake transport + fixtures
+// only, no network, no TTY.
+// ---------------------------------------------------------------------------
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |i| {
+        n += 1;
+        rest = rest[i + needle.len ..];
+    }
+    return n;
+}
+
+fn lineContaining(frame: []const u8, needle: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, frame, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return line;
+    }
+    return null;
+}
+
+fn lastLine(frame: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, frame, "\n");
+    const idx = std.mem.lastIndexOfScalar(u8, trimmed, '\n');
+    return if (idx) |i| trimmed[i + 1 ..] else trimmed;
+}
+
+test "transitions paint loading then content, never mixed" {
+    var router = FlowRouter{ .alloc = std.testing.allocator };
+    defer {
+        for (router.urls.items) |u| std.testing.allocator.free(u);
+        router.urls.deinit(std.testing.allocator);
+    }
+    var tui = try Tui.init(std.testing.allocator, flowIo(), router.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-10" });
+    defer tui.deinit();
+    tui.loadCurrent();
+
+    var log = TransitionLog.init(std.testing.allocator);
+    defer log.deinit();
+
+    // board -> game: loading first (zero game rows, footer anchored),
+    // then the detail.
+    const l1 = try tui.loadingBytes(.game, 24);
+    defer std.testing.allocator.free(l1);
+    try log.push(l1);
+    try std.testing.expect(isLoadingFrame(l1));
+    try std.testing.expect(std.mem.indexOf(u8, l1, "PHI") == null);
+    try std.testing.expect(std.mem.indexOf(u8, l1, "HOU") == null);
+    try std.testing.expectEqualStrings(" q quit", lastLine(l1)[lastLine(l1).len - 7 ..]);
+    tui.openSelected();
+    try std.testing.expect(tui.nav.current.view == .game);
+    const c1 = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(c1);
+    try log.push(c1);
+    try std.testing.expect(!isLoadingFrame(c1));
+    try std.testing.expect(std.mem.indexOf(u8, c1, "TEAMS (enter opens schedule)") != null);
+
+    // game -> back to board: loading again, then the board with no
+    // leftover detail rows (never half-old/half-new).
+    const l2 = try tui.loadingBytes(.board, 24);
+    defer std.testing.allocator.free(l2);
+    try log.push(l2);
+    tui.goBack();
+    try std.testing.expect(tui.nav.current.view == .board);
+    const c2 = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(c2);
+    try log.push(c2);
+    try std.testing.expect(std.mem.indexOf(u8, c2, "GAMES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c2, "TEAMS (enter opens schedule)") == null);
+    try std.testing.expect(log.isClean());
+}
+
+test "transitionIsClean rejects stale and mixed sequences" {
+    const loading = "\x1b[2J\x1b[Hbanner\nLoading scores…\nq quit\n";
+    const board = "\x1b[2J\x1b[Hbanner\nGAMES\n  Final\nq quit\n";
+    const game = "\x1b[2J\x1b[Hbanner\nTEAMS (enter opens schedule)\nq quit\n";
+    try std.testing.expect(transitionIsClean(&.{ loading, board }));
+    // Back-to-back transitions stay clean: every section change rides
+    // behind its own loading frame.
+    try std.testing.expect(transitionIsClean(&.{ loading, board, loading, game }));
+    // Steady polls repeat one section without reloading.
+    try std.testing.expect(transitionIsClean(&.{ loading, board, board }));
+    // Too short to be a transition.
+    try std.testing.expect(!transitionIsClean(&.{board}));
+    try std.testing.expect(!transitionIsClean(&.{}));
+    // No loading frame first: stale content may be showing.
+    try std.testing.expect(!transitionIsClean(&.{ board, game }));
+    // Section change with no loading between: half-old/half-new.
+    try std.testing.expect(!transitionIsClean(&.{ loading, board, game }));
+    // Mixed sections in one frame: half-old/half-new.
+    const mixed = "\x1b[2J\x1b[Hbanner\nGAMES\nTEAMS (enter opens schedule)\nq quit\n";
+    try std.testing.expect(!transitionIsClean(&.{ loading, mixed }));
+    // Stale rows inside the loading frame itself.
+    const stale = "\x1b[2J\x1b[Hbanner\nLoading scores…\nHME  5 ✓\nq quit\n";
+    try std.testing.expect(!transitionIsClean(&.{ stale, board }));
+    // Loading frame without clear-then-paint: old cells may linger.
+    const unclean = "\x1b[Hbanner\nLoading scores…\nq quit\n";
+    try std.testing.expect(!transitionIsClean(&.{ unclean, board }));
+    // Loading never cleared (no content at all).
+    try std.testing.expect(!transitionIsClean(&.{ loading, loading }));
+}
+
+const CountingTransport = struct {
+    urls: std.ArrayList([]const u8) = .empty,
+    alloc: Allocator,
+    body: []const u8,
+    status: std.http.Status = .ok,
+
+    fn dispatch(
+        ptr: *anyopaque,
+        arena: Allocator,
+        url: []const u8,
+        extra_headers: []const std.http.Header,
+    ) anyerror!sprts_client.FetchResult {
+        _ = extra_headers;
+        const self: *CountingTransport = @ptrCast(@alignCast(ptr));
+        try self.urls.append(self.alloc, try self.alloc.dupe(u8, url));
+        return .{ .status = self.status, .body = try arena.dupe(u8, self.body) };
+    }
+
+    fn asTransport(self: *CountingTransport) sprts_client.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+
+    fn deinit(self: *CountingTransport) void {
+        for (self.urls.items) |u| self.alloc.free(u);
+        self.urls.deinit(self.alloc);
+    }
+};
+
+test "cursor moves fetch nothing and rebuild nothing" {
+    var net = CountingTransport{ .alloc = std.testing.allocator, .body = canned_board };
+    defer net.deinit();
+    var tui = try Tui.init(std.testing.allocator, flowIo(), net.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-06" });
+    defer tui.deinit();
+    tui.loadCurrent();
+    try std.testing.expectEqual(@as(usize, 1), net.urls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), tui.cost.fetches);
+
+    // First paint builds every card: 4 participant rows (2 games x 2)
+    // plus 2 mark cards (fake abbrevs render empty, still memoized).
+    const f1 = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(f1);
+    try std.testing.expectEqual(@as(usize, 4), tui.cost.row_builds);
+    try std.testing.expectEqual(@as(usize, 2), tui.cost.mark_builds);
+
+    // Second probe with no input: hits only, zero rebuilds.
+    const f1b = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(f1b);
+    try std.testing.expectEqualStrings(f1, f1b);
+    try std.testing.expectEqual(@as(usize, 4), tui.cost.row_builds);
+    try std.testing.expectEqual(@as(usize, 2), tui.cost.mark_builds);
+    try std.testing.expect(tui.cost.row_hits >= 4);
+    try std.testing.expect(tui.cost.mark_hits >= 2);
+
+    // One `j` step: zero fetches, zero rebuilds, gutter moves.
+    tui.selected = moveDown(tui.selected, tui.rowCount(), 1);
+    const f2 = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(f2);
+    try std.testing.expectEqual(@as(usize, 1), net.urls.items.len);
+    try std.testing.expectEqual(@as(usize, 1), tui.cost.fetches);
+    try std.testing.expectEqual(@as(usize, 4), tui.cost.row_builds);
+    try std.testing.expectEqual(@as(usize, 2), tui.cost.mark_builds);
+    try std.testing.expect(!std.mem.eql(u8, f1, f2));
+    try std.testing.expect(std.mem.indexOf(u8, f2, "> Top 7th") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f2, "  Final") != null);
+    // Minimal repaint: exactly the two status lines differ (old + new
+    // gutter), every other row is byte-identical.
+    var l1 = std.mem.splitScalar(u8, f1, '\n');
+    var l2 = std.mem.splitScalar(u8, f2, '\n');
+    var differing: usize = 0;
+    var total: usize = 0;
+    while (true) {
+        const a = l1.next();
+        const b = l2.next();
+        if (a == null or b == null) {
+            try std.testing.expect(a == null and b == null);
+            break;
+        }
+        total += 1;
+        if (!std.mem.eql(u8, a.?, b.?)) differing += 1;
+    }
+    try std.testing.expect(total > 10);
+    try std.testing.expectEqual(@as(usize, 2), differing);
+}
+
+test "board cache memos cards until the view resets" {
+    const alloc = std.testing.allocator;
+    var cache = BoardCache.init(alloc);
+    defer cache.deinit();
+    var rows = [_][]u8{ try alloc.dupe(u8, "a"), try alloc.dupe(u8, "b") };
+    defer for (rows) |r| alloc.free(r);
+    try cache.put("r:1:1:52", &rows);
+    const hit = cache.get("r:1:1:52") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), hit.len);
+    try std.testing.expectEqualStrings("a", hit[0]);
+    try std.testing.expect(cache.get("r:2:1:52") == null);
+    cache.clear();
+    try std.testing.expect(cache.get("r:1:1:52") == null);
+}
+
+test "commands stay bottom-anchored at every height, view, and error" {
+    try std.testing.expectEqual(@as(usize, 2), footerLineCount(.{ .err = "boom" }));
+    try std.testing.expectEqual(@as(usize, 1), footerLineCount(.{}));
+
+    var fake = FakeTransportState{ .body = canned_board };
+    var tui = try Tui.init(std.testing.allocator, flowIo(), fake.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-06" });
+    defer tui.deinit();
+    tui.loadCurrent();
+
+    // Board at desktop, laptop, and tiny heights: exactly h lines,
+    // key line last.
+    for ([_]usize{ 24, 16, 10 }) |h| {
+        const frame = try tui.buildContentBytesSized(h);
+        defer std.testing.allocator.free(frame);
+        try std.testing.expectEqual(h, countOccurrences(frame, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, lastLine(frame), "q quit") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "GAMES") != null);
+    }
+    // Absurd heights: the key line still survives.
+    for ([_]usize{ 3, 1 }) |h| {
+        const frame = try tui.buildContentBytesSized(h);
+        defer std.testing.allocator.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, lastLine(frame), "q quit") != null);
+    }
+
+    // Help overlay keeps every command visible and anchored.
+    tui.show_help = true;
+    for ([_]usize{ 24, 10 }) |h| {
+        const frame = try tui.buildContentBytesSized(h);
+        defer std.testing.allocator.free(frame);
+        try std.testing.expectEqual(h, countOccurrences(frame, "\n"));
+        try std.testing.expect(std.mem.indexOf(u8, frame, "sprts-tui - Help") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "enter open") != null);
+        try std.testing.expect(std.mem.indexOf(u8, lastLine(frame), "q quit") != null);
+    }
+    tui.show_help = false;
+
+    // Error state: the error line plus the anchored key line.
+    tui.setError("boom", .{});
+    for ([_]usize{ 24, 10 }) |h| {
+        const frame = try tui.buildContentBytesSized(h);
+        defer std.testing.allocator.free(frame);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "ERROR: boom") != null);
+        try std.testing.expect(std.mem.indexOf(u8, lastLine(frame), "q quit") != null);
+    }
+    tui.clearError();
+}
+
+test "leagues view mirrors the web home rhythm" {
+    var fake = FakeTransportState{ .body = canned_leagues };
+    var tui = try Tui.init(std.testing.allocator, flowIo(), fake.asTransport(), "https://example.test", .{ .view = .leagues, .league = "", .target = "", .date = null });
+    defer tui.deinit();
+    tui.loadCurrent();
+    const frame = try tui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(frame);
+    // Banner opens the screen (clear-then-paint first), then the dim
+    // section heading, then the separator rule, then the rows.
+    try std.testing.expect(std.mem.startsWith(u8, frame, "\x1b[2J\x1b[H"));
+    const banner_at = std.mem.indexOf(u8, frame, "█") orelse return error.TestExpectedEqual;
+    const leagues_at = std.mem.indexOf(u8, frame, "LEAGUES") orelse return error.TestExpectedEqual;
+    try std.testing.expect(leagues_at > banner_at);
+    const rule = blk: {
+        // The heading wraps dim when color is on, so scan for the rule
+        // line itself instead of anchoring on the heading bytes.
+        var lit = std.mem.splitScalar(u8, frame, '\n');
+        while (lit.next()) |line| {
+            if (std.mem.startsWith(u8, line, "─")) break :blk line;
+        }
+        break :blk "";
+    };
+    try std.testing.expectEqual(board_cols, core.art.countCells(rule));
+    // Slug column pads like the server home list, so names align.
+    const mlb_line = lineContaining(frame, "MLB") orelse return error.TestExpectedEqual;
+    const nfl_line = lineContaining(frame, "NFL") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, mlb_line, "> mlb") != null);
+    try std.testing.expectEqual(std.mem.indexOf(u8, mlb_line, "MLB"), std.mem.indexOf(u8, nfl_line, "NFL"));
+    try std.testing.expectEqual(@as(usize, 2 + league_slug_w + 1), std.mem.indexOf(u8, mlb_line, "MLB"));
+    // Footer anchored last.
+    try std.testing.expect(std.mem.indexOf(u8, lastLine(frame), "q quit") != null);
+}
+
+// Independent reference composer for the server's `scoreParticipantLine`
+// contract (abbr cell 4, name cell, right score cell 4, ` (record)`,
+// winner tick, trailing blanks trimmed): rewritten from the contract,
+// not by reusing the production path, so drift shows up as a diff.
+fn refSanitize(w: *std.Io.Writer, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+            try w.writeAll("�");
+            i += 1;
+            continue;
+        };
+        if (i + len > bytes.len) {
+            try w.writeAll("�");
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(bytes[i..][0..len]) catch {
+            try w.writeAll("�");
+            i += 1;
+            continue;
+        };
+        if (cp < 0x20 or cp == 0x7F or (cp >= 0x80 and cp <= 0x9F)) {
+            try w.writeByte(' ');
+        } else {
+            try w.writeAll(bytes[i..][0..len]);
+        }
+        i += len;
+    }
+}
+
+fn refCell(w: *std.Io.Writer, s: []const u8, width: usize) !void {
+    const fit: struct { usize, bool } = blk: {
+        if (s.len <= width) break :blk .{ s.len, false };
+        if (width < 4) break :blk .{ @as(usize, 0), true };
+        var e: usize = width - 3;
+        while (e > 0 and (s[e] & 0xC0) == 0x80) e -= 1;
+        break :blk .{ e, true };
+    };
+    try refSanitize(w, s[0..fit[0]]);
+    if (fit[1]) try w.writeAll("…");
+    var cells: usize = textCells(s[0..fit[0]]) + (if (fit[1]) @as(usize, 1) else 0);
+    while (cells < width) : (cells += 1) try w.writeByte(' ');
+}
+
+fn refCellRight(w: *std.Io.Writer, s: []const u8, width: usize) !void {
+    const fit: struct { usize, bool } = blk: {
+        if (s.len <= width) break :blk .{ s.len, false };
+        if (width < 4) break :blk .{ @as(usize, 0), true };
+        var e: usize = width - 3;
+        while (e > 0 and (s[e] & 0xC0) == 0x80) e -= 1;
+        break :blk .{ e, true };
+    };
+    const cells: usize = textCells(s[0..fit[0]]) + (if (fit[1]) @as(usize, 1) else 0);
+    var pad: usize = width -| cells;
+    while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+    try refSanitize(w, s[0..fit[0]]);
+    if (fit[1]) try w.writeAll("…");
+}
+
+fn referenceParticipantRow(allocator: Allocator, p: anytype, cols: usize) ![]u8 {
+    const rec_w: usize = if (p.record) |r| @min(textCells(r), 10) else 0;
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const b = &buf.writer;
+    if (p.abbreviation.len > 0) {
+        try refCell(b, p.abbreviation, 4);
+        try b.writeByte(' ');
+        try refCell(b, p.name, cols -| 4 -| 2 -| 4 -| 2 -| (if (p.record != null) rec_w + 3 else 0));
+    } else {
+        try refCell(b, p.name, cols -| 7 -| (if (p.record != null) rec_w + 3 else 0));
+    }
+    try b.writeByte(' ');
+    try refCellRight(b, p.score, 4);
+    if (p.record) |r| {
+        try b.writeAll(" (");
+        try refCell(b, r, rec_w);
+        try b.writeByte(')');
+    }
+    if (p.winner) try b.writeAll(" ✓") else try b.writeAll("  ");
+    const raw = try buf.toOwnedSlice();
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trimEnd(u8, raw, " "));
+}
+
+test "tui rows match the server columnar layout byte for byte" {
+    const Case = struct {
+        p: gen.ScoreboardGamesItemParticipantsItem,
+        cols: usize,
+    };
+    const cases = [_]Case{
+        .{ .cols = 52, .p = .{ .record = "82-64", .abbreviation = "PHI", .winner = false, .score = "0", .home_away = "home", .id = "22", .name = "Philadelphia Phillies" } },
+        .{ .cols = 52, .p = .{ .record = "12-3", .abbreviation = "HME", .winner = true, .score = "5", .home_away = "home", .id = "h", .name = "Home Club" } },
+        .{ .cols = 52, .p = .{ .record = null, .abbreviation = "BEE", .winner = false, .score = "0", .home_away = "away", .id = "b", .name = "Bee Club" } },
+        .{ .cols = 52, .p = .{ .record = null, .abbreviation = "", .winner = true, .score = "#1", .home_away = null, .id = "x", .name = "Charles Leclerc" } },
+        .{ .cols = 52, .p = .{ .record = "69-74\r\nx", .abbreviation = "AWY", .winner = false, .score = "2", .home_away = "away", .id = "a", .name = "Atlético Madrid Club de Fútbol with an extremely long tail that never ends \x1b[31m" } },
+        .{ .cols = 200, .p = .{ .record = "69-74\r\nx", .abbreviation = "AWY", .winner = false, .score = "2", .home_away = "away", .id = "a", .name = "Atlético Madrid Club de Fútbol with an extremely long tail that never ends \x1b[31m" } },
+        .{ .cols = 52, .p = .{ .record = "123456789012345", .abbreviation = "LON", .winner = false, .score = "7", .home_away = "away", .id = "q", .name = "Long Record Club" } },
+        .{ .cols = 52, .p = .{ .record = "5-5", .abbreviation = "CJK", .winner = false, .score = "3", .home_away = "home", .id = "c", .name = "日本語チーム Tokyo Giants Baseball Club Extended" } },
+        .{ .cols = 60, .p = .{ .record = "0-0", .abbreviation = "QBC", .winner = false, .score = "", .home_away = "pre", .id = "z", .name = "Quiet Club" } },
+    };
+    for (cases) |case| {
+        const got = try participantRow(std.testing.allocator, case.p, case.cols);
+        defer std.testing.allocator.free(got);
+        const want = try referenceParticipantRow(std.testing.allocator, case.p, case.cols);
+        defer std.testing.allocator.free(want);
+        try std.testing.expectEqualStrings(want, got);
+        // Server invariants hold on every row: fits the width, valid
+        // UTF-8, zero escapes (controls sanitize to blanks).
+        try std.testing.expect(textCells(got) <= case.cols);
+        _ = try std.unicode.Utf8View.init(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\x1b") == null);
+    }
+}
+
+test "rules and mark cards match server geometry" {
+    var rule: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer rule.deinit();
+    try renderRule(&rule.writer, board_cols);
+    try std.testing.expectEqual(board_cols, core.art.countCells(std.mem.trimEnd(u8, rule.written(), "\n")));
+    try std.testing.expect(std.mem.endsWith(u8, rule.written(), "\n"));
+
+    // Side by side when the pair fits.
+    const pair = try gameMarks(std.testing.allocator, "mlb", "PHI", "HOU", false, board_cols);
+    defer {
+        for (pair) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(pair);
+    }
+    try std.testing.expect(pair.len > 0);
+    for (pair) |line| try std.testing.expect(core.art.countCells(line) <= board_cols);
+
+    // Stacked when too narrow: the same rows, one side after the other.
+    const one = try gameMarks(std.testing.allocator, "mlb", "PHI", "ZZZ", false, board_cols);
+    defer {
+        for (one) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(one);
+    }
+    const other = try gameMarks(std.testing.allocator, "mlb", "ZZZ", "HOU", false, board_cols);
+    defer {
+        for (other) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(other);
+    }
+    const stacked = try gameMarks(std.testing.allocator, "mlb", "PHI", "HOU", false, 10);
+    defer {
+        for (stacked) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(stacked);
+    }
+    try std.testing.expectEqual(one.len + other.len, stacked.len);
+    for (one, 0..) |line, i| try std.testing.expectEqualStrings(line, stacked[i]);
+    for (other, 0..) |line, i| try std.testing.expectEqualStrings(line, stacked[one.len + i]);
+
+    // First two WITH marks: a mark-less leader never steals a side.
+    const skipped = try gameMarksList(std.testing.allocator, "mlb", &.{ "ZZZ", "PHI", "HOU" }, false, board_cols);
+    defer {
+        for (skipped) |line| std.testing.allocator.free(line);
+        std.testing.allocator.free(skipped);
+    }
+    try std.testing.expectEqual(pair.len, skipped.len);
+    for (pair, 0..) |line, i| try std.testing.expectEqualStrings(line, skipped[i]);
+}
+
+const loser_board =
+    \\{"schema_version":"1","league":"mlb","league_name":"MLB","date":"2026-09-11","source":"test","games":[
+    \\{"id":"99","name":"","starts_at":"2026-09-11T17:00Z","state":"post","status":"Final","participants":[
+    \\{"id":"22","name":"Philadelphia Phillies","abbreviation":"PHI","score":"1","winner":false,"home_away":"home","record":"82-65"},
+    \\{"id":"18","name":"Houston Astros","abbreviation":"HOU","score":"2","winner":true,"home_away":"away","record":"75-72"}]}]}
+;
+
+const loser_game =
+    \\{"schema_version":"1","league":"mlb","league_name":"MLB","id":"99","date":"2026-09-11","state":"post","status":"Final",
+    \\"venue":"Citizens Bank Park","series":null,"attendance":null,"situation":null,
+    \\"participants":[
+    \\{"id":"22","name":"Philadelphia Phillies","abbreviation":"PHI","score":"1","winner":false,"home_away":"home","record":"82-65","probable":null,"hits":null,"errors":null,"lines":[]},
+    \\{"id":"18","name":"Houston Astros","abbreviation":"HOU","score":"2","winner":true,"home_away":"away","record":"75-72","probable":null,"hits":null,"errors":null,"lines":[]}],
+    \\"scoring_plays":[],"decisions":[],"lineups":[],"team_stats":[],"leaders":[]}
+;
+
+test "winner ticks follow the flag: PHI loses 1-2, only HOU ticked" {
+    // Audit result: the TUI never compares scores — no int parsing of
+    // score strings exists anywhere in apps/cli, so string-vs-int and
+    // tie hazards cannot arise here. Every tick in every view comes
+    // straight from the server's `winner` bool (the same flag the
+    // server's `scoreParticipantLine` and detail tint read), and views
+    // without ticks (standings, team, header, plain) emit none. PHI 1
+    // (false, listed first so order cannot save us) vs HOU 2 (true) can
+    // only tick HOU; this test locks that across rows, cache, color,
+    // and full frames in both views.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeTransportState{ .body = loser_board };
+    const board = try loadBoard(arena, fake.asTransport(), "https://example.test", "mlb", null);
+
+    // Uncached board rows: exactly one tick, on the HOU line.
+    var out: std.Io.Writer.Allocating = .init(arena);
+    defer out.deinit();
+    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false }, null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(out.written(), "✓"));
+    const phi_line = lineContaining(out.written(), "Philadelphia") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, phi_line, "✓") == null);
+    const hou_line = lineContaining(out.written(), "Houston") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, hou_line, "✓") != null);
+
+    // Cached rows paint identically (2 row builds + 1 mark build).
+    var cache = BoardCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var cost = RenderCost{};
+    var paint = BoardPaint{ .cache = &cache, .cost = &cost };
+    var cached_out: std.Io.Writer.Allocating = .init(arena);
+    defer cached_out.deinit();
+    try renderBoardRows(&cached_out.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false }, &paint);
+    try std.testing.expectEqualStrings(out.written(), cached_out.written());
+    try std.testing.expectEqual(@as(usize, 2), cost.row_builds);
+    try std.testing.expectEqual(@as(usize, 1), cost.mark_builds);
+
+    // Color on: exactly one green winner wrap, still on HOU.
+    var vivid: std.Io.Writer.Allocating = .init(arena);
+    defer vivid.deinit();
+    try renderBoardRows(&vivid.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = true }, null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(vivid.written(), "\x1b[32m"));
+    const vivid_hou = lineContaining(vivid.written(), "Houston") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, vivid_hou, "\x1b[32m") != null);
+
+    // Full board frame: one tick total, loser unticked.
+    var bfake = FakeTransportState{ .body = loser_board };
+    var btui = try Tui.init(std.testing.allocator, flowIo(), bfake.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-11" });
+    defer btui.deinit();
+    btui.loadCurrent();
+    const bframe = try btui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(bframe);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(bframe, "✓"));
+    const bphi = lineContaining(bframe, "Philadelphia") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, bphi, "✓") == null);
+
+    // Full game frame: one tick total, loser unticked.
+    var gfake = FakeTransportState{ .body = loser_game };
+    var gtui = try Tui.init(std.testing.allocator, flowIo(), gfake.asTransport(), "https://example.test", .{ .view = .game, .league = "mlb", .target = "99", .date = "2026-09-11" });
+    defer gtui.deinit();
+    gtui.loadCurrent();
+    const gframe = try gtui.buildContentBytesSized(24);
+    defer std.testing.allocator.free(gframe);
+    try std.testing.expect(std.mem.indexOf(u8, gframe, "TEAMS (enter opens schedule)") != null);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(gframe, "✓"));
+    const gphi = lineContaining(gframe, "Philadelphia") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, gphi, "✓") == null);
+    const ghou = lineContaining(gframe, "Houston") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, ghou, "✓") != null);
 }
