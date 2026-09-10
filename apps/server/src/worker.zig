@@ -190,8 +190,8 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
                 .text => if (home_route.oneline)
                     try render.homeOneLineWithZone(alloc, boards, color, zone)
                 else
-                    try render.homeLiveWithZone(alloc, color, host, boards, day, home_route.quiet, zone),
-                .html => try render.homeHtmlLive(alloc, host, boards, day, home_route.quiet),
+                    try render.homeLiveWithZone(alloc, color, host, boards, day, home_route.quiet, zone, home_route.date != null),
+                .html => try render.homeHtmlLive(alloc, host, boards, day, home_route.quiet, home_route.date != null),
                 .json => try render.leaguesJson(alloc),
             };
             return staticResponse(body, contentType(format), null);
@@ -1096,7 +1096,15 @@ fn serveAll(
     // include oneline: ?0 renders a different body than the full digest.
     // Art joins the tag too: digest sections carry scoreboard marks.
     const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone, route.art, false);
-    const digest_key = try edge.boardKey(alloc, "all", day, tag);
+    // Dated digests skip off-day leagues (see digest.textWithZoneArt), so
+    // an explicit ?date=<today> must key apart from the dateless entry:
+    // same day, different bodies. One-line bodies already skip empties in
+    // every mode (see allOneLine), so only the full digest needs the bit.
+    const variant_tag = if (route.date != null and !(format == .text and route.oneline))
+        try std.fmt.allocPrint(alloc, "{s}/dated", .{tag})
+    else
+        tag;
+    const digest_key = try edge.boardKey(alloc, "all", day, variant_tag);
     const fresh_key = try edge.freshKey(alloc, digest_key, epoch_s, false);
     const cache = workers.Cache.default();
     // Fresh hit: same 30s bucket, so age < 30s. Serve the stored render.
@@ -1121,8 +1129,8 @@ fn serveAll(
         .text => if (route.oneline)
             try serveAllOneLine(alloc, sections, color, route.quiet, zone)
         else
-            try digest.textWithZoneArt(alloc, sections, day, color, route.width, route.height, route.quiet, zone, route.art),
-        .html => try digest.htmlWithZoneArt(alloc, sections, day, route.width, route.height, route.quiet, zone, route.art),
+            try digest.textWithZoneArt(alloc, sections, day, color, route.width, route.height, route.quiet, zone, route.art, route.date != null),
+        .html => try digest.htmlWithZoneArt(alloc, sections, day, route.width, route.height, route.quiet, zone, route.art, route.date != null),
         .json => try digest.json(alloc, sections, day),
     };
     var resp = staticResponse(body, contentType(format), "miss");

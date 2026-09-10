@@ -146,8 +146,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 .text => if (home_route.oneline)
                     try server_app.render.homeOneLineWithZone(arena, boards, color, zone)
                 else
-                    try server_app.render.homeLiveWithZone(arena, color, host, boards, day, home_route.quiet, zone),
-                .html => try server_app.render.homeHtmlLive(arena, host, boards, day, home_route.quiet),
+                    try server_app.render.homeLiveWithZone(arena, color, host, boards, day, home_route.quiet, zone, home_route.date != null),
+                .html => try server_app.render.homeHtmlLive(arena, host, boards, day, home_route.quiet, home_route.date != null),
                 .json => try server_app.render.leaguesJson(arena),
             };
             try respond(request, body, format, .ok, commonHeaders());
@@ -270,8 +270,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 .text => if (all_route.oneline)
                     try allOneLine(arena, sections, color, all_route.quiet, zone)
                 else
-                    try server_app.digest.textWithZoneArt(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet, zone, all_route.art),
-                .html => try server_app.digest.htmlWithZoneArt(arena, sections, day, all_route.width, all_route.height, all_route.quiet, zone, all_route.art),
+                    try server_app.digest.textWithZoneArt(arena, sections, day, color, all_route.width, all_route.height, all_route.quiet, zone, all_route.art, all_route.date != null),
+                .html => try server_app.digest.htmlWithZoneArt(arena, sections, day, all_route.width, all_route.height, all_route.quiet, zone, all_route.art, all_route.date != null),
                 .json => try server_app.digest.json(arena, sections, day),
             };
             try respond(request, body, format, .ok, commonHeaders());
