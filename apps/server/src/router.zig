@@ -164,7 +164,15 @@ pub const Route = union(enum) {
 
 pub fn parse(target: []const u8) Route {
     const query_at = std.mem.indexOfScalar(u8, target, '?');
-    const path = target[0 .. query_at orelse target.len];
+    var path = target[0 .. query_at orelse target.len];
+    // Friendlier routing: strip ONE trailing slash pre-parse so `/mlb/`,
+    // `/all/`, `/healthz/`, and `/api/v1/leagues/` (plus every other
+    // slash-terminated address) parse like their bare twins. Root `/`
+    // stays (it is the home route), and `//` stays not_found (only one
+    // slash strips, leaving `/`, whose empty league misses below).
+    if (path.len > 1 and path[path.len - 1] == '/' and !std.mem.eql(u8, path, "//")) {
+        path = path[0 .. path.len - 1];
+    }
     const query = if (query_at) |at| target[at + 1 ..] else "";
     const display = parseDisplay(query);
 
@@ -183,7 +191,7 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/docs")) return .docs;
     if (std.mem.eql(u8, path, "/favicon.svg")) return .favicon;
     if (std.mem.eql(u8, path, "/llms.txt")) return .llms;
-    if (std.mem.eql(u8, path, "/api/v1/leagues")) return .leagues;
+    if (std.mem.eql(u8, path, "/api/v1/leagues") or std.mem.eql(u8, path, "/api/v1")) return .leagues;
 
     // Help page (wttr.in `:help` style): global `/:help`, `/help` plus the
     // `/api/v1/` twins. Per-league `/{league}/:help` and `/{league}/help`
@@ -421,10 +429,10 @@ fn isAliasAbbr(s: []const u8) bool {
 /// as slug `mlb/help` and is caught by `isHelpSegment` in the two-segment
 /// branch, so help never falls into the team view.
 fn isHelpPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/:help") or
-        std.mem.eql(u8, path, "/help") or
-        std.mem.eql(u8, path, "/api/v1/:help") or
-        std.mem.eql(u8, path, "/api/v1/help");
+    return std.ascii.eqlIgnoreCase(path, "/:help") or
+        std.ascii.eqlIgnoreCase(path, "/help") or
+        std.ascii.eqlIgnoreCase(path, "/api/v1/:help") or
+        std.ascii.eqlIgnoreCase(path, "/api/v1/help");
 }
 
 /// Second segment of `/{league}/standings` (and the `/api/v1/` twin).
@@ -438,8 +446,9 @@ fn isTeamsSegment(segment: []const u8) bool {
 }
 
 /// Second segment of `/{league}/:help` or `/{league}/help`.
+/// Case-insensitive like standings/teams (team abbrevs match that way).
 fn isHelpSegment(segment: []const u8) bool {
-    return std.mem.eql(u8, segment, ":help") or std.mem.eql(u8, segment, "help");
+    return std.ascii.eqlIgnoreCase(segment, ":help") or std.ascii.eqlIgnoreCase(segment, "help");
 }
 
 /// Response format for a request. The address decides first: `/api/v1/`
@@ -462,7 +471,10 @@ pub fn formatFor(target: []const u8, accept: []const u8) Format {
 pub fn isJsonTarget(target: []const u8) bool {
     const query_at = std.mem.indexOfScalar(u8, target, '?');
     const path = target[0 .. query_at orelse target.len];
-    return std.mem.startsWith(u8, path, "/api/v1/");
+    // The bare `/api/v1` root lists leagues (see parse), so it is JSON
+    // like every other `/api/v1/` address; longer lookalikes (`/api/v10`)
+    // only match via the trailing-slash prefix, never bare.
+    return std.mem.startsWith(u8, path, "/api/v1/") or std.mem.eql(u8, path, "/api/v1");
 }
 
 /// True when a game-detail request renders the one-line fallback instead of
@@ -824,7 +836,8 @@ test "second segment splits game ids from team abbrevs" {
     const api_team = parse("/api/v1/nfl/kc?width=90").team;
     try std.testing.expectEqualStrings("kc", api_team.abbr);
     try std.testing.expect(api_team.width.? == 90);
-    try std.testing.expect(parse("/mlb/") == .not_found);
+    // One trailing slash strips pre-parse, so `/mlb/` is the scoreboard.
+    try std.testing.expectEqualStrings("mlb", parse("/mlb/").scoreboard.league);
     try std.testing.expect(parse("//phi") == .not_found);
 }
 
@@ -839,7 +852,8 @@ test "today shortcut parses team scope with address family" {
     // Deeper paths, wrong tails, and reserved words stay not_found.
     try std.testing.expect(parse("/mlb/PHI/today/x") == .not_found);
     try std.testing.expect(parse("/mlb/PHI/yesterday") == .not_found);
-    try std.testing.expect(parse("/mlb/PHI/") == .not_found);
+    // One trailing slash strips pre-parse, so `/mlb/PHI/` is the team view.
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/").team.abbr);
     try std.testing.expect(parse("/mlb//today") == .not_found);
     try std.testing.expect(parse("/mlb/help/today") == .not_found);
     try std.testing.expect(parse("/mlb/standings/today") == .not_found);
@@ -884,7 +898,10 @@ test "date alias parses date and matchup, human only" {
     try std.testing.expect(parse("/mlb/2026-13-40/min-det") == .not_found);
     try std.testing.expect(parse("/mlb/Today/min-det") == .not_found);
     try std.testing.expect(parse("/mlb/2026-09-09/min-det/x") == .not_found);
-    try std.testing.expect(parse("/mlb/2026-09-09/") == .not_found);
+    // One trailing slash strips pre-parse, so the bare date rides the
+    // two-segment team split like its slashless twin (dispatch 404s it as
+    // an unknown team).
+    try std.testing.expectEqualStrings("2026-09-09", parse("/mlb/2026-09-09/").team.abbr);
     // Existing two-segment regions are untouched by the alias shapes.
     try std.testing.expect(parse("/mlb/a/b") == .not_found);
     try std.testing.expect(parse("/mlb/phi") == .team);
@@ -1111,8 +1128,9 @@ test "llms.txt parses exact with query ignored" {
     try std.testing.expect(parse("/llms.txt?color=0") == .llms);
     try std.testing.expect(!isJsonTarget("/llms.txt"));
     try std.testing.expect(!isJsonTarget("/llms.txt?foo=bar"));
-    // Near misses are not the agent page.
-    try std.testing.expect(parse("/llms.txt/") == .not_found);
+    // Near misses are not the agent page (one trailing slash strips
+    // pre-parse, so `/llms.txt/` IS the agent page).
+    try std.testing.expect(parse("/llms.txt/") == .llms);
     try std.testing.expect(parse("/llms") == .scoreboard);
 }
 
@@ -1148,4 +1166,77 @@ test "art kill-switch parses off case-insensitively, anything else is on" {
     // Redirects and mark-free pages carry no art flag.
     try std.testing.expect(@TypeOf(parse("/mlb/PHI/today").today) == TodayRoute);
     try std.testing.expect(@TypeOf(parse("/").home) == HomeRoute);
+}
+
+test "bare api root lists leagues like /api/v1/leagues" {
+    // No trailing slash used to fall into human slug parsing (league
+    // `api`, team `v1`); now it is the leagues listing. There is no
+    // separate API root route, so dispatch serves the same leagues body.
+    try std.testing.expect(parse("/api/v1") == .leagues);
+    try std.testing.expect(parse("/api/v1/") == .leagues);
+    try std.testing.expect(parse("/api/v1?foo=bar") == .leagues);
+    try std.testing.expect(isJsonTarget("/api/v1"));
+    try std.testing.expect(isJsonTarget("/api/v1/"));
+    try std.testing.expectEqual(Format.json, formatFor("/api/v1", "*/*"));
+    // Longer lookalikes are not the root: they ride the usual slug split.
+    try std.testing.expect(parse("/api/v10") != .leagues);
+    try std.testing.expect(parse("/api/v1x") != .leagues);
+    try std.testing.expect(!isJsonTarget("/api/v10"));
+}
+
+test "help segments match case-insensitively like standings" {
+    // Per-league spellings never fall into the team view, whatever case.
+    try std.testing.expect(parse("/mlb/HELP") == .help);
+    try std.testing.expect(parse("/mlb/Help") == .help);
+    try std.testing.expect(parse("/mlb/:HELP") == .help);
+    try std.testing.expect(parse("/mlb/:Help") == .help);
+    try std.testing.expect(parse("/api/v1/mlb/HELP") == .help);
+    try std.testing.expect(parse("/api/v1/mlb/:help") == .help);
+    // Global spellings (and the /api/v1/ twins) match whatever case.
+    try std.testing.expect(parse("/:HELP") == .help);
+    try std.testing.expect(parse("/HELP") == .help);
+    try std.testing.expect(parse("/Help") == .help);
+    try std.testing.expect(parse("/api/v1/HELP") == .help);
+    try std.testing.expect(parse("/api/v1/:HELP") == .help);
+    // Display flags ride along in any casing.
+    try std.testing.expect(parse("/mlb/HELP?0q").help.oneline);
+    try std.testing.expect(parse("/mlb/HELP?0q").help.quiet);
+    try std.testing.expect(parse("/HELP?T").help.color.? == false);
+    // Reserved-word guard on the today shortcut is case-insensitive too.
+    try std.testing.expect(parse("/mlb/HELP/today") == .not_found);
+    try std.testing.expect(parse("/mlb/Help/today") == .not_found);
+    // Almost-help still misses into the team view.
+    try std.testing.expect(parse("/mlb/HELPful") == .team);
+}
+
+test "one trailing slash strips pre-parse, root and double slash stay" {
+    // Single-segment routes parse like their bare twins.
+    try std.testing.expectEqualStrings("mlb", parse("/mlb/").scoreboard.league);
+    try std.testing.expect(parse("/all/") == .all);
+    try std.testing.expect(parse("/healthz/") == .health);
+    try std.testing.expect(parse("/api/v1/leagues/") == .leagues);
+    try std.testing.expect(parse("/docs/") == .docs);
+    try std.testing.expect(parse("/openapi.json/") == .openapi);
+    try std.testing.expect(parse("/llms.txt/") == .llms);
+    try std.testing.expect(parse("/favicon.svg/") == .favicon);
+    // Two-segment routes parse like their bare twins.
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/").team.abbr);
+    try std.testing.expectEqualStrings("401816828", parse("/mlb/401816828/").game.id);
+    try std.testing.expect(parse("/mlb/standings/") == .standings);
+    try std.testing.expect(parse("/mlb/teams/") == .teams);
+    try std.testing.expect(parse("/mlb/help/") == .help);
+    try std.testing.expect(parse("/api/v1/mlb/") == .scoreboard);
+    try std.testing.expect(parse("/api/v1/mlb/standings/") == .standings);
+    // Queries survive the strip.
+    try std.testing.expectEqualStrings("2026-09-06", parse("/mlb/?date=2026-09-06").scoreboard.date.?);
+    try std.testing.expectEqualStrings("2026-09-06", parse("/all/?date=2026-09-06").all.date.?);
+    try std.testing.expect(parse("/mlb/?date=2026-13-40") == .bad_date);
+    // Root `/` stays home (never strips to empty).
+    try std.testing.expect(parse("/") == .home);
+    try std.testing.expectEqualStrings("2026-09-01", parse("/?date=2026-09-01").home.date.?);
+    // Only ONE slash strips: `//` stays 404 and doubled tails still miss.
+    try std.testing.expect(parse("//") == .not_found);
+    try std.testing.expect(parse("/mlb//") == .not_found);
+    try std.testing.expect(parse("/api/v1/leagues//") == .not_found);
+    try std.testing.expect(parse("/mlb/standings/x/") == .not_found);
 }
