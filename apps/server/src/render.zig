@@ -2723,6 +2723,3 @@ test "tmp debug narrow" {
     defer std.testing.allocator.free(page);
     std.debug.print("\n=====PAGE=====\n{s}\n=====END=====\n", .{page});
 }
-
-
-
