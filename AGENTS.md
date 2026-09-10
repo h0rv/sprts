@@ -4,10 +4,10 @@ Zig 0.16.0 monorepo (`mise.toml` pins `zig 0.16.0`, `node 24.15.0`, `openapi2zig
 
 ## Commands
 
-- `mise run serve` — run server locally (`zig build run`), port 8080.
-- `mise run check` — full verification: root `zig build test` + `zig build` + `ReleaseSafe` build + per-package `test`/`build` in `packages/core`, `clients/espn`, `apps/server`. Run this before declaring done; root `zig build test` alone only covers the server module.
+- `mise run serve` — run server locally (`zig build run`), port 8080. `mise run run:cli` — run the CLI (`apps/cli`, once landed).
+- `mise run check` — full verification: root `zig build test` (server + sprts_client modules) + `zig build` + `ReleaseSafe` build + per-package `test` in `packages/core` and `clients/espn`, `test`+`build` in `clients/sprts`, `apps/server`, and `apps/cli` (the CLI step skips until `apps/cli` lands). Run this before declaring done; root `zig build test` alone does not cover the per-package steps.
 - Focused: `cd packages/core && zig build test`, `cd clients/espn && zig build test`, `cd apps/server && zig build test` (or `zig build run` from `apps/server`).
-- `mise run generate:espn` — regenerate ESPN client via `tools/generate-espn-client`.
+- `mise run generate:espn` — regenerate ESPN client via `tools/generate-espn-client`. `mise run generate:sprts-client` — regenerate sprts API client via `tools/generate-sprts-client` (spins up a local server for `/openapi.json`; no checked-in spec).
 - Cloudflare (thin wrapper, not a second backend): `mise exec -- npm install`, `mise exec -- npm run cf:check` (`tsc --noEmit` + `wrangler deploy --dry-run`), `mise exec -- npm run cf:deploy`. Containers require Workers Paid plan; config in `wrangler.jsonc` maps to `sprts.horv.co`.
 
 ## Layout

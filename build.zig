@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const core = b.dependency("sprts_core", .{ .target = target, .optimize = optimize }).module("sprts_core");
     const espn = b.dependency("espn_client", .{ .target = target, .optimize = optimize }).module("espn_client");
+    const sprts_client = b.dependency("sprts_client", .{ .target = target, .optimize = optimize }).module("sprts_client");
     const zchema = b.dependency("zchema", .{ .target = target, .optimize = optimize }).module("zchema");
     const server_module = b.createModule(.{
         .root_source_file = b.path("apps/server/src/root.zig"),
@@ -36,7 +37,10 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the sprts server").dependOn(&run.step);
     const tests = b.addTest(.{ .root_module = server_module });
-    b.step("test", "Run all monorepo tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run all monorepo tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const sprts_client_tests = b.addTest(.{ .root_module = sprts_client });
+    test_step.dependOn(&b.addRunArtifact(sprts_client_tests).step);
 
     // Cloudflare Worker (wasm32+wasi, ReleaseSmall). Imported ONLY by the
     // worker entry; native exe above is unaffected. workers-zig's addWorker
