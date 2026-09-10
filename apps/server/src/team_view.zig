@@ -1235,3 +1235,93 @@ test "hostile team schedule reads identically in text and HTML" {
     try std.testing.expect(std.mem.indexOf(u8, seen, "&lt;") == null);
     try std.testing.expect(std.mem.indexOf(u8, seen, "\x1b[") == null);
 }
+
+test "family soccer team view renders draws, standing, and links in text and HTML" {
+    // Per-sport team parity beyond baseball: a soccer side carries a
+    // draws-leg record, a table standing, and no probable starters;
+    // draws (`D 2-2`) read as results, never wins. Inline fixture only.
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    const team_view: schedule.TeamView = .{
+        .league = "epl",
+        .league_name = "Premier League",
+        .team = .{
+            .id = "110",
+            .abbrev = "ARS",
+            .name = "Arsenal",
+            .record_summary = "18-3-5",
+            .standing_summary = "1st in Premier League",
+        },
+        .last = &.{
+            .{
+                .id = "784120",
+                .date = "2026-09-01T19:00Z",
+                .opponent_abbrev = "CHE",
+                .opponent_name = "Chelsea",
+                .home_away = "away",
+                .status = "Full Time",
+                .state = "post",
+                .our_score = "2",
+                .opp_score = "2",
+                .result = "D 2-2",
+            },
+        },
+        .next = &.{
+            .{
+                .id = "784123",
+                .date = "2026-09-08T19:00Z",
+                .opponent_abbrev = "TOT",
+                .opponent_name = "Tottenham Hotspur",
+                .home_away = "home",
+                .status = "9/8 - 3:00 PM EDT",
+                .state = "pre",
+                .result = "vs TOT 3:00 PM",
+            },
+        },
+    };
+    const text = try renderText(arena, team_view, false, null, null);
+    defer arena.free(text);
+    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "1st in Premier League", "Last 5:", "D 2-2", "/epl/784120", "Next 5:", "vs TOT 3:00 PM", "/epl/784123" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, text, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text, "Probable:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(text);
+    const page = try teamHtml(arena, team_view, "epl", null, null);
+    defer arena.free(page);
+    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "D 2-2", "<a href=\"/epl/784120\">", "<a href=\"/epl/784123\">" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, page, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Visible-text parity on the shared rows: record line plus both
+    // schedule rows read identically after the pointer/link fold.
+    const pre_open = std.mem.indexOf(u8, page, "<pre>").?;
+    const pre_close = std.mem.indexOf(u8, page, "</pre>").?;
+    var visible: std.Io.Writer.Allocating = .init(arena);
+    defer visible.deinit();
+    var raw = std.mem.splitScalar(u8, page[pre_open + "<pre>".len .. pre_close], '\n');
+    while (raw.next()) |line| {
+        const clean = try vd.stripHtmlVisible(arena, line);
+        defer arena.free(clean);
+        try visible.writer.writeAll(clean);
+        try visible.writer.writeByte('\n');
+    }
+    const seen = try visible.toOwnedSlice();
+    defer arena.free(seen);
+    const rec = try vd.recordStandingsLine(arena, team_view.team.record_summary, team_view.team.standing_summary);
+    defer if (rec) |line| arena.free(line);
+    try std.testing.expect(teamContainsLine(text, rec.?));
+    try std.testing.expect(teamContainsLine(seen, rec.?));
+    for ([2]schedule.GameRef{ team_view.last[0], team_view.next[0] }) |game| {
+        const base = try vd.gameLine(arena, game);
+        defer arena.free(base);
+        const fitted = try vd.fitLine(arena, base, cols, null, false);
+        defer arena.free(fitted);
+        try std.testing.expect(teamContainsLine(seen, fitted));
+        const full = try vd.gameLineFull(arena, "epl", game);
+        defer arena.free(full);
+        const fitted_full = try vd.fitLine(arena, full, cols, null, false);
+        defer arena.free(fitted_full);
+        try std.testing.expect(teamContainsLine(text, fitted_full));
+    }
+}
