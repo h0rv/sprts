@@ -195,7 +195,38 @@ const Competition = struct {
     date: []const u8 = "",
     status: ?Status = null,
     competitors: []const Competitor = &.{},
+    broadcasts: []const ScoreboardBroadcast = &.{},
+    geoBroadcasts: []const ScoreboardGeoBroadcast = &.{},
 };
+/// ESPN competition broadcast: `names` carries the TV networks
+/// (e.g. `["ESPN"]`); every other field is ignored.
+const ScoreboardBroadcast = struct {
+    names: []const []const u8 = &.{},
+};
+/// ESPN per-market geo feed: only the media short name is usable as a
+/// network fallback (e.g. a regional feed name); market/type are ignored.
+const ScoreboardGeoBroadcast = struct {
+    media: ?ScoreboardGeoMedia = null,
+};
+const ScoreboardGeoMedia = struct {
+    shortName: ?[]const u8 = null,
+};
+/// Broadcaster for one competition: the first non-empty
+/// `broadcasts[].names` entry in order, else the first non-empty
+/// geo-feed media short name, else null (absent stays absent).
+fn competitionNetwork(competition: Competition) ?[]const u8 {
+    for (competition.broadcasts) |broadcast| {
+        for (broadcast.names) |name| {
+            if (name.len > 0) return name;
+        }
+    }
+    for (competition.geoBroadcasts) |geo| {
+        const media = geo.media orelse continue;
+        const short = media.shortName orelse continue;
+        if (short.len > 0) return short;
+    }
+    return null;
+}
 const Competitor = struct {
     id: []const u8 = "",
     order: i64 = 0,
@@ -286,6 +317,7 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                 .state = status_type.state,
                 .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
                 .participants = try participants.toOwnedSlice(arena),
+                .network = competitionNetwork(competition),
             });
         }
     }
@@ -345,6 +377,33 @@ test "competitor records normalize the total summary" {
     try std.testing.expect(board.games[0].participants[1].record == null);
     // Team identities keep their abbreviations.
     try std.testing.expectEqualStrings("AWY", board.games[0].participants[0].abbreviation);
+}
+
+test "competition broadcasts normalize to the game network" {
+    const fixture =
+        \\{"events":[{"id":"401","name":"Away at Home","date":"2026-09-06T17:00Z","status":{"type":{"state":"pre","shortDetail":"7:05 PM ET"}},"competitions":[{"broadcasts":[{"names":["ESPN"]}],"competitors":[{"homeAway":"away","score":"","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const board = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", fixture);
+    try std.testing.expectEqualStrings("ESPN", board.games[0].network.?);
+}
+
+test "game network is null without broadcasts and falls back to geo feeds" {
+    // No broadcasts at all: absent stays absent.
+    const bare =
+        \\{"events":[{"id":"401","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const plain = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", bare);
+    try std.testing.expect(plain.games[0].network == null);
+    // Empty names skipped; geo media short name fills the gap.
+    const geo =
+        \\{"events":[{"id":"402","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"broadcasts":[{"names":[]}],"geoBroadcasts":[{"media":{"shortName":"MASN"},"market":{"id":"x"},"type":{}}],"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    const fallback = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", geo);
+    try std.testing.expectEqualStrings("MASN", fallback.games[0].network.?);
 }
 
 const FakeTransportState = struct {
@@ -1528,6 +1587,9 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .venue = venue,
         .attendance = attendance,
         .series = series,
+        // Zero new fetches: the board row already parsed this game's
+        // competition broadcasts above, so the detail copies it over.
+        .network = game.network,
         .participants = try participants.toOwnedSlice(arena),
         .situation = situation,
         .decisions = try decisions.toOwnedSlice(arena),
@@ -1641,9 +1703,27 @@ test "fetchDetail enriches the board row with summary fields" {
     try std.testing.expectEqualStrings("0", detail.scoring_plays[0].away_score);
     try std.testing.expectEqualStrings("Riley tripled to center, Albies scored.", detail.scoring_plays[6].text);
     try std.testing.expect(detail.situation == null);
+    try std.testing.expect(detail.network == null);
     try std.testing.expect(detail.leaders.len >= 4);
     try std.testing.expectEqualStrings("ATL H-AB 10-35", detail.leaders[0]);
     try std.testing.expectEqualStrings("Drake Baldwin 2-4", detail.leaders[1]);
+}
+
+test "fetchDetail copies the board network with no extra fetch" {
+    const board =
+        \\{"events":[{"id":"9","name":"Atlanta Braves at Philadelphia Phillies","date":"2026-09-06T17:10Z","competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"pre","shortDetail":"7:05 PM ET"}},"broadcasts":[{"names":["FS1"]}],"competitors":[{"homeAway":"away","team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}},{"homeAway":"home","team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}}]}]}]}
+    ;
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"pre","shortDetail":"7:05 PM ET"}},"competitors":[{"id":"22","homeAway":"home","team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}},{"id":"15","homeAway":"away","team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqualStrings("FS1", detail.network.?);
+    // One summary + one board fetch: the network rode the board payload.
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.board_calls);
 }
 
 const evening_summary_fixture =
@@ -2357,6 +2437,90 @@ const team_fixture_schedule_empty =
 // Supported sports: football, basketball, baseball, hockey, soccer (resolved
 // through the same `endpointFor` sport/league keys as the scoreboard, so a
 // league without a mapping — or a mapped sport ESPN has no table for, such
+// ---- League team list (additive; existing fns above are untouched) ----
+
+/// Team picker payload behind `GET /api/v1/{league}/teams`: one ESPN
+/// teams fetch (same `?limit=1000` shape as the team view, so college
+/// memberships arrive whole), mapped to id/abbrev/name rows in provider
+/// order. No record: the teams payload carries none, and per-team records
+/// would cost one schedule fetch per team instead of this single call.
+/// Empty membership yields an empty list, never an error.
+pub fn fetchTeams(adapter: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League) !core.schedule.TeamList {
+    const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
+    const url = try std.fmt.allocPrint(arena, "{s}?limit=1000", .{try espn.buildTeamsUrl(arena, adapter.base_url, endpoint.sport, endpoint.league)});
+    return parseTeamList(arena, league, try adapterFetchUrl(adapter, arena, url));
+}
+
+pub fn parseTeamList(arena: std.mem.Allocator, league: *const core.leagues.League, body: []const u8) !core.schedule.TeamList {
+    const response = try std.json.parseFromSliceLeaky(TeamListResponse, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    var teams: std.ArrayList(core.schedule.TeamListEntry) = .empty;
+    for (response.sports) |sport| {
+        for (sport.leagues) |entrant| {
+            for (entrant.teams) |entry| {
+                const team = entry.team orelse continue;
+                if (team.id.len == 0) continue;
+                try teams.append(arena, .{
+                    .id = team.id,
+                    .abbrev = team.abbreviation,
+                    .name = if (team.displayName.len > 0) team.displayName else "Unknown",
+                });
+            }
+        }
+    }
+    return .{
+        .league = league.slug,
+        .league_name = league.name,
+        .teams = try teams.toOwnedSlice(arena),
+        .source = "site.api.espn.com",
+    };
+}
+
+test "parseTeamList maps every team in provider order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const list = try parseTeamList(arena_state.allocator(), core.leagues.find("mlb").?, team_fixture_teams);
+    try std.testing.expectEqualStrings("mlb", list.league);
+    try std.testing.expectEqualStrings("MLB", list.league_name);
+    try std.testing.expectEqualStrings("1", list.schema_version);
+    try std.testing.expectEqualStrings("site.api.espn.com", list.source);
+    try std.testing.expectEqual(@as(usize, 2), list.teams.len);
+    try std.testing.expectEqualStrings("22", list.teams[0].id);
+    try std.testing.expectEqualStrings("PHI", list.teams[0].abbrev);
+    try std.testing.expectEqualStrings("Philadelphia Phillies", list.teams[0].name);
+    try std.testing.expectEqualStrings("ATL", list.teams[1].abbrev);
+}
+
+test "parseTeamList tolerates empty and teamless payloads" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mlb = core.leagues.find("mlb").?;
+    const empty = try parseTeamList(arena, mlb, "{\"sports\":[]}");
+    try std.testing.expectEqual(@as(usize, 0), empty.teams.len);
+    try std.testing.expectEqualStrings("mlb", empty.league);
+    const teamless = try parseTeamList(arena, mlb, "{\"sports\":[{\"leagues\":[{\"teams\":[{},{\"team\":{\"id\":\"\"}}]}]}]}");
+    try std.testing.expectEqual(@as(usize, 0), teamless.teams.len);
+}
+
+test "fetchTeams hits the teams endpoint with the college-sized limit" {
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = team_fixture_schedule,
+        .board_body = team_fixture_board,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const list = try fetchTeams(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?);
+    try std.testing.expectEqual(@as(usize, 2), list.teams.len);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/baseball/mlb/teams?limit=1000",
+        fake.teams_url.?,
+    );
+}
+
 // as tennis, racing, MMA, golf — fails with `error.UnsupportedLeague`
 // without ever contacting upstream). The serve layer maps that to 404
 // ("standings unavailable for league"); a non-200 upstream is

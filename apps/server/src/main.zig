@@ -528,6 +528,33 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             const extra = cacheHeaders(cache_state);
             try respond(request, body, format, .ok, &extra);
         },
+        .teams => |teams_route| {
+            // JSON-only endpoint (no text/HTML twin): the team list is a
+            // picker payload for JSON clients, and no text table exists
+            // for it — so the human path serves the same JSON body.
+            const league = core.leagues.find(teams_route.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+            const key: server_app.native_cache.Key = .{ .teams = .{ .slug = slug } };
+            var fetch_ctx = TeamsFetchCtx{ .adapter = adapter, .league = league };
+            const start = std.Io.Clock.Timestamp.now(io, .awake);
+            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchTeamsPayload) catch |err| {
+                upstream_ms = elapsedMs(start, io);
+                status = .bad_gateway;
+                std.log.warn("ESPN teams request failed for {s}: {t}", .{ league.slug, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            upstream_ms = if (cached.outcome == .hit) 0 else elapsedMs(start, io);
+            cache_state = @tagName(cached.outcome);
+            status = .ok;
+            const body = try server_app.render.teamsJson(arena, cached.data.teams);
+            const extra = cacheHeaders(cache_state);
+            try respond(request, body, .json, .ok, &extra);
+        },
     }
 }
 
@@ -578,6 +605,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .date_alias => |r| std.fmt.allocPrint(arena, "date-alias/{s}/{s}", .{ r.league, r.date }),
         .week_alias => |r| std.fmt.allocPrint(arena, "week-alias/{s}/{s}", .{ r.league, r.season }),
         .standings => |r| std.fmt.allocPrint(arena, "standings/{s}", .{r.league}),
+        .teams => |r| std.fmt.allocPrint(arena, "teams/{s}", .{r.league}),
     };
 }
 
@@ -592,6 +620,7 @@ const BoardFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league:
 const DetailFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, id: []const u8 };
 const TeamFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, abbr: []const u8 };
 const StandingsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League };
+const TeamsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League };
 
 fn fetchBoardPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {
     const c: *BoardFetchCtx = @ptrCast(@alignCast(ctx));
@@ -611,6 +640,11 @@ fn fetchTeamPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_a
 fn fetchStandingsPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {
     const c: *StandingsFetchCtx = @ptrCast(@alignCast(ctx));
     return .{ .standings = try server_app.provider.fetchStandings(c.adapter, arena, c.league) };
+}
+
+fn fetchTeamsPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {
+    const c: *TeamsFetchCtx = @ptrCast(@alignCast(ctx));
+    return .{ .teams = try server_app.provider.fetchTeams(c.adapter, arena, c.league) };
 }
 
 /// Success headers for cached routes: the shared cache headers plus the

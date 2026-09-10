@@ -124,6 +124,9 @@ pub const DetailGame = struct {
     venue: ?[]const u8 = null,
     attendance: ?i64 = null,
     series: ?[]const u8 = null,
+    /// TV broadcaster, copied from the scoreboard row (same ESPN payload,
+    /// no extra fetch); null when the provider supplies none.
+    network: ?[]const u8 = null,
     participants: []const DetailParticipant,
     situation: ?DetailSituation = null,
     decisions: []const DetailDecision = &.{},
@@ -147,6 +150,7 @@ pub const DetailGame = struct {
             .venue = .{ .description = "Venue full name when the provider supplies one." },
             .attendance = .{ .description = "Ticketed attendance when the provider supplies it." },
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },
+            .network = .{ .description = "TV broadcaster when the provider supplies one." },
             .leaders = .{ .description = "Short statistical leader strings, e.g. team totals and top performers." },
             .lineups = .{ .description = "Starting lineups in batting order when the provider supplies a batting group; absent otherwise." },
             .team_stats = .{ .description = "Box-score team total lines when the provider supplies them; absent otherwise." },
@@ -177,6 +181,7 @@ test "game detail defaults to empty collections" {
     };
     try std.testing.expectEqualStrings("1", game_detail.schema_version);
     try std.testing.expect(game_detail.venue == null);
+    try std.testing.expect(game_detail.network == null);
     try std.testing.expect(game_detail.situation == null);
     try std.testing.expectEqual(@as(usize, 0), game_detail.decisions.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.scoring_plays.len);

@@ -104,6 +104,15 @@ pub const StandingsRoute = struct {
     oneline: bool = false,
 };
 
+/// Team-list tab (`/{league}/teams`, plaintextsports parity with the
+/// Schedule/Standings/Teams tabs): every member team's id/abbrev/name in
+/// provider order. No date or week: membership is current-only. JSON-only
+/// (the team picker is a JSON-client affordance; there is no text table),
+/// so display flags are accepted for uniformity and ignored on dispatch.
+pub const TeamsRoute = struct {
+    league: []const u8,
+};
+
 pub const HomeRoute = struct {
     color: ?bool,
     quiet: bool = false,
@@ -137,6 +146,7 @@ pub const Route = union(enum) {
     scoreboard: ScoreboardRoute,
     game: GameRoute,
     team: TeamRoute,
+    teams: TeamsRoute,
     today: TodayRoute,
     date_alias: DateAliasRoute,
     week_alias: WeekAliasRoute,
@@ -205,7 +215,7 @@ pub fn parse(target: []const u8) Route {
             const seg3 = segment[slash2 + 1 ..];
             const api = std.mem.startsWith(u8, path, api_prefix);
             if (seg2.len > 0 and std.mem.eql(u8, seg3, "today") and
-                !isHelpSegment(seg2) and !isStandingsSegment(seg2))
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2))
             {
                 return .{ .today = .{
                     .league = league,
@@ -265,6 +275,12 @@ pub fn parse(target: []const u8) Route {
             .art = parseArt(queryValue(query, "art")),
             .quiet = display.quiet,
             .oneline = display.oneline,
+        } };
+        // Team-list tab: caught before the game/team split so the literal
+        // never falls into the team view (no team is abbreviated "teams",
+        // and game ids are digits-only, so the match is exact).
+        if (isTeamsSegment(segment)) return .{ .teams = .{
+            .league = league,
         } };
         const sized = .{
             .color = display.color,
@@ -408,6 +424,11 @@ fn isHelpPath(path: []const u8) bool {
 /// Second segment of `/{league}/standings` (and the `/api/v1/` twin).
 fn isStandingsSegment(segment: []const u8) bool {
     return std.ascii.eqlIgnoreCase(segment, "standings");
+}
+
+/// Second segment of `/{league}/teams` (and the `/api/v1/` twin).
+fn isTeamsSegment(segment: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(segment, "teams");
 }
 
 /// Second segment of `/{league}/:help` or `/{league}/help`.
@@ -990,6 +1011,31 @@ test "standings routes parse before the game/team split" {
     // Unknown-league slugs still parse: the serve layer answers 404 via
     // the league lookup, so the route carries the slug verbatim.
     try std.testing.expectEqualStrings("quidditch", parse("/quidditch/standings").standings.league);
+}
+
+test "teams routes parse before the game/team split" {
+    const short = parse("/nfl/teams").teams;
+    try std.testing.expectEqualStrings("nfl", short.league);
+    const api = parse("/api/v1/mlb/teams").teams;
+    try std.testing.expectEqualStrings("mlb", api.league);
+    try std.testing.expect(isJsonTarget("/api/v1/mlb/teams"));
+    try std.testing.expect(!isJsonTarget("/mlb/teams"));
+    // Case-insensitive like standings and team abbrevs; neighboring
+    // regions untouched.
+    try std.testing.expect(parse("/mlb/TEAMS") == .teams);
+    try std.testing.expect(parse("/mlb/Teams") == .teams);
+    try std.testing.expect(parse("/mlb/help") == .help);
+    try std.testing.expect(parse("/mlb/standings") == .standings);
+    try std.testing.expect(parse("/mlb/401816828") == .game);
+    try std.testing.expect(parse("/mlb/phi") == .team);
+    // Deeper paths are not routes; a bare /teams is a (unknown) league.
+    try std.testing.expect(parse("/mlb/teams/x") == .not_found);
+    try std.testing.expect(parse("/teams") == .scoreboard);
+    // Reserved words never ride the today shortcut as team abbrevs.
+    try std.testing.expect(parse("/mlb/teams/today") == .not_found);
+    // Unknown-league slugs still parse: the serve layer answers 404 via
+    // the league lookup, so the route carries the slug verbatim.
+    try std.testing.expectEqualStrings("quidditch", parse("/quidditch/teams").teams.league);
 }
 
 test "game one-line flag spellings parse on the detail route" {
