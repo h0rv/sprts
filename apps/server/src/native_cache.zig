@@ -176,214 +176,50 @@ pub const Cached = struct {
 /// `getOrFetch` clones successes into cache-owned memory.
 pub const FetchFn = *const fn (ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Data;
 
-fn dupeOpt(a: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
-    const s = value orelse return null;
-    return try a.dupe(u8, s);
-}
-
-/// Deep copy into `a`; the result borrows nothing from the source.
-pub fn cloneScoreboard(a: std.mem.Allocator, board: domain.Scoreboard) !domain.Scoreboard {
-    const games = try a.alloc(domain.Game, board.games.len);
-    for (board.games, 0..) |game, i| {
-        const participants = try a.alloc(domain.Participant, game.participants.len);
-        for (game.participants, 0..) |p, j| {
-            participants[j] = .{
-                .id = try a.dupe(u8, p.id),
-                .name = try a.dupe(u8, p.name),
-                .abbreviation = try a.dupe(u8, p.abbreviation),
-                .score = try a.dupe(u8, p.score),
-                .winner = p.winner,
-                .home_away = try dupeOpt(a, p.home_away),
-                .record = try dupeOpt(a, p.record),
-            };
-        }
-        games[i] = .{
-            .id = try a.dupe(u8, game.id),
-            .name = try a.dupe(u8, game.name),
-            .starts_at = try a.dupe(u8, game.starts_at),
-            .state = try a.dupe(u8, game.state),
-            .status = try a.dupe(u8, game.status),
-            .participants = participants,
-            .network = try dupeOpt(a, game.network),
-        };
-    }
-    return .{
-        .schema_version = try a.dupe(u8, board.schema_version),
-        .league = try a.dupe(u8, board.league),
-        .league_name = try a.dupe(u8, board.league_name),
-        .date = try a.dupe(u8, board.date),
-        .source = try a.dupe(u8, board.source),
-        .games = games,
-    };
-}
-
-pub fn cloneGameDetail(a: std.mem.Allocator, detail: core.detail.GameDetail) !core.detail.GameDetail {
-    const participants = try a.alloc(core.detail.DetailParticipant, detail.participants.len);
-    for (detail.participants, 0..) |p, i| {
-        const lines = try a.alloc(core.detail.LineScore, p.lines.len);
-        for (p.lines, 0..) |line, j| {
-            lines[j] = .{ .period = line.period, .display = try a.dupe(u8, line.display) };
-        }
-        participants[i] = .{
-            .id = try a.dupe(u8, p.id),
-            .name = try a.dupe(u8, p.name),
-            .abbreviation = try a.dupe(u8, p.abbreviation),
-            .score = try a.dupe(u8, p.score),
-            .winner = p.winner,
-            .home_away = try dupeOpt(a, p.home_away),
-            .lines = lines,
-            .hits = try dupeOpt(a, p.hits),
-            .errors = try dupeOpt(a, p.errors),
-            .record = try dupeOpt(a, p.record),
-            .probable = try dupeOpt(a, p.probable),
-        };
-    }
-    const situation: ?core.detail.Situation = if (detail.situation) |s| blk: {
-        const runners = try a.alloc([]const u8, s.runners.len);
-        for (s.runners, 0..) |runner, i| runners[i] = try a.dupe(u8, runner);
-        break :blk .{
-            .balls = s.balls,
-            .strikes = s.strikes,
-            .outs = s.outs,
-            .runners = runners,
-            .batter = try dupeOpt(a, s.batter),
-            .pitcher = try dupeOpt(a, s.pitcher),
-            .last_play = try dupeOpt(a, s.last_play),
-        };
-    } else null;
-    const decisions = try a.alloc(core.detail.Decision, detail.decisions.len);
-    for (detail.decisions, 0..) |d, i| {
-        decisions[i] = .{ .outcome = try a.dupe(u8, d.outcome), .name = try a.dupe(u8, d.name) };
-    }
-    const scoring_plays = try a.alloc(core.detail.ScoringPlay, detail.scoring_plays.len);
-    for (detail.scoring_plays, 0..) |play, i| {
-        scoring_plays[i] = .{
-            .period = try a.dupe(u8, play.period),
-            .text = try a.dupe(u8, play.text),
-            .away_score = try a.dupe(u8, play.away_score),
-            .home_score = try a.dupe(u8, play.home_score),
-        };
-    }
-    const leaders = try a.alloc([]const u8, detail.leaders.len);
-    for (detail.leaders, 0..) |leader, i| leaders[i] = try a.dupe(u8, leader);
-    return .{
-        .schema_version = try a.dupe(u8, detail.schema_version),
-        .id = try a.dupe(u8, detail.id),
-        .league = try a.dupe(u8, detail.league),
-        .league_name = try a.dupe(u8, detail.league_name),
-        .date = try a.dupe(u8, detail.date),
-        .state = try a.dupe(u8, detail.state),
-        .status = try a.dupe(u8, detail.status),
-        .venue = try dupeOpt(a, detail.venue),
-        .attendance = detail.attendance,
-        .series = try dupeOpt(a, detail.series),
-        .network = try dupeOpt(a, detail.network),
-        .participants = participants,
-        .situation = situation,
-        .decisions = decisions,
-        .scoring_plays = scoring_plays,
-        .leaders = leaders,
-    };
-}
-
-fn cloneGameRef(a: std.mem.Allocator, ref: core.schedule.GameRef) !core.schedule.GameRef {
-    return .{
-        .id = try a.dupe(u8, ref.id),
-        .date = try a.dupe(u8, ref.date),
-        .opponent_abbrev = try a.dupe(u8, ref.opponent_abbrev),
-        .opponent_name = try a.dupe(u8, ref.opponent_name),
-        .home_away = try a.dupe(u8, ref.home_away),
-        .status = try a.dupe(u8, ref.status),
-        .state = try a.dupe(u8, ref.state),
-        .our_score = try a.dupe(u8, ref.our_score),
-        .opp_score = try a.dupe(u8, ref.opp_score),
-        .result = try a.dupe(u8, ref.result),
-        .probable = try a.dupe(u8, ref.probable),
-    };
-}
-
-fn cloneGameRefOpt(a: std.mem.Allocator, ref: ?core.schedule.GameRef) !?core.schedule.GameRef {
-    const r = ref orelse return null;
-    return try cloneGameRef(a, r);
-}
-
-pub fn cloneTeamView(a: std.mem.Allocator, view: core.schedule.TeamView) !core.schedule.TeamView {
-    const next = try a.alloc(core.schedule.GameRef, view.next.len);
-    for (view.next, 0..) |ref, i| next[i] = try cloneGameRef(a, ref);
-    const last = try a.alloc(core.schedule.GameRef, view.last.len);
-    for (view.last, 0..) |ref, i| last[i] = try cloneGameRef(a, ref);
-    return .{
-        .schema_version = try a.dupe(u8, view.schema_version),
-        .league = try a.dupe(u8, view.league),
-        .league_name = try a.dupe(u8, view.league_name),
-        .team = .{
-            .id = try a.dupe(u8, view.team.id),
-            .abbrev = try a.dupe(u8, view.team.abbrev),
-            .name = try a.dupe(u8, view.team.name),
-            .record_summary = try dupeOpt(a, view.team.record_summary),
-            .standing_summary = try dupeOpt(a, view.team.standing_summary),
+/// Comptime deep-dupe over the cached `core` structs (NOT raw-body
+/// caching): the `FetchFn` seam returns normalized payloads borrowing the
+/// request arena, and every TTL/outcome decision reads the normalized
+/// content (`isLiveBoard`/`isLiveDetail`), so the cache must own
+/// normalized data. Storing raw ESPN bytes instead would re-run
+/// normalization on every hit and drag transport/response types into the
+/// cache — a bigger seam for zero TTL benefit. This single generic
+/// replaces the five hand-written `clone*` functions: strings and slices
+/// are duped, scalars copy, structs/unions recurse field-by-field. Any
+/// future cache payload made of plain data (slices, optionals, nested
+/// structs/unions, ints/bools/enums) clones with no new code; exotic
+/// shapes (sentinels, raw pointers, untagged unions) fail at comptime.
+pub fn clone(comptime T: type, a: std.mem.Allocator, value: T) !T {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => value,
+        .optional => |o| if (value) |v| try clone(o.child, a, v) else null,
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.sentinel_ptr != null) @compileError("clone: sentinel slices unsupported (" ++ @typeName(T) ++ ")");
+                if (p.child == u8) return try a.dupe(u8, value);
+                const out = try a.alloc(p.child, value.len);
+                for (out, value) |*dst, src| dst.* = try clone(p.child, a, src);
+                return out;
+            },
+            else => @compileError("clone: non-slice pointers unsupported (" ++ @typeName(T) ++ ")"),
         },
-        .last = last,
-        .next = next,
-        .live = try cloneGameRefOpt(a, view.live),
-    };
-}
-
-pub fn cloneStandings(a: std.mem.Allocator, st: core.standings.LeagueStandings) !core.standings.LeagueStandings {
-    const groups = try a.alloc(core.standings.StandingGroup, st.groups.len);
-    for (st.groups, 0..) |group, i| {
-        const entries = try a.alloc(core.standings.StandingEntry, group.entries.len);
-        for (group.entries, 0..) |entry, j| {
-            entries[j] = .{
-                .team_id = try a.dupe(u8, entry.team_id),
-                .abbrev = try a.dupe(u8, entry.abbrev),
-                .name = try a.dupe(u8, entry.name),
-                .wins = try dupeOpt(a, entry.wins),
-                .losses = try dupeOpt(a, entry.losses),
-                .ties = try dupeOpt(a, entry.ties),
-                .points = try dupeOpt(a, entry.points),
-            };
-        }
-        groups[i] = .{
-            .name = try a.dupe(u8, group.name),
-            .entries = entries,
-        };
-    }
-    return .{
-        .schema_version = try a.dupe(u8, st.schema_version),
-        .league = try a.dupe(u8, st.league),
-        .league_name = try a.dupe(u8, st.league_name),
-        .season = try a.dupe(u8, st.season),
-        .groups = groups,
-        .source = try a.dupe(u8, st.source),
-    };
-}
-
-pub fn cloneTeamList(a: std.mem.Allocator, list: core.schedule.TeamList) !core.schedule.TeamList {
-    const teams = try a.alloc(core.schedule.TeamListEntry, list.teams.len);
-    for (list.teams, 0..) |entry, i| {
-        teams[i] = .{
-            .id = try a.dupe(u8, entry.id),
-            .abbrev = try a.dupe(u8, entry.abbrev),
-            .name = try a.dupe(u8, entry.name),
-        };
-    }
-    return .{
-        .schema_version = try a.dupe(u8, list.schema_version),
-        .league = try a.dupe(u8, list.league),
-        .league_name = try a.dupe(u8, list.league_name),
-        .teams = teams,
-        .source = try a.dupe(u8, list.source),
-    };
-}
-
-fn cloneData(a: std.mem.Allocator, data: Data) !Data {
-    return switch (data) {
-        .board => |b| .{ .board = try cloneScoreboard(a, b) },
-        .detail => |d| .{ .detail = try cloneGameDetail(a, d) },
-        .team => |t| .{ .team = try cloneTeamView(a, t) },
-        .standings => |s| .{ .standings = try cloneStandings(a, s) },
-        .teams => |t| .{ .teams = try cloneTeamList(a, t) },
+        .array => |arr| {
+            var out: T = undefined;
+            for (&out, value) |*dst, src| dst.* = try clone(arr.child, a, src);
+            return out;
+        },
+        .@"struct" => |s| {
+            var out: T = undefined;
+            inline for (s.fields) |f| @field(out, f.name) = try clone(f.type, a, @field(value, f.name));
+            return out;
+        },
+        .@"union" => |u| {
+            const Tag = u.tag_type orelse @compileError("clone: untagged unions unsupported (" ++ @typeName(T) ++ ")");
+            inline for (u.fields) |f| {
+                if (value == @field(Tag, f.name)) return @unionInit(T, f.name, try clone(f.type, a, @field(value, f.name)));
+            }
+            unreachable;
+        },
+        else => @compileError("clone: unsupported type (" ++ @typeName(T) ++ ")"),
     };
 }
 
@@ -431,7 +267,7 @@ pub const NativeCache = struct {
         defer cache.mutex.unlock(cache.io);
         const entry = cache.map.get(key) orelse return null;
         if (at >= entry.fresh_until) return null;
-        return try cloneData(arena, entry.data);
+        return try clone(Data, arena, entry.data);
     }
 
     /// Stale hit (upstream-error fallback) clones into `arena`, or null.
@@ -440,7 +276,7 @@ pub const NativeCache = struct {
         defer cache.mutex.unlock(cache.io);
         const entry = cache.map.get(key) orelse return null;
         if (at >= entry.stale_until) return null;
-        return try cloneData(arena, entry.data);
+        return try clone(Data, arena, entry.data);
     }
 
     /// Stores a successful fetch, cloning it into cache-owned memory.
@@ -452,29 +288,8 @@ pub const NativeCache = struct {
         errdefer cache.allocator.destroy(store);
         store.* = std.heap.ArenaAllocator.init(cache.allocator);
         errdefer store.deinit();
-        const owned_key: Key = switch (key) {
-            .board => |b| .{ .board = .{
-                .slug = try store.allocator().dupe(u8, b.slug),
-                .day = try store.allocator().dupe(u8, b.day),
-                .live = b.live,
-            } },
-            .detail => |d| .{ .detail = .{
-                .slug = try store.allocator().dupe(u8, d.slug),
-                .id = try store.allocator().dupe(u8, d.id),
-                .live = d.live,
-            } },
-            .team => |t| .{ .team = .{
-                .slug = try store.allocator().dupe(u8, t.slug),
-                .abbr = try store.allocator().dupe(u8, t.abbr),
-            } },
-            .standings => |s| .{ .standings = .{
-                .slug = try store.allocator().dupe(u8, s.slug),
-            } },
-            .teams => |t| .{ .teams = .{
-                .slug = try store.allocator().dupe(u8, t.slug),
-            } },
-        };
-        const owned_data = try cloneData(store.allocator(), data);
+        const owned_key: Key = try clone(Key, store.allocator(), key);
+        const owned_data = try clone(Data, store.allocator(), data);
         const entry = Entry{
             .store = store,
             .data = owned_data,
@@ -649,7 +464,7 @@ const FakeBoard = struct {
         const self: *FakeBoard = @ptrCast(@alignCast(ctx));
         self.calls += 1;
         if (self.fail) return self.fail_err;
-        return .{ .board = try cloneScoreboard(arena, boardFixture()) };
+        return .{ .board = try clone(domain.Scoreboard, arena, boardFixture()) };
     }
 };
 
@@ -911,7 +726,7 @@ test "concurrent hammer stays consistent" {
         fn fetch(ctx: *anyopaque, a: std.mem.Allocator) anyerror!Data {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             _ = self.calls.fetchAdd(1, .seq_cst);
-            return .{ .board = try cloneScoreboard(a, FakeBoard.boardFixture()) };
+            return .{ .board = try clone(domain.Scoreboard, a, FakeBoard.boardFixture()) };
         }
         fn run(cache_ptr: *NativeCache, ctx: *anyopaque) void {
             var thread_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -959,7 +774,7 @@ test "standings entries use the schedule windows and survive the cache" {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             if (self.fail) return self.fail_err;
-            return .{ .standings = try cloneStandings(a, .{
+            return .{ .standings = try clone(core.standings.LeagueStandings, a, .{
                 .league = "nhl",
                 .league_name = "NHL",
                 .season = "2026",
@@ -1030,7 +845,7 @@ const StateDetailFake = struct {
     fn fetch(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Data {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.calls += 1;
-        return .{ .detail = try cloneGameDetail(arena, .{
+        return .{ .detail = try clone(core.detail.GameDetail, arena, .{
             .id = "9",
             .league = "mlb",
             .league_name = "MLB",

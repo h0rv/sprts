@@ -1,45 +1,22 @@
 const std = @import("std");
+const domain = @import("domain.zig");
 
 /// Provider-neutral per-game detail view. Baseball-first in spirit but every
 /// field name is sport-neutral (`period`, never `inning`).
-pub const DetailLineScore = struct {
-    period: ?i64 = null,
-    display: []const u8 = "",
+///
+/// Reunified: the line score is exactly `domain.LineScore` (identical
+/// shape — one period's score for one side); this alias keeps every
+/// `DetailLineScore` construction site compiling untouched.
+pub const DetailLineScore = domain.LineScore;
 
-    pub const jsonschema = .{
-        .name = "DetailLineScore",
-        .description = "One period's score for one side of a game.",
-    };
-};
-
-/// Detail-side participant. Identity fields mirror `domain.Participant`
-/// (`domain.Participant` itself is untouched); this struct only adds the
-/// per-period breakdown plus hits/errors/record/probable starter.
-pub const DetailParticipant = struct {
-    id: []const u8,
-    name: []const u8,
-    abbreviation: []const u8,
-    score: []const u8,
-    winner: bool,
-    home_away: ?[]const u8 = null,
-    lines: []const DetailLineScore = &.{},
-    hits: ?[]const u8 = null,
-    errors: ?[]const u8 = null,
-    record: ?[]const u8 = null,
-    probable: ?[]const u8 = null,
-
-    pub const jsonschema = .{
-        .name = "DetailParticipant",
-        .description = "One side of a game with its per-period breakdown.",
-        .fields = .{
-            .home_away = .{ .description = "The team-sport side when the provider supplies one." },
-            .hits = .{ .description = "Total hits (or sport equivalent) when the provider supplies them." },
-            .errors = .{ .description = "Total errors (or sport equivalent) when the provider supplies them." },
-            .record = .{ .description = "Overall record summary, e.g. \"88-56\"." },
-            .probable = .{ .description = "Probable starter name when the provider supplies one." },
-        },
-    };
-};
+/// Detail-side participant: exactly `domain.Participant` (identity fields
+/// plus the per-period breakdown and hits/errors/record/probable — the
+/// old mirror struct is reunified into the single scoreboard struct, so
+/// this alias keeps every `DetailParticipant` site compiling untouched).
+/// Wire change is additive-only: board payloads may now carry
+/// hits/errors/probable (null when unset), detail payloads may now carry
+/// `form` (null when unset); no field was renamed or removed.
+pub const DetailParticipant = domain.Participant;
 
 pub const DetailSituation = struct {
     balls: i64 = 0,
@@ -167,8 +144,8 @@ pub const DetailGame = struct {
 };
 
 test "detail structs carry jsonschema names" {
-    try std.testing.expectEqualStrings("DetailLineScore", DetailLineScore.jsonschema.name);
-    try std.testing.expectEqualStrings("DetailParticipant", DetailParticipant.jsonschema.name);
+    try std.testing.expectEqualStrings("LineScore", DetailLineScore.jsonschema.name);
+    try std.testing.expectEqualStrings("Participant", DetailParticipant.jsonschema.name);
     try std.testing.expectEqualStrings("DetailSituation", DetailSituation.jsonschema.name);
     try std.testing.expectEqualStrings("DetailDecision", DetailDecision.jsonschema.name);
     try std.testing.expectEqualStrings("DetailScoringPlay", DetailScoringPlay.jsonschema.name);

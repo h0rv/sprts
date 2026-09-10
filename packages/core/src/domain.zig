@@ -22,6 +22,13 @@ pub const Participant = struct {
     /// Recent-results string (e.g. soccer "WDDLD") when the provider
     /// supplies one; null otherwise.
     form: ?[]const u8 = null,
+    /// Detail-side extras (baseball totals, probable starters): null
+    /// unless the provider supplies them. These reunify the old
+    /// `detail.DetailParticipant` into this single struct — every field
+    /// stays optional, so both wire shapes only ever gain keys.
+    hits: ?[]const u8 = null,
+    errors: ?[]const u8 = null,
+    probable: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "Participant",
@@ -31,6 +38,9 @@ pub const Participant = struct {
             .record = .{ .description = "The win-loss style overall record when the provider supplies one." },
             .lines = .{ .description = "Per-period scores when the provider supplies them; empty otherwise." },
             .form = .{ .description = "Recent-results string (e.g. soccer WDDLD) when the provider supplies one." },
+            .hits = .{ .description = "Total hits (or sport equivalent) when the provider supplies them." },
+            .errors = .{ .description = "Total errors (or sport equivalent) when the provider supplies them." },
+            .probable = .{ .description = "Probable starter name when the provider supplies one." },
         },
     };
 };
@@ -81,78 +91,9 @@ pub const Scoreboard = struct {
     };
 };
 
-/// One scoring play inside a finished or live game.
-pub const ScoringPlay = struct {
-    period: []const u8 = "",
-    text: []const u8 = "",
-    away_score: i64 = 0,
-    home_score: i64 = 0,
-
-    pub const jsonschema = .{ .name = "ScoringPlay" };
-};
-
-/// Full detail for one game: the scoreboard row plus venue, scoring
-/// plays, and win/loss pitchers of record where the provider has them.
-pub const GameDetail = struct {
-    schema_version: []const u8 = "1",
-    league: []const u8,
-    league_name: []const u8,
-    id: []const u8,
-    name: []const u8,
-    date: []const u8,
-    state: []const u8,
-    status: []const u8,
-    venue: []const u8 = "",
-    attendance: i64 = 0,
-    winner: []const u8 = "",
-    loser: []const u8 = "",
-    participants: []const Participant = &.{},
-    scoring_plays: []const ScoringPlay = &.{},
-    source: []const u8 = "",
-
-    pub const jsonschema = .{
-        .name = "GameDetail",
-        .fields = .{
-            .schema_version = .{ .@"const" = "1" },
-            .date = .{ .format = "date" },
-        },
-    };
-};
-
-/// One game on a team's schedule: opponent, home/away, result or start.
-pub const ScheduleGame = struct {
-    id: []const u8 = "",
-    date: []const u8 = "",
-    opponent: []const u8 = "",
-    opponent_name: []const u8 = "",
-    home_away: []const u8 = "",
-    state: []const u8 = "",
-    status: []const u8 = "",
-    score_for: []const u8 = "",
-    score_against: []const u8 = "",
-    won: ?bool = null,
-
-    pub const jsonschema = .{
-        .name = "ScheduleGame",
-        .fields = .{ .date = .{ .format = "date-time" } },
-    };
-};
-
-/// A team page: identity plus last result and upcoming games.
-pub const TeamView = struct {
-    schema_version: []const u8 = "1",
-    league: []const u8,
-    league_name: []const u8,
-    team: []const u8 = "",
-    team_name: []const u8 = "",
-    record: []const u8 = "",
-    standing: []const u8 = "",
-    last: ?ScheduleGame = null,
-    next: []const ScheduleGame = &.{},
-    source: []const u8 = "",
-
-    pub const jsonschema = .{
-        .name = "TeamView",
-        .fields = .{ .schema_version = .{ .@"const" = "1" } },
-    };
-};
+// NOTE: game detail lives in exactly one place — `detail.GameDetail`
+// (`detail.zig`) — and team schedules in exactly one place —
+// `schedule.TeamView` / `schedule.GameRef` (`schedule.zig`). The older
+// `domain` duplicates (`ScoringPlay`, `GameDetail`, `ScheduleGame`,
+// `TeamView`) were removed; nothing on the wire lost a field, the live
+// structs only ever gain optional keys.

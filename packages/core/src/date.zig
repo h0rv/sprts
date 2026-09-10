@@ -6,12 +6,7 @@ pub fn validate(value: []const u8) bool {
     const month = std.fmt.parseInt(u4, value[5..7], 10) catch return false;
     const day = std.fmt.parseInt(u5, value[8..10], 10) catch return false;
     if (year < 1970 or month < 1 or month > 12 or day < 1) return false;
-    const max_day: u5 = switch (month) {
-        2 => if (isLeap(year)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-    return day <= max_day;
+    return day <= std.time.epoch.getDaysInMonth(year, @enumFromInt(month));
 }
 
 /// Lowercase-exact relative date tokens accepted in `?date=` alongside
@@ -111,16 +106,10 @@ pub fn parseTimestampUTC(value: []const u8) ?i64 {
         @as(i64, minute) * std.time.s_per_min + seconds;
 }
 
-/// Year (e.g. 2026) containing this epoch day (days since 1970-01-01).
+/// Year (e.g. 2026) containing this epoch day (days since 1970-01-01),
+/// via `std.time.epoch` (same std math `fromEpochDay` uses below).
 fn yearOfEpochDay(epoch_day: i64) u16 {
-    var day = epoch_day;
-    var year: u16 = 1970;
-    while (true) {
-        const len: i64 = if (isLeap(year)) 366 else 365;
-        if (day < len) return year;
-        day -= len;
-        year += 1;
-    }
+    return (std.time.epoch.EpochDay{ .day = @intCast(epoch_day) }).calculateYearDay().year;
 }
 
 /// Epoch day of the nth Sunday of March (DST start month).
@@ -141,14 +130,18 @@ fn nthSundayOfMonth(year: u16, month: u4, n: u8) i64 {
     return first_day + days_to_first_sunday + @as(i64, n - 1) * 7;
 }
 
+/// Days since 1970-01-01 for a calendar date: Howard Hinnant's
+/// days_from_civil (branchless civil-date math, no year/month loops).
+/// Callers pass years >= 1970 (`validate` enforces it), so the result
+/// is always >= 0.
 fn epochDayOfDate(year: u16, month: u4, day: u5) i64 {
-    var total: i64 = 0;
-    var y: u16 = 1970;
-    while (y < year) : (y += 1) total += if (isLeap(y)) 366 else 365;
-    var m: u4 = 1;
-    while (m < month) : (m += 1) total += daysInMonth(year, m);
-    total += day - 1;
-    return total;
+    const y: i64 = @as(i64, year) - @as(i64, if (month <= 2) 1 else 0);
+    const era: i64 = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400; // [0, 399]
+    const mp: i64 = @mod(@as(i64, month) + 9, 12); // Mar=0 .. Feb=11
+    const doy: i64 = @divFloor(153 * mp + 2, 5) + @as(i64, day) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468; // 719468 = days 0000-03-01 to 1970-01-01
 }
 
 pub fn shift(allocator: std.mem.Allocator, value: []const u8, delta: i32) ![]u8 {
@@ -163,13 +156,7 @@ fn toEpochDay(value: []const u8) !u47 {
     const year = try std.fmt.parseInt(u16, value[0..4], 10);
     const month = try std.fmt.parseInt(u4, value[5..7], 10);
     const day = try std.fmt.parseInt(u5, value[8..10], 10);
-    var total: u47 = 0;
-    var y: u16 = 1970;
-    while (y < year) : (y += 1) total += if (isLeap(y)) 366 else 365;
-    var m: u4 = 1;
-    while (m < month) : (m += 1) total += daysInMonth(year, m);
-    total += day - 1;
-    return total;
+    return @intCast(epochDayOfDate(year, month, day));
 }
 
 fn fromEpochDay(allocator: std.mem.Allocator, epoch_day: u47) ![]u8 {
@@ -177,18 +164,6 @@ fn fromEpochDay(allocator: std.mem.Allocator, epoch_day: u47) ![]u8 {
     const yd = ed.calculateYearDay();
     const md = yd.calculateMonthDay();
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), md.day_index + 1 });
-}
-
-fn isLeap(year: u16) bool {
-    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
-}
-
-fn daysInMonth(year: u16, month: u4) u5 {
-    return switch (month) {
-        2 => if (isLeap(year)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
 }
 
 test "dates validate and shift across leap day" {
