@@ -7,3 +7,4 @@ apps/server/zig-pkg/
 node_modules/
 .wrangler/
 .dev.vars
+data/

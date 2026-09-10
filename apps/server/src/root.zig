@@ -1,4 +1,5 @@
 pub const provider = @import("provider.zig");
+pub const nflverse = @import("nflverse.zig");
 pub const render = @import("render.zig");
 pub const detail_view = @import("detail_view.zig");
 pub const router = @import("router.zig");
@@ -16,6 +17,7 @@ pub const tour = @import("tour.zig");
 
 test {
     _ = provider;
+    _ = nflverse;
     _ = render;
     _ = detail_view;
     _ = router;

@@ -1,0 +1,25 @@
+#!/bin/sh
+# fetch-nflverse — refresh the nflverse games.csv snapshot for the NFL fallback.
+#
+# nflverse-data (https://github.com/nflverse/nflverse-data) is CC-BY-4.0,
+# updated daily in-season with same-day latency (NOT live). The server never
+# downloads per-request: this sidecar refreshes data/nflverse/games.csv and
+# bumps data/nflverse/timestamp.txt afterwards, and the server re-parses the
+# CSV only when the stamp changes (see apps/server/src/nflverse.zig).
+#
+# Run daily in-season, e.g.:
+#   0 12 * * * SPRTS_NFLVERSE_DIR=/srv/sprts/nflverse /srv/sprts/tools/fetch-nflverse
+#
+# Env: SPRTS_NFLVERSE_DIR (default data/nflverse, relative to the repo root).
+set -eu
+
+DIR="${SPRTS_NFLVERSE_DIR:-data/nflverse}"
+URL="https://github.com/nflverse/nflverse-data/releases/download/games/games.csv"
+
+mkdir -p "$DIR"
+tmp="$DIR/games.csv.tmp"
+trap 'rm -f "$tmp"' EXIT INT TERM
+curl -fsSL --retry 3 "$URL" -o "$tmp"
+mv "$tmp" "$DIR/games.csv"
+date -u +%F > "$DIR/timestamp.txt"
+echo "nflverse snapshot refreshed: $DIR/games.csv ($(date -u +%F))"
