@@ -170,16 +170,6 @@ test "standings text hides the points column when no entry has points" {
     try std.testing.expect(std.mem.indexOf(u8, output, "80-63") != null);
 }
 
-/// A separator rule is nothing but ─ cells (3 bytes each).
-fn isSeparator(line: []const u8) bool {
-    if (line.len == 0 or line.len % 3 != 0) return false;
-    var i: usize = 0;
-    while (i < line.len) : (i += 3) {
-        if (!std.mem.eql(u8, line[i..][0..3], "─")) return false;
-    }
-    return true;
-}
-
 test "standings text rows fit the page and honor height" {
     for ([_]u16{ 52, 80, 200 }) |width| {
         const output = try text(std.testing.allocator, testStandings(), false, width, null);
@@ -189,7 +179,7 @@ test "standings text rows fit the page and honor height" {
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             // Separator spans the requested width; content never exceeds it.
-            if (isSeparator(line)) {
+            if (table.isRuleLine(line)) {
                 try std.testing.expectEqual(table.textCells(line), width);
             } else {
                 try std.testing.expect(table.textCells(line) <= width);
@@ -303,67 +293,17 @@ test "standings renders no team marks in text or HTML" {
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
 }
 
-/// Strip every `<...>` tag: what remains is the page's visible text.
-fn stripHtmlTags(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var in_tag = false;
-    for (s) |c| {
-        if (in_tag) {
-            if (c == '>') in_tag = false;
-            continue;
-        }
-        if (c == '<') {
-            in_tag = true;
-            continue;
-        }
-        try out.writer.writeByte(c);
-    }
-    return out.toOwnedSlice();
-}
-
-/// Unescape the five entities `render.escapeInto` emits. Single pass so
-/// `&amp;lt;` never double-decodes.
-fn unescapeHtml(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == '&') {
-            inline for (.{ .{ "&amp;", "&" }, .{ "&lt;", "<" }, .{ "&gt;", ">" }, .{ "&quot;", "\"" }, .{ "&#39;", "'" } }) |pair| {
-                if (std.mem.startsWith(u8, s[i..], pair[0])) {
-                    try out.writer.writeAll(pair[1]);
-                    i += pair[0].len;
-                    break;
-                }
-            } else {
-                try out.writer.writeByte(s[i]);
-                i += 1;
-            }
-            continue;
-        }
-        try out.writer.writeByte(s[i]);
-        i += 1;
-    }
-    return out.toOwnedSlice();
-}
-
 test "standings HTML visible text equals the text output" {
     // `html()` derives from `text(color=false)` (same shared composer
     // via `view.entryRows`): only invisible tags separate them, so the
-    // `<pre>` block with tags stripped and entities unescaped reads back
-    // byte for byte. Inline fixture only, never live ESPN.
+    // visible `<pre>` text reads back byte for byte. Inline fixture
+    // only, never live ESPN.
     const st = testStandings();
     const body = try text(std.testing.allocator, st, false, null, null);
     defer std.testing.allocator.free(body);
     const page = try html(std.testing.allocator, st, null, null);
     defer std.testing.allocator.free(page);
-    const pre_open = std.mem.indexOf(u8, page, "<pre>").? + "<pre>".len;
-    const pre_close = std.mem.indexOf(u8, page, "</pre>").?;
-    try std.testing.expect(pre_open <= pre_close);
-    const stripped = try stripHtmlTags(std.testing.allocator, page[pre_open..pre_close]);
-    defer std.testing.allocator.free(stripped);
-    const visible = try unescapeHtml(std.testing.allocator, stripped);
+    const visible = try view.expectVisibleParity(std.testing.allocator, page);
     defer std.testing.allocator.free(visible);
     try std.testing.expectEqualStrings(body, visible);
 }

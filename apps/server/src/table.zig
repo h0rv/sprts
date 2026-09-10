@@ -23,9 +23,9 @@
 //! zero-width and skipped by `countCells` (used only for mark geometry, and
 //! by `writeArtRow`/`writeGameMarks` which render trusted embedded marks,
 //! never ESPN strings). Interior blank rows inside a mark are preserved as
-//! blank cells: dropping them (as the old inline copy did) vertically
-//! compresses disconnected logos (e.g. MLS ATX/HOU xs marks); only the
-//! single trailing empty from the file's final newline is skipped.
+//! blank cells: dropping them vertically compresses disconnected logos
+//! (e.g. MLS ATX/HOU xs marks); only the single trailing empty from the
+//! file's final newline is skipped.
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -559,6 +559,18 @@ pub fn writeSeparator(w: *std.Io.Writer, width: usize) !void {
     try w.writeByte('\n');
 }
 
+/// A separator rule is nothing but ─ cells (3 bytes each): headings,
+/// statuses, and art never consist solely of them, so content rows cannot
+/// be mistaken for rules. The one detector every view shares.
+pub fn isRuleLine(line: []const u8) bool {
+    if (line.len == 0 or line.len % 3 != 0) return false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 3) {
+        if (!std.mem.eql(u8, line[i..][0..3], "─")) return false;
+    }
+    return true;
+}
+
 /// Both teams' marks side by side at `.xs`: a horizontal card instead of
 /// a tall stacked block. A side with no mark is skipped; if the pair is
 /// wider than the box, the marks stack vertically. When `color` is set and
@@ -853,163 +865,6 @@ test "hardened battery: checked-in marks render within width" {
     try std.testing.expect(widest * 2 + 2 <= 48);
 }
 
-// --- Byte-parity with the pre-consolidation render.zig (HEAD): OLD copies
-// verbatim, asserting identical bytes on sanitization-free inputs. ---
-const OldRule = enum { top, mid, bottom };
-fn oldWriteRule(w: *std.Io.Writer, which: OldRule, inner: usize) !void {
-    const left: []const u8 = switch (which) {
-        .top => "┌",
-        .mid => "├",
-        .bottom => "└",
-    };
-    const right: []const u8 = switch (which) {
-        .top => "┐\n",
-        .mid => "┤\n",
-        .bottom => "┘\n",
-    };
-    try w.writeAll(left);
-    var i: usize = 0;
-    while (i < inner) : (i += 1) try w.writeAll("─");
-    try w.writeAll(right);
-}
-fn oldFit(s: []const u8, width: usize) struct { usize, bool } {
-    if (s.len <= width) return .{ s.len, false };
-    if (width < 4) return .{ 0, true };
-    var end: usize = width - 3;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return .{ end, true };
-}
-fn oldCountVisibleCells(line: []const u8) usize {
-    var cells: usize = 0;
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == 0x1b and i + 1 < line.len and line[i + 1] == '[') {
-            var j = i + 2;
-            while (j < line.len and line[j] != 'm') : (j += 1) {}
-            i = if (j < line.len) j + 1 else line.len;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
-            cells += 1;
-            i += 1;
-            continue;
-        };
-        cells += 1;
-        i += len;
-    }
-    return cells;
-}
-fn oldWriteCell(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = oldFit(s, width);
-    const use_color = color and code != null;
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-    const n_written: usize = oldCountVisibleCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
-    var i: usize = n_written;
-    while (i < width) : (i += 1) try w.writeByte(' ');
-}
-fn oldWriteCellRight(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    const end, const ellipsis = oldFit(s, width);
-    const use_color = color and code != null;
-    const n_written: usize = oldCountVisibleCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
-    var spaces: usize = width -| n_written;
-    while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
-    if (use_color) try w.print("\x1b[{s}m", .{code.?});
-    try w.writeAll(s[0..end]);
-    if (ellipsis) try w.writeAll("…");
-    if (use_color) try w.writeAll("\x1b[0m");
-}
-fn oldWriteRow(w: *std.Io.Writer, s: []const u8, width: usize, code: ?[]const u8, color: bool) !void {
-    try w.writeAll("│ ");
-    try oldWriteCell(w, s, width, code, color);
-    try w.writeAll(" │\n");
-}
-
-test "parity: rules, cells, rows, fit match pre-consolidation render" {
-    const parity_fixtures = [_][]const u8{
-        "Final",           "Top 7th",             "MLB  2026-09-06", "Away",     "Philadelphia Phillies",
-        "Atlético Madrid Club de Fútbol with extra",
-        "Hülkenberg",
-        "Nico Hülkenberg",
-        "Charles Leclerc", "69-74",               "2",               "5",        "AWY",
-        "",                "No games scheduled.", "+1 more",         "LIVE NOW", "TODAY",
-        "ALL LEAGUES",
-    };
-    for ([3]usize{ 50, 78, 198 }) |inner| {
-        for ([3]OldRule{ .top, .mid, .bottom }) |r| {
-            var a: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer a.deinit();
-            try oldWriteRule(&a.writer, r, inner);
-            const as = try a.toOwnedSlice();
-            defer std.testing.allocator.free(as);
-            var b: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer b.deinit();
-            try writeRule(&b.writer, @as(Rule, @enumFromInt(@intFromEnum(r))), inner);
-            const bs = try b.toOwnedSlice();
-            defer std.testing.allocator.free(bs);
-            try std.testing.expectEqualStrings(as, bs);
-        }
-    }
-    for (parity_fixtures) |s| {
-        for ([_]usize{ 0, 1, 2, 3, 4, 5, 8, 13, 34, 36, 44, 48 }) |w| {
-            const oe, const ob = oldFit(s, w);
-            const ne, const nb = fit(s, w);
-            try std.testing.expectEqual(oe, ne);
-            try std.testing.expectEqual(ob, nb);
-        }
-    }
-    for (parity_fixtures) |s| {
-        for ([_]usize{ 0, 1, 3, 4, 5, 13, 34, 48 }) |w| {
-            for ([2]bool{ false, true }) |color| {
-                for ([_]?[]const u8{ null, "2", "32", "1;31" }) |code| {
-                    var a: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer a.deinit();
-                    try oldWriteCell(&a.writer, s, w, code, color);
-                    const as = try a.toOwnedSlice();
-                    defer std.testing.allocator.free(as);
-                    var b: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer b.deinit();
-                    try writeCell(&b.writer, s, w, code, color);
-                    const bs = try b.toOwnedSlice();
-                    defer std.testing.allocator.free(bs);
-                    try std.testing.expectEqualStrings(as, bs);
-
-                    var c: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer c.deinit();
-                    try oldWriteCellRight(&c.writer, s, w, code, color);
-                    const cs = try c.toOwnedSlice();
-                    defer std.testing.allocator.free(cs);
-                    var d: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer d.deinit();
-                    try writeCellRight(&d.writer, s, w, code, color);
-                    const ds = try d.toOwnedSlice();
-                    defer std.testing.allocator.free(ds);
-                    try std.testing.expectEqualStrings(cs, ds);
-
-                    var e: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer e.deinit();
-                    try oldWriteRow(&e.writer, s, w, code, color);
-                    const es = try e.toOwnedSlice();
-                    defer std.testing.allocator.free(es);
-                    var f: std.Io.Writer.Allocating = .init(std.testing.allocator);
-                    defer f.deinit();
-                    try writeRow(&f.writer, s, w, code, color);
-                    const fs = try f.toOwnedSlice();
-                    defer std.testing.allocator.free(fs);
-                    try std.testing.expectEqualStrings(es, fs);
-                }
-            }
-        }
-    }
-    try std.testing.expectEqual(oldCountVisibleCells("⣠⣴⣶"), countCells("⣠⣴⣶"));
-    try std.testing.expectEqual(
-        oldCountVisibleCells("\x1b[38;5;196m⣠\x1b[0m⣴"),
-        countCells("\x1b[38;5;196m⣠\x1b[0m⣴"),
-    );
-}
-
 // True when a line carries braille cells anywhere (not just leading):
 // pair rows can open with padding when one side's row is short.
 fn hasBraille(line: []const u8) bool {
@@ -1020,13 +875,7 @@ fn hasBraille(line: []const u8) bool {
     return false;
 }
 
-test "hardened battery: interior blank mark rows survive the card" { // Pair choice (2026-09): the MLS ATX/HOU xs marks this test pinned were
-    // legitimately regenerated with NO interior blanks (4 solid rows each),
-    // so they can no longer prove blank preservation. Of all checked-in xs
-    // marks, only the ALCN marks (ncaaf/ncaam/ncaaw) carry an interior blank
-    // line, so this test pairs NCAAF ALCN (blank inside) with NCAAF ALA
-    // (solid). The old inline copy dropped every empty split line,
-    // compressing the logo; the shared path preserves them as blank cells.
+test "hardened battery: interior blank mark rows survive the card" { // Only the ALCN xs marks carry an interior blank, so ALCN pairs with solid ALA.
     const league = "ncaaf";
     const board: domain.Scoreboard = .{
         .league = league,
@@ -1106,9 +955,8 @@ test "hardened battery: interior blank mark rows survive the card" { // Pair cho
     for (0..card.items.len) |r| {
         // Each side's row r renders inside card row r (left field, gap,
         // right field), so a solid mark row is a byte substring of its own
-        // card row: every row sits at its own index, including the rows
-        // around a blank, rather than shifting up into a dropped blank
-        // (the old inline copy dropped blanks, compressing the logo).
+        // card row: every row sits at its own index, never shifting up
+        // into a dropped blank.
         if (r < left_rows.items.len and left_rows.items[r].len > 0)
             try std.testing.expect(std.mem.indexOf(u8, card.items[r], left_rows.items[r]) != null);
         if (r < right_rows.items.len and right_rows.items[r].len > 0)
@@ -1116,8 +964,8 @@ test "hardened battery: interior blank mark rows survive the card" { // Pair cho
         // An interior blank renders as blank cells, not as a dropped row:
         // the first left_width CELLS of its card row are all spaces. Walk
         // cells, not bytes — braille is 3 bytes per cell, so a byte prefix
-        // would lie. Under the old dropping behavior this slot holds the
-        // next solid row (braille first) and the walk fails.
+        // would lie. If blanks were dropped, this slot holds the next
+        // solid row (braille first) and the walk fails.
         if (r < left_rows.items.len and left_rows.items[r].len == 0 and r > 0 and r + 1 < left_rows.items.len) {
             var cells: usize = 0;
             var bi: usize = 0;
@@ -1131,8 +979,6 @@ test "hardened battery: interior blank mark rows survive the card" { // Pair cho
         }
     }
 }
-
-// (hasBraille above; the old inline scan documented the E2 ranges here.)
 
 test "dark logo ink is filtered for terminal contrast" {
     // Near-black (xterm 16) is dropped, readable red kept, resets pass

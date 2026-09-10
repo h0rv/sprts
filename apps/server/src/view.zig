@@ -1,12 +1,9 @@
-//! Shared view-layer section composers + format emitters: the ONE place
-//! that turns provider data into fitted, column-aligned row strings over
-//! the `table.zig` primitives.
-//!
-//! Target: every view module (`render`, `detail_view`, `team_view`,
-//! `standings_view`, `digest`) composes plain strings here and emits them
-//! through `emitText`/`emitHtml`, which reuse the `table.zig`/`render.zig`
-//! primitives. Composers return plain strings with `color = false`; color
-//! wraps at emit time, never inside. No per-view IR, no JSON changes.
+//! Shared view-layer section composers: the ONE place that turns provider
+//! data into fitted, column-aligned row strings over the `table.zig`
+//! primitives. Every view module (`render`, `detail_view`, `team_view`,
+//! `standings_view`, `digest`) composes plain strings here; renderers own
+//! emit. Composers return plain strings with `color = false`; color wraps
+//! at emit time, never inside. No per-view IR, no JSON changes.
 //!
 //! Shape: every composer builds rows with color disabled; color, links,
 //! and headings ride at emit time, so text and HTML can never drift. A
@@ -18,11 +15,6 @@
 //! column geometry (which column flexes, which shares a right edge).
 //! Renderers own emit (ANSI spans, `<a>`/`<span>` wrapping, blank-line
 //! breathing, overflow trailers, `?height` slicing).
-//!
-//! History: `Section` + thin `emitText`/`emitHtml` wrappers, then
-//! standings `entryRows`/`hasPoints` (verbatim move from
-//! `standings_view.zig`), then the detail/team composers (verbatim move
-//! from the retired `view_detail.zig`, which this module absorbs).
 
 const std = @import("std");
 const core = @import("sprts_core");
@@ -30,7 +22,6 @@ const standings = core.standings;
 const detail = core.detail;
 const domain = core.domain;
 const schedule = core.schedule;
-const render = @import("render.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
 
@@ -54,53 +45,7 @@ pub fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     allocator.free(lines);
 }
 
-/// Text emitter: dim heading, one separator rule, then one fitted line
-/// per row. Thin wrapper over `table.writeLine`/`table.writeSeparator`.
-pub fn emitText(
-    allocator: std.mem.Allocator,
-    section: Section,
-    cols: usize,
-    color: bool,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-    if (section.heading) |heading| {
-        try table.writeLine(w, heading, cols, "2", color);
-        try table.writeSeparator(w, cols);
-    }
-    for (section.rows) |row| {
-        try table.writeLine(w, row, cols, null, color);
-    }
-    return out.toOwnedSlice();
-}
-
-/// HTML emitter: page head titled by the heading, the heading as `<h1>`,
-/// one escaped line per row, then the shared page close. Thin wrapper
-/// over `render.pageHead`/`render.writeHtmlH1`/`render.writeHtmlLine`/
-/// `render.closePageWithNav`.
-pub fn emitHtml(
-    allocator: std.mem.Allocator,
-    section: Section,
-    cols: usize,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-    try render.pageHead(w, section.heading orelse "");
-    if (section.heading) |heading| {
-        try render.writeHtmlH1(w, allocator, heading, cols, "dim");
-    }
-    for (section.rows) |row| {
-        try render.writeHtmlLine(w, allocator, row, cols, null, null);
-    }
-    try w.writeAll("</pre><nav>");
-    try render.closePageWithNav(w);
-    return out.toOwnedSlice();
-}
-
 /// True when at least one entry anywhere carries points (hockey, soccer).
-/// Verbatim move of `standings_view.countPoints`.
 pub fn hasPoints(st: standings.LeagueStandings) bool {
     for (st.groups) |group| {
         for (group.entries) |entry| {
@@ -111,8 +56,7 @@ pub fn hasPoints(st: standings.LeagueStandings) bool {
 }
 
 /// One composed standings entry row (`color = false`, trailing blanks
-/// trimmed, no newline). Verbatim move of `standings_view.writeEntryRow`'s
-/// composition; the caller writes the row plus `'\n'`.
+/// trimmed, no newline); the caller writes the row plus `'\n'`.
 pub fn entryRow(
     allocator: std.mem.Allocator,
     entry: standings.StandingEntry,
@@ -167,55 +111,6 @@ pub fn entryRows(
         try out.append(allocator, try entryRow(allocator, entry, cols, points_col));
     }
     return out.toOwnedSlice(allocator);
-}
-
-test "view emitText behaves like the table primitives" {
-    const raw_rows = [_][]const u8{ "BOS  Boston Bruins 38-14-9   85", "BUF  Buffalo Sabres 30-25   68" };
-    const heading = try std.testing.allocator.dupe(u8, "NHL standings  2026");
-    defer std.testing.allocator.free(heading);
-    var owned_rows: [raw_rows.len][]u8 = undefined;
-    for (raw_rows, 0..) |raw, i| owned_rows[i] = try std.testing.allocator.dupe(u8, raw);
-    defer {
-        for (owned_rows) |row| std.testing.allocator.free(row);
-    }
-    const section: Section = .{ .heading = heading, .rows = &owned_rows };
-    const got = try emitText(std.testing.allocator, section, 52, false);
-    defer std.testing.allocator.free(got);
-    var want: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer want.deinit();
-    try table.writeLine(&want.writer, section.heading.?, 52, "2", false);
-    try table.writeSeparator(&want.writer, 52);
-    for (raw_rows) |row| try table.writeLine(&want.writer, row, 52, null, false);
-    const expected = try want.toOwnedSlice();
-    defer std.testing.allocator.free(expected);
-    try std.testing.expectEqualStrings(expected, got);
-    _ = try std.unicode.Utf8View.init(got);
-}
-
-test "view emitHtml behaves like the render primitives" {
-    const raw_rows = [_][]const u8{"BOS  Boston Bruins 38-14-9   85"};
-    const heading = try std.testing.allocator.dupe(u8, "NHL standings");
-    defer std.testing.allocator.free(heading);
-    var owned_rows: [raw_rows.len][]u8 = undefined;
-    for (raw_rows, 0..) |raw, i| owned_rows[i] = try std.testing.allocator.dupe(u8, raw);
-    defer {
-        for (owned_rows) |row| std.testing.allocator.free(row);
-    }
-    const section: Section = .{ .heading = heading, .rows = &owned_rows };
-    const got = try emitHtml(std.testing.allocator, section, 52);
-    defer std.testing.allocator.free(got);
-    var want: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer want.deinit();
-    try render.pageHead(&want.writer, section.heading.?);
-    try render.writeHtmlH1(&want.writer, std.testing.allocator, section.heading.?, 52, "dim");
-    for (raw_rows) |row| try render.writeHtmlLine(&want.writer, std.testing.allocator, row, 52, null, null);
-    try want.writer.writeAll("</pre><nav>");
-    try render.closePageWithNav(&want.writer);
-    const expected = try want.toOwnedSlice();
-    defer std.testing.allocator.free(expected);
-    try std.testing.expectEqualStrings(expected, got);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\x1b[") == null);
-    _ = try std.unicode.Utf8View.init(got);
 }
 
 test "view entryRows carry records, ties legs, and the points column" {
@@ -652,10 +547,7 @@ pub fn leadersSection(
     };
 }
 
-// --- Team schedule composers (same shapes): record/standing lines,
-// game rows, and the fit-then-trim document line. Moved here from
-// `team_view` so Today/Last/Next overflow and the live row share one
-// geometry with the detail sections above. ---
+// --- Team schedule composers: one shared geometry for Today/Last/Next overflow and the live row. ---
 
 /// Record/standing header line (`{record}  {standing}`, each half
 /// omitted when absent). Null when the team carries neither, so callers
@@ -783,6 +675,31 @@ pub fn stripHtmlVisible(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
         i += 1;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Visible text of a page's `<pre>` block, line for line via
+/// `stripHtmlVisible`: the parity surface the text and HTML emitters must
+/// agree on. Lines join with `'\n'` and no trailing newline, mirroring
+/// the text bodies. Errors when the page carries no well-formed `<pre>`
+/// block, so callers get the visible string (or a hard failure) instead
+/// of re-deriving tag-stripping loops per view. Test helper only.
+pub fn expectVisibleParity(allocator: std.mem.Allocator, page: []const u8) ![]u8 {
+    const pre_open = std.mem.indexOf(u8, page, "<pre") orelse return error.TestUnexpectedResult;
+    const pre_gt = std.mem.indexOfScalarPos(u8, page, pre_open, '>') orelse return error.TestUnexpectedResult;
+    const pre_close = std.mem.indexOf(u8, page, "</pre>") orelse return error.TestUnexpectedResult;
+    if (pre_gt >= pre_close) return error.TestUnexpectedResult;
+    var visible: std.Io.Writer.Allocating = .init(allocator);
+    errdefer visible.deinit();
+    var raw = std.mem.splitScalar(u8, page[pre_gt + 1 .. pre_close], '\n');
+    var first = true;
+    while (raw.next()) |line| {
+        const clean = try stripHtmlVisible(allocator, line);
+        defer allocator.free(clean);
+        if (!first) try visible.writer.writeByte('\n');
+        first = false;
+        try visible.writer.writeAll(clean);
+    }
+    return visible.toOwnedSlice();
 }
 
 fn hostileParticipants() [2]detail.DetailParticipant {
@@ -987,14 +904,9 @@ test "team composers keep record, game, and fit semantics" {
     try std.testing.expectEqualStrings("A & B <ace>", vis);
 }
 
-// --- Scoreboard/home/digest composers (Phases 4-5): the row strings
-// behind `render.textWithZoneArt` (scoreboard), `render.homeSections`
-// (live home text+HTML), and the digest heading/markers. Verbatim moves
-// from `render.zig` (`scoreParticipantLine`, the home `gameLine` family,
-// `statusColor`/`stateClass`); renderers own emit (winner tint, links,
-// art rows, rules, trailers) and call these for composition, so text
-// and HTML can never drift. Composers return plain strings with
-// `color = false`; color wraps at emit time, never inside.
+// --- Scoreboard/home/digest composers: row strings behind the scoreboard,
+// home, and digest sections. Renderers own emit; composers stay plain
+// (`color = false`) so text and HTML can never drift. ---
 
 /// Scoreboard heading: `{League}  {date} {zone}`. Shared by text and
 /// HTML (via the text body the linkifier post-passes).

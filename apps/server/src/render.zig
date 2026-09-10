@@ -915,7 +915,7 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
             try w.writeByte('\n');
             continue;
         }
-        if (isRuleLine(line)) {
+        if (table.isRuleLine(line)) {
             try escapeInto(w, line);
             try w.writeByte('\n');
             if (current != null and game_idx >= shown) {
@@ -1001,16 +1001,6 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
     }
 }
 
-/// A separator rule is nothing but ─ cells: headings, statuses, and art
-/// never consist solely of them, so rows cannot be mistaken for rules.
-fn isRuleLine(line: []const u8) bool {
-    if (line.len == 0 or line.len % 3 != 0) return false;
-    var i: usize = 0;
-    while (i < line.len) : (i += 3) {
-        if (!std.mem.eql(u8, line[i..][0..3], "─")) return false;
-    }
-    return true;
-}
 /// Status (or name-only) row for one game: the trimmed line becomes the
 /// game link and carries the per-game anchor id. Made `with_id` so a
 /// caller can reuse the wrapper for rows that already live inside a

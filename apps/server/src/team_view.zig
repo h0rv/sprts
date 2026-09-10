@@ -1149,18 +1149,7 @@ test "hostile team schedule reads identically in text and HTML" {
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b") == null);
     // Visible HTML: the `<pre>` block with tags stripped and entities
     // unescaped, line for line.
-    const pre_open = std.mem.indexOf(u8, page, "<pre>") orelse return error.TestUnexpectedResult;
-    const pre_close = std.mem.indexOf(u8, page, "</pre>") orelse return error.TestUnexpectedResult;
-    var visible: std.Io.Writer.Allocating = .init(arena);
-    defer visible.deinit();
-    var raw = std.mem.splitScalar(u8, page[pre_open + "<pre>".len .. pre_close], '\n');
-    while (raw.next()) |line| {
-        const clean = try vd.stripHtmlVisible(arena, line);
-        defer arena.free(clean);
-        try visible.writer.writeAll(clean);
-        try visible.writer.writeByte('\n');
-    }
-    const seen = try visible.toOwnedSlice();
+    const seen = try vd.expectVisibleParity(arena, page);
     defer arena.free(seen);
     // Header and record ride the shared composers: identical folds.
     const tag = try zoneTag(arena, view);
@@ -1295,18 +1284,7 @@ test "family soccer team view renders draws, standing, and links in text and HTM
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     // Visible-text parity on the shared rows: record line plus both
     // schedule rows read identically after the pointer/link fold.
-    const pre_open = std.mem.indexOf(u8, page, "<pre>").?;
-    const pre_close = std.mem.indexOf(u8, page, "</pre>").?;
-    var visible: std.Io.Writer.Allocating = .init(arena);
-    defer visible.deinit();
-    var raw = std.mem.splitScalar(u8, page[pre_open + "<pre>".len .. pre_close], '\n');
-    while (raw.next()) |line| {
-        const clean = try vd.stripHtmlVisible(arena, line);
-        defer arena.free(clean);
-        try visible.writer.writeAll(clean);
-        try visible.writer.writeByte('\n');
-    }
-    const seen = try visible.toOwnedSlice();
+    const seen = try vd.expectVisibleParity(arena, page);
     defer arena.free(seen);
     const rec = try vd.recordStandingsLine(arena, team_view.team.record_summary, team_view.team.standing_summary);
     defer if (rec) |line| arena.free(line);
