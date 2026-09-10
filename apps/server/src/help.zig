@@ -141,8 +141,9 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  /{league}?week=N               football week only, ignored elsewhere
         \\  /{league}/{id}                 one game (all digits = game, else team)
         \\  /{league}/{abbr}               one team, e.g. /mlb/phi
-        \\  /{league}/{date}/{away}-{home} game by date+teams, redirects, e.g. /mlb/2026-09-09/min-det
-        \\  /{league}/{YYYY}/week{N}/{a}-{h} football week game, redirects, e.g. /nfl/2026/week1/ne-sea
+        \\  /{league}/{date}/{away}-{home}[-N] game by date+teams, 302, e.g. /mlb/2026-09-09/min-det (-2 = doubleheader game 2; curl -L)
+        \\  /{league}/{YYYY}/week{N}/{a}-{h}[-N] football week game, 302, e.g. /nfl/2026/week1/ne-sea (curl -L)
+        \\  aliases match two team abbreviations only: cards, races, tournaments without abbrs 404 (browse the day board for the id)
         \\  /{league}/{abbr}/today        today's game, redirects to it
         \\  /{league}/standings            current table, no date
         \\  /api/v1/leagues                leagues as JSON
@@ -159,7 +160,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
     try w.writeAll(
         \\  color=0|1  width=N (52..200)  height=N (max games)
         \\  quiet=0|1 (no header/footer)  oneline=0|1 (?0, text only)  format=text|html
-        \\  date=YYYY-MM-DD|today|tomorrow|yesterday (scoreboard, all)  week=N (football only)
+        \\  date=YYYY-MM-DD|today|tomorrow|yesterday, default today in ET (scoreboard, all)  week=N (football only)
         \\  stream=sse (scoreboard text only, curl -N)  tz=utc (default et)
         \\  art=off strips team-mark art (tofu terminals); anything else art on
         \\
@@ -190,8 +191,9 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  curl localhost:8080/mlb
         \\  curl 'localhost:8080/mlb?date=2026-09-06'
         \\  curl 'localhost:8080/mlb/401816828?0'
-        \\  curl localhost:8080/mlb/2026-09-09/min-det
-        \\  curl localhost:8080/nfl/2026/week1/ne-sea
+        \\  curl -L localhost:8080/mlb/2026-09-09/min-det
+        \\  curl -L localhost:8080/mlb/2026-09-09/min-det-2
+        \\  curl -L localhost:8080/nfl/2026/week1/ne-sea
         \\  curl localhost:8080/all
         \\  curl localhost:8080/nfl/standings
         \\  curl -N 'localhost:8080/mlb?stream=sse'
@@ -203,7 +205,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
-    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}(redirect) /{league}/{YYYY}/week{N}/{away}-{home}(football redirect) /{league}/standings /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
+    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
     try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
@@ -252,8 +254,8 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "/{league}?week=N", .description = "Football week only, ignored elsewhere" },
             .{ .name = "/{league}/{id}", .description = "One game (all digits = game, else team)" },
             .{ .name = "/{league}/{abbr}", .description = "One team, e.g. /mlb/phi" },
-            .{ .name = "/{league}/{date}/{away}-{home}", .description = "One game by date and teams, redirects to the game (date or today|tomorrow|yesterday)" },
-            .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, redirects to the game" },
+            .{ .name = "/{league}/{date}/{away}-{home}", .description = "One game by date and teams, 302 to the game (date or today|tomorrow|yesterday; -N = doubleheader game N, 1 = first; curl -L; duel-only, cards/races 404 with the day board)" },
+            .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, 302 to the game (-N = doubleheader game N; curl -L)" },
             .{ .name = "/{league}/standings", .description = "Current table, no date" },
             .{ .name = "/api/v1/leagues", .description = "Leagues as JSON" },
             .{ .name = "/api/v1/{league}[/{id|abbr}]", .description = "Same shapes as JSON" },
@@ -284,8 +286,9 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             "curl localhost:8080/mlb",
             "curl 'localhost:8080/mlb?date=2026-09-06'",
             "curl 'localhost:8080/mlb/401816828?0'",
-            "curl localhost:8080/mlb/2026-09-09/min-det",
-            "curl localhost:8080/nfl/2026/week1/ne-sea",
+            "curl -L localhost:8080/mlb/2026-09-09/min-det",
+            "curl -L localhost:8080/mlb/2026-09-09/min-det-2",
+            "curl -L localhost:8080/nfl/2026/week1/ne-sea",
             "curl localhost:8080/all",
             "curl localhost:8080/nfl/standings",
             "curl -N 'localhost:8080/mlb?stream=sse'",

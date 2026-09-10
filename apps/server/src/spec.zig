@@ -171,7 +171,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "Provider-neutral sports scores and schedules, ESPN-backed.\n" ++
             "Plain text by default, HTML with ?format=html, JSON under /api/v1/.\n" ++
             "\n" ++
-            "Base URL: this host (local http://localhost:8080). Same paths on prod.\n" ++
+            "Base URL: prod https://sprts.horv.co, local http://localhost:8080. Same paths on both: examples use localhost:8080, swap the host for prod.\n" ++
             "\n" ++
             "DOCS\n" ++
             "  /openapi.json - full API spec, single source of truth\n" ++
@@ -180,8 +180,8 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "\n" ++
             "JSON API\n" ++
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
-            "  GET /api/v1/all - Scores for all leagues and date. params: date. degraded lists outage slugs. (getAll)\n" ++
-            "  GET /api/v1/league - Scores for one league and date. params: date, week football-only. (getScoreboard)\n" ++
+            "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
+            "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only. (getScoreboard)\n" ++
             "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
             "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
@@ -190,9 +190,10 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  Second segment all digits is a game: /mlb/401816828.\n" ++
             "  Anything else is a team: /mlb/PHI.\n" ++
             "\n" ++
-            "ALIASES human only, 302 to /{league}/{id}, no /api/v1/ twins\n" ++
-            "  /{league}/YYYY-MM-DD/{away}-{home} one game by date and teams: /mlb/2026-09-09/min-det (today/tomorrow/yesterday also work)\n" ++
-            "  /{league}/YYYY/weekN/{away}-{home} football-only week game: /nfl/2026/week1/ne-sea\n" ++
+            "ALIASES human only, 302 to /{league}/{id} (bare curl prints the stub: use curl -L), no /api/v1/ twins\n" ++
+            "  /{league}/YYYY-MM-DD/{away}-{home}[-N] one game by date and teams: /mlb/2026-09-09/min-det (-2 = doubleheader game 2, 1 = first; today/tomorrow/yesterday also work)\n" ++
+            "  /{league}/YYYY/weekN/{away}-{home}[-N] football-only week game: /nfl/2026/week1/ne-sea\n" ++
+            "  duel-only: no abbr pair matches cards, races, or tournaments (no abbreviations) - that 404 names the day board for the event id\n" ++
             "\n" ++
             "TEXT HTML JSON\n" ++
             "  Text default: curl localhost:8080/mlb\n" ++
@@ -200,7 +201,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  JSON: curl localhost:8080/api/v1/mlb\n" ++
             "\n" ++
             "FLAGS text and HTML only, JSON ignores display flags\n" ++
-            "  ?date=YYYY-MM-DD scoreboard day, default today (today/tomorrow/yesterday also work)\n" ++
+            "  ?date=YYYY-MM-DD scoreboard day, default today in ET (today/tomorrow/yesterday also work)\n" ++
             "  ?week=N football-only week selector, ignored elsewhere\n" ++
             "  ?color=0 color off, ?color=1 color on\n" ++
             "  ?width=N ?height=N terminal size cap\n" ++
@@ -214,6 +215,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "\n" ++
             "ZONES SOURCE\n" ++
             "  starts_at is UTC ISO-8601; text and HTML headings name the request zone, default ET.\n" ++
+            "  no ?date= means today in the request zone (ET unless ?tz= overrides): that ET date can be yesterday where you are, so pin ?date=YYYY-MM-DD to compare days.\n" ++
             "  source is the upstream host, normally site.api.espn.com.\n" ++
             "\n" ++
             "EXAMPLES\n" ++
@@ -224,9 +226,10 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
-            "  curl localhost:8080/mlb/2026-09-09/min-det\n" ++
-            "  curl localhost:8080/nfl/2026/week1/ne-sea\n" ++
-            "  curl localhost:8080/mlb/PHI/today\n" ++
+            "  curl -L localhost:8080/mlb/2026-09-09/min-det\n" ++
+            "  curl -L localhost:8080/mlb/2026-09-09/min-det-2\n" ++
+            "  curl -L localhost:8080/nfl/2026/week1/ne-sea\n" ++
+            "  curl -L localhost:8080/mlb/PHI/today\n" ++
             "  curl localhost:8080/openapi.json\n" ++
             "\n" ++
             "LEAGUES\n" ++

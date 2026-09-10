@@ -627,9 +627,10 @@ fn serveToday(
     return resp;
 }
 
-/// Human game alias, date form `/{league}/{date}/{away}-{home}`: resolve
+/// Human game alias, date form `/{league}/{date}/{away}-{home}[-N]`: resolve
 /// the day in the request zone, fetch that board fresh, redirect to the
-/// canonical `/{league}/{id}` (404 when no duel matches). Fresh-only,
+/// canonical `/{league}/{id}` (a miss 404s: plain on all-duel days,
+/// duel-only hint past them). Fresh-only,
 /// no-store, no `/api/v1/` twin (serveToday parity).
 fn serveDateAlias(
     env: *workers.Env,
@@ -655,8 +656,9 @@ fn serveDateAlias(
         workers.log("upstream ESPN fetch failed for {s} {s}", .{ league.slug, day });
         return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
     };
-    const game = provider.findGameByMatchup(board, route.away, route.home) orelse {
-        return errorResponse(alloc, "game not found", format, .not_found);
+    const game = provider.findGameByMatchupN(board, route.away, route.home, route.n orelse 1) orelse {
+        const browse = try std.fmt.allocPrint(alloc, "/{s}?date={s}", .{ league.slug, day });
+        return errorResponse(alloc, try provider.aliasMissMessage(alloc, board, browse), format, .not_found);
     };
     const target = try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id });
     const body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
@@ -706,8 +708,9 @@ fn serveWeekAlias(
     if (week_board.season_year == null or week_board.season_year.? != season) {
         return errorResponse(alloc, "game not found", format, .not_found);
     }
-    const game = provider.findGameByMatchup(week_board.board, route.away, route.home) orelse {
-        return errorResponse(alloc, "game not found", format, .not_found);
+    const game = provider.findGameByMatchupN(week_board.board, route.away, route.home, route.n orelse 1) orelse {
+        const browse = try std.fmt.allocPrint(alloc, "/{s}?week={d}", .{ league.slug, route.week });
+        return errorResponse(alloc, try provider.aliasMissMessage(alloc, week_board.board, browse), format, .not_found);
     };
     const target = try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id });
     const body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
