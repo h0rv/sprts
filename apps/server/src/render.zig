@@ -191,10 +191,86 @@ fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !
     try w.writeAll("\x1b[0m");
 }
 
+/// Block-character `sprts` wordmark for terminal pages: the pixel logo
+/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated row
+/// for row — s is the notched block (`XX_`/`XXX`/`_XX`), p the bowl with
+/// its descender stem, r stem+flag, t the ascender with crossbar and
+/// foot, s again. Each 10-unit pixel is one 2-wide full block (terminal
+/// cells are ~2:1 tall, so `██` keeps pixels square); letters sit on
+/// 6-cell columns with a 2-cell gap. Five rows (ascender, three x-height
+/// rows, descender) by 38 columns, ragged right, never ANSI: the heading
+/// below keeps its dim color while the banner stays plaintext. Shown on
+/// both text homes above the heading (quiet mode skips it with the rest
+/// of the header chrome); HTML and JSON never see it.
+pub const text_home_banner: []const u8 =
+    \\                          ██
+    \\████    ██████  ██████  ██████  ████
+    \\██████  ██  ██  ██        ██    ██████
+    \\  ████  ██████  ██        ████    ████
+    \\        ██
+    ++ "\n";
+
+test "text homes show the block sprts wordmark above the heading" {
+    // The banner itself: 5 block rows, ragged within 40 cells, valid
+    // UTF-8, zero ANSI on its own.
+    var rows: usize = 0;
+    var banner_lines = std.mem.splitScalar(u8, text_home_banner, '\n');
+    while (banner_lines.next()) |line| {
+        if (line.len == 0) continue;
+        rows += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "█") != null);
+        try std.testing.expect(table.textCells(line) <= 40);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+    _ = try std.unicode.Utf8View.init(text_home_banner);
+
+    // Static home: banner opens the page, `sprts` heading unchanged.
+    const static = try home(std.testing.allocator, false);
+    defer std.testing.allocator.free(static);
+    try std.testing.expect(std.mem.startsWith(u8, static, text_home_banner));
+    try std.testing.expect(std.mem.indexOf(u8, static, "sprts\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, static, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(static);
+
+    // Static home keeps the banner ANSI-free with color on: only the
+    // heading below it carries the dim span.
+    const static_color = try home(std.testing.allocator, true);
+    defer std.testing.allocator.free(static_color);
+    try std.testing.expect(std.mem.startsWith(u8, static_color, text_home_banner));
+    try std.testing.expect(std.mem.indexOf(u8, static_color[0..text_home_banner.len], "\x1b[") == null);
+
+    // Live home: banner above the dated heading, heading unchanged.
+    var results: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
+    const live = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
+    defer std.testing.allocator.free(live);
+    const banner_at = std.mem.indexOf(u8, live, "████").?;
+    const heading_at = std.mem.indexOf(u8, live, "sprts  2026-09-06 ET").?;
+    try std.testing.expect(banner_at < heading_at);
+    try std.testing.expect(std.mem.indexOf(u8, live, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(live);
+
+    // Colored live home: banner stays plaintext, heading keeps dim.
+    const colored = try homeLive(std.testing.allocator, true, "example.test", &results, "2026-09-06", false);
+    defer std.testing.allocator.free(colored);
+    const colored_head = std.mem.indexOf(u8, colored, "sprts  2026-09-06 ET").?;
+    try std.testing.expect(colored_head > text_home_banner.len);
+    try std.testing.expect(std.mem.startsWith(u8, colored, text_home_banner));
+    try std.testing.expect(std.mem.indexOf(u8, colored[0..text_home_banner.len], "\x1b[") == null);
+
+    // Quiet mode drops the banner with the rest of the header chrome.
+    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", true);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "█") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "sprts") == null);
+}
+
 pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    try w.writeAll(text_home_banner);
     try colorize(w, "2", "sprts\n", color);
     try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
@@ -247,6 +323,7 @@ pub fn homeLiveWithZone(
     errdefer out.deinit();
     const w = &out.writer;
     if (!quiet) {
+        try w.writeAll(text_home_banner);
         const tag = try tz.zoneTag(allocator, zone);
         defer allocator.free(tag);
         const heading = try std.fmt.allocPrint(allocator, "sprts  {s} {s}", .{ day, tag });
@@ -1860,6 +1937,9 @@ fn expectAlignedTable(output: []const u8) !void {
     var count: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0 or line[0] != 0xE2) continue;
+        // The block wordmark rides above the heading, outside the table:
+        // full blocks would otherwise count as (ragged) table rows.
+        if (std.mem.indexOf(u8, line, "█") != null) continue;
         const w = displayWidth(line);
         if (width) |first| {
             try std.testing.expectEqual(first, w);
@@ -1892,6 +1972,9 @@ fn expectNoBrokenLines(output: []const u8, frame_width: usize) !void {
     var count: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0 or line[0] != 0xE2) continue;
+        // Banner rows carry full blocks, not frame cells; the wordmark
+        // test below owns their width, so they skip the frame check.
+        if (std.mem.indexOf(u8, line, "█") != null) continue;
         try std.testing.expect(displayWidth(line) <= frame_width);
         count += 1;
     }
