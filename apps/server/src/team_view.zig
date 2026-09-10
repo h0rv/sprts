@@ -11,6 +11,7 @@ const render = @import("render.zig");
 const router = @import("router.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
+const vd = @import("view_detail.zig");
 
 /// Text view: logo mark, header (name, record, standing), LIVE row when
 /// present, today's upcoming games top-center, last results, then the
@@ -53,20 +54,14 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
         defer allocator.free(header);
         try table.writeLine(w, header, cols, null, color);
     }
-    if (view.team.record_summary) |record| {
-        const line = if (view.team.standing_summary) |standing|
-            try std.fmt.allocPrint(allocator, "{s}  {s}", .{ record, standing })
-        else
-            try std.fmt.allocPrint(allocator, "{s}", .{record});
+    if (try vd.recordStandingsLine(allocator, view.team.record_summary, view.team.standing_summary)) |line| {
         defer allocator.free(line);
         try table.writeLine(w, line, cols, "2", color);
-    } else if (view.team.standing_summary) |standing| {
-        try table.writeLine(w, standing, cols, "2", color);
     }
     if (view.live) |live| {
         try w.writeByte('\n');
         try table.writeLine(w, "LIVE NOW", cols, "1;31", color);
-        const live_line = try gameLine(allocator, live);
+        const live_line = try vd.gameLine(allocator, live);
         defer allocator.free(live_line);
         try table.writeLine(w, live_line, cols, "1;31", color);
     }
@@ -190,7 +185,7 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
 /// One schedule row plus its probable starter, shared by every section
 /// so Today/Last/Next overflow all read the same.
 fn writeTeamGameFull(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, game: schedule.GameRef, cols: usize, color: bool) !void {
-    const line = try gameLineFull(allocator, league_slug, game);
+    const line = try vd.gameLineFull(allocator, league_slug, game);
     defer allocator.free(line);
     try table.writeLine(w, line, cols, null, color);
     if (game.probable.len > 0) {
@@ -198,69 +193,6 @@ fn writeTeamGameFull(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slu
         defer allocator.free(pline);
         try table.writeLine(w, pline, cols, "2", color);
     }
-}
-
-/// Fit `s` to `cols` terminal cells through the shared `table.writeCell`,
-/// then strip the padding: document lines breathe instead of forming a
-/// box column. Color wraps the fitted bytes only; the padding is trimmed
-/// ahead of the reset so the SGR span survives intact.
-fn fitLine(allocator: std.mem.Allocator, s: []const u8, cols: usize, code: ?[]const u8, color: bool) ![]u8 {
-    var cell: std.Io.Writer.Allocating = .init(allocator);
-    defer cell.deinit();
-    try table.writeCell(&cell.writer, s, cols, code, color);
-    const padded = try cell.toOwnedSlice();
-    defer allocator.free(padded);
-    if (color and code != null and std.mem.endsWith(u8, padded, "\x1b[0m")) {
-        const body = std.mem.trimEnd(u8, padded[0 .. padded.len - "\x1b[0m".len], " ");
-        return std.fmt.allocPrint(allocator, "{s}\x1b[0m", .{body});
-    }
-    return allocator.dupe(u8, std.mem.trimEnd(u8, padded, " "));
-}
-
-/// One game body line. Final/live results (`"L 4-5"`, `"3-2 Top 7th"`) carry
-/// no opponent, so they get `"<date> <vs/at OPP> <result>"`; upcoming
-/// results already read `"vs OPP 7:05 PM"`, so they get `"<date> <result>"`.
-fn gameLine(allocator: std.mem.Allocator, game: schedule.GameRef) ![]u8 {
-    // Eastern calendar day: ESPN instants are UTC, so an 8:20 PM ET kickoff
-    // reads as the next UTC day without this shift (matches the ET times
-    // already in `result`; `GameRef.date` itself stays a true UTC instant).
-    const day = try gameDay(allocator, game.date);
-    defer allocator.free(day);
-    const prefix = shortDate(day);
-    if (std.mem.eql(u8, game.state, "pre")) {
-        return std.fmt.allocPrint(allocator, "{s} {s}", .{ prefix, game.result });
-    }
-    const versus = if (std.mem.eql(u8, game.home_away, "away")) "at" else "vs";
-    return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ prefix, versus, game.opponent_abbrev, game.result });
-}
-
-/// Eastern calendar day (`YYYY-MM-DD`) for a schedule instant: full UTC
-/// timestamps shift to the Eastern day, date-only strings pass through.
-/// Fallback (never errors): unknown shapes keep their raw prefix. Pair
-/// with `shortDate` for the `MM-DD` line prefix, or with `tz.labelFor`
-/// for the `M/D ZONE` header tag.
-fn gameDay(allocator: std.mem.Allocator, iso: []const u8) ![]u8 {
-    if (core.date.parseTimestampUTC(iso)) |epoch| {
-        return core.date.todayInTz(allocator, epoch, core.date.etOffsetMinutes(epoch));
-    }
-    return allocator.dupe(u8, iso[0..@min(iso.len, 10)]);
-}
-
-/// Short date: `2026-09-08` becomes `09-08`. Matches render.zig's
-/// home headers; the year is implicit in the page context.
-fn shortDate(day: []const u8) []const u8 {
-    if (day.len >= 10 and day[4] == '-' and day[7] == '-') return day[5..10];
-    return day;
-}
-
-/// Schedule line with a game pointer for linking: the base `gameLine`
-/// plus `  /{league}/{id}` so terminals can jump to the game view.
-/// HTML callers link the row instead (see `teamScheduleHtml`).
-fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, game: schedule.GameRef) ![]u8 {
-    const base = try gameLine(allocator, game);
-    defer allocator.free(base);
-    if (game.id.len == 0) return allocator.dupe(u8, base);
-    return std.fmt.allocPrint(allocator, "{s}  /{s}/{s}", .{ base, league, game.id });
 }
 
 /// HTML view: same sections as text (logo, header, live, last 5, next 5),
@@ -306,15 +238,9 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
         defer allocator.free(header);
         try render.writeHtmlH1(w, allocator, header, cols, null);
     }
-    if (view.team.record_summary) |record| {
-        const line = if (view.team.standing_summary) |standing|
-            try std.fmt.allocPrint(allocator, "{s}  {s}", .{ record, standing })
-        else
-            try std.fmt.allocPrint(allocator, "{s}", .{record});
+    if (try vd.recordStandingsLine(allocator, view.team.record_summary, view.team.standing_summary)) |line| {
         defer allocator.free(line);
         try render.writeHtmlLine(w, allocator, line, cols, "dim", null);
-    } else if (view.team.standing_summary) |standing| {
-        try render.writeHtmlLine(w, allocator, standing, cols, "dim", null);
     }
     if (view.live) |live| {
         try w.writeByte('\n');
@@ -449,9 +375,9 @@ fn writeTeamGameFullHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league
 /// Empty ids (should not happen; the provider always sets one) render
 /// as a plain line rather than a dead link.
 fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
-    const line = try gameLine(allocator, game);
+    const line = try vd.gameLine(allocator, game);
     defer allocator.free(line);
-    const trimmed = try fitLine(allocator, line, cols, null, false);
+    const trimmed = try vd.fitLine(allocator, line, cols, null, false);
     defer allocator.free(trimmed);
     if (game.id.len > 0) {
         try w.print("<a href=\"/{s}/{s}\">", .{ league, game.id });
@@ -759,7 +685,7 @@ fn zoneDayFor(view: schedule.TeamView) ?[]const u8 {
 // morning (same shift as `gameLine`).
 fn zoneTag(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
     const day = zoneDayFor(view) orelse return allocator.dupe(u8, "");
-    const et = try gameDay(allocator, day);
+    const et = try vd.gameDay(allocator, day);
     defer allocator.free(et);
     return tz.labelFor(allocator, et, .et);
 }
@@ -808,7 +734,7 @@ test "team game lines and zone tag use the Eastern calendar day" {
         .state = "pre",
         .result = "vs NYG 8:20 PM",
     };
-    const line = try gameLine(std.testing.allocator, late);
+    const line = try vd.gameLine(std.testing.allocator, late);
     defer std.testing.allocator.free(line);
     try std.testing.expect(std.mem.startsWith(u8, line, "09-13 "));
     // Date-only strings (no time to shift) pass through untouched.
@@ -822,7 +748,7 @@ test "team game lines and zone tag use the Eastern calendar day" {
         .state = "post",
         .result = "W 5-3",
     };
-    const line2 = try gameLine(std.testing.allocator, dated);
+    const line2 = try vd.gameLine(std.testing.allocator, dated);
     defer std.testing.allocator.free(line2);
     try std.testing.expect(std.mem.startsWith(u8, line2, "09-08 "));
     // The header tag shifts too: next game is the 8:20 PM ET kickoff.
@@ -1107,4 +1033,205 @@ test "art-off team HTML carries no marks, no logo spans" {
     if (core.art.teamArtColor("mlb", "PHI", .xs) != null) {
         try std.testing.expect(std.mem.indexOf(u8, on_page, "<span style=\"color:rgb(") != null);
     }
+}
+
+// Phase 3: team visible-text equality over hostile schedule strings.
+// Every shared-composer row (`recordStandingsLine`, `gameLine` /
+// `gameLineFull`, probable lines) must surface verbatim in the text page
+// and as visible text (tags stripped, entities unescaped) in the HTML
+// page. The text pointer suffix (`  /{league}/{id}`) and the HTML link
+// wrapping are chrome: strip the pointer before comparing with the
+// linked HTML row.
+fn hostileTeamView() schedule.TeamView {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{
+            .id = "22",
+            .abbrev = "PHI",
+            .name = "Philadelphia\tPhillies\n& <Co> 漢字",
+            .record_summary = "80-63",
+            .standing_summary = "2nd in NL East",
+        },
+        .live = .{
+            .id = "live1",
+            .date = "2026-09-07T17:05Z",
+            .opponent_abbrev = "ATL",
+            .opponent_name = "Atlanta Braves",
+            .home_away = "home",
+            .status = "Top 7th",
+            .state = "in",
+            .our_score = "3",
+            .opp_score = "2",
+            .result = "3-2\nTop\t7th",
+        },
+        .last = &.{.{
+            .id = "401814694",
+            .date = "2026-09-05T23:10Z",
+            .opponent_abbrev = "NYM",
+            .opponent_name = "New York Mets",
+            .home_away = "home",
+            .status = "Final",
+            .state = "post",
+            .our_score = "5",
+            .opp_score = "3",
+            .result = "W 5-3 & <go> 漢字",
+        }},
+        .next = &.{
+            .{
+                .id = "today1",
+                .date = "2026-09-07T17:05Z",
+                .opponent_abbrev = "ATL",
+                .opponent_name = "Atlanta Braves",
+                .home_away = "home",
+                .status = "9/7 - 1:05 PM EDT",
+                .state = "pre",
+                .result = "vs ATL\n1:05\tPM",
+                .probable = "Jesus & <Luzardo>\nJr.",
+                .today = true,
+            },
+            .{
+                .id = "401816844",
+                .date = "2026-09-08T17:05Z",
+                .opponent_abbrev = "ATL",
+                .opponent_name = "Atlanta Braves",
+                .home_away = "away",
+                .status = "9/8 - 1:05 PM EDT",
+                .state = "pre",
+                .result = "at ATL 1:05 PM",
+            },
+        },
+        .extra_past = &.{.{
+            .id = "old1",
+            .date = "2026-09-04T19:05Z",
+            .opponent_abbrev = "NYM",
+            .opponent_name = "New York Mets",
+            .home_away = "away",
+            .status = "Final",
+            .state = "post",
+            .our_score = "2",
+            .opp_score = "4",
+            .result = "L 2-4",
+        }},
+        .extra_next = &.{.{
+            // Empty id: no pointer in text, no link in HTML — the bare
+            // row must still read identically on both surfaces.
+            .id = "",
+            .date = "2026-09-09T19:05Z",
+            .opponent_abbrev = "NYM",
+            .opponent_name = "New York Mets",
+            .home_away = "home",
+            .status = "9/9 - 3:05 PM EDT",
+            .state = "pre",
+            .result = "vs NYM\t3:05 PM",
+            .probable = "Ranger & <Suarez>",
+        }},
+    };
+}
+
+fn teamContainsLine(haystack: []const u8, needle: []const u8) bool {
+    var it = std.mem.splitScalar(u8, haystack, '\n');
+    while (it.next()) |line| if (std.mem.eql(u8, line, needle)) return true;
+    return false;
+}
+
+test "hostile team schedule reads identically in text and HTML" {
+    const arena = std.testing.allocator;
+    const view = hostileTeamView();
+    const cols: usize = 52;
+    const text = try renderText(arena, view, false, null, 9);
+    defer arena.free(text);
+    const page = try teamHtml(arena, view, "mlb", null, 9);
+    defer arena.free(page);
+    _ = try std.unicode.Utf8View.init(text);
+    _ = try std.unicode.Utf8View.init(page);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b") == null);
+    // Visible HTML: the `<pre>` block with tags stripped and entities
+    // unescaped, line for line.
+    const pre_open = std.mem.indexOf(u8, page, "<pre>") orelse return error.TestUnexpectedResult;
+    const pre_close = std.mem.indexOf(u8, page, "</pre>") orelse return error.TestUnexpectedResult;
+    var visible: std.Io.Writer.Allocating = .init(arena);
+    defer visible.deinit();
+    var raw = std.mem.splitScalar(u8, page[pre_open + "<pre>".len .. pre_close], '\n');
+    while (raw.next()) |line| {
+        const clean = try vd.stripHtmlVisible(arena, line);
+        defer arena.free(clean);
+        try visible.writer.writeAll(clean);
+        try visible.writer.writeByte('\n');
+    }
+    const seen = try visible.toOwnedSlice();
+    defer arena.free(seen);
+    // Header and record ride the shared composers: identical folds.
+    const tag = try zoneTag(arena, view);
+    defer arena.free(tag);
+    const header = try std.fmt.allocPrint(arena, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, tag });
+    defer arena.free(header);
+    const fitted_header = try vd.fitLine(arena, header, cols, null, false);
+    defer arena.free(fitted_header);
+    try std.testing.expect(teamContainsLine(text, fitted_header));
+    try std.testing.expect(teamContainsLine(seen, fitted_header));
+    try std.testing.expect(std.mem.indexOf(u8, fitted_header, "\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fitted_header, "\n") == null);
+    const rec = try vd.recordStandingsLine(arena, view.team.record_summary, view.team.standing_summary);
+    defer if (rec) |line| arena.free(line);
+    try std.testing.expect(rec != null);
+    try std.testing.expect(teamContainsLine(text, rec.?));
+    try std.testing.expect(teamContainsLine(seen, rec.?));
+    // Every schedule row: text shows the pointer-suffixed line, HTML
+    // links the bare row — both fold to the same visible string.
+    const rows = [_]struct { game: schedule.GameRef, live: bool }{
+        .{ .game = view.live.?, .live = true },
+        .{ .game = view.last[0], .live = false },
+        .{ .game = view.next[0], .live = false },
+        .{ .game = view.next[1], .live = false },
+        .{ .game = view.extra_past[0], .live = false },
+        .{ .game = view.extra_next[0], .live = false },
+    };
+    for (rows) |item| {
+        const base = try vd.gameLine(arena, item.game);
+        defer arena.free(base);
+        const fitted = try vd.fitLine(arena, base, cols, null, false);
+        defer arena.free(fitted);
+        _ = try std.unicode.Utf8View.init(fitted);
+        if (item.live) {
+            try std.testing.expect(teamContainsLine(text, fitted));
+        } else {
+            const full = try vd.gameLineFull(arena, "mlb", item.game);
+            defer arena.free(full);
+            const fitted_full = try vd.fitLine(arena, full, cols, null, false);
+            defer arena.free(fitted_full);
+            try std.testing.expect(teamContainsLine(text, fitted_full));
+            // Pointer chrome links the surfaces: strip it to reach the
+            // bare row the HTML side links.
+            if (item.game.id.len > 0) {
+                const pointer = try std.fmt.allocPrint(arena, "  /mlb/{s}", .{item.game.id});
+                defer arena.free(pointer);
+                try std.testing.expect(std.mem.endsWith(u8, fitted_full, pointer));
+                try std.testing.expectEqualStrings(fitted, fitted_full[0 .. fitted_full.len - pointer.len]);
+            } else {
+                try std.testing.expectEqualStrings(fitted, fitted_full);
+            }
+        }
+        try std.testing.expect(teamContainsLine(seen, fitted));
+        if (item.game.probable.len > 0) {
+            const pline = try std.fmt.allocPrint(arena, "  Probable: {s}", .{item.game.probable});
+            defer arena.free(pline);
+            const fitted_prob = try vd.fitLine(arena, pline, cols, null, false);
+            defer arena.free(fitted_prob);
+            try std.testing.expect(teamContainsLine(text, fitted_prob));
+            try std.testing.expect(teamContainsLine(seen, fitted_prob));
+        }
+    }
+    // Overflow semantics intact: flagged Today leads, height reveals the
+    // extras, and nothing hides behind a trailer.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Today:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Today:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "L 2-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "L 2-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+1 more") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "more:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "&amp;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "&lt;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "\x1b[") == null);
 }
