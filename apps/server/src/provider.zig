@@ -1251,7 +1251,7 @@ test "sse initial serves a seeded board with zero upstream fetches" {
     var fake = CountingTransport{ .live_body = "{\"events\":[]}" };
     const adapter = homeCacheTestAdapter(&fake, &threaded);
     const slug = try core.cache.canonicalSlug(arena, mlb.slug);
-    var ctx = BoardCacheCtx{ .adapter = adapter, .league = mlb, .day = home_cache_day };
+    var ctx = BoardCacheCtx{ .adapter = adapter, .league = mlb, .day = home_cache_day, .today_day = home_cache_day };
     // Near the end of the 30s final window: hit, no fetch, seeded content.
     const cached = try cache.getOrFetchBoard(arena, slug, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1, &ctx, fetchBoardCached);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
