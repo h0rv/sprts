@@ -1339,10 +1339,13 @@ fn valuePresent(value: ?std.json.Value) bool {
 }
 
 /// Single upstream GET used by every provider fetch: honors the injected
-/// transport with a `StdTransport` fallback, and maps any non-200 to
-/// `error.UpstreamResponse`. URL construction stays with the callers
-/// (`fetchWeekBody` builds scoreboard URLs; detail/schedule/teams build
-/// theirs); only the transport-fallback + status check live here.
+/// transport with a `StdTransport` fallback. Non-200 maps to
+/// `error.UpstreamClientError` for 4xx (upstream has no such resource —
+/// the detail path degrades on it) and `error.UpstreamResponse` otherwise
+/// (transient upstream failure, serve layer 502). URL construction stays
+/// with the callers (`fetchWeekBody` builds scoreboard URLs;
+/// detail/schedule/teams build theirs); only the transport-fallback +
+/// status check live here.
 fn fetchUrl(self: EspnAdapter, arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     var status: std.http.Status = undefined;
     var body: []const u8 = undefined;
@@ -1357,7 +1360,9 @@ fn fetchUrl(self: EspnAdapter, arena: std.mem.Allocator, url: []const u8) ![]con
         body = result.body;
     }
     if (status != .ok) {
-        std.log.warn("ESPN returned HTTP {d}", .{@intFromEnum(status)});
+        const code = @intFromEnum(status);
+        std.log.warn("ESPN returned HTTP {d}", .{code});
+        if (code >= 400 and code < 500) return error.UpstreamClientError;
         return error.UpstreamResponse;
     }
     return body;
@@ -1926,10 +1931,76 @@ fn findBoardGame(
     return null;
 }
 
+/// Board-built detail for summary-4xx leagues (tennis-style: ESPN has no
+/// per-event summary, so the enriched path is unreachable). Scans recent
+/// day boards from the adapter clock — today, two days forward (published
+/// draws), then fourteen back (a slam's full span) — and builds a
+/// degraded-but-200 detail from the first board row matching `game_id`:
+/// identity, state, status, participants (scores + set/period lines),
+/// venue and network straight from the board; leaders, lineups,
+/// situation and every summary-only section stay empty (renderers skip
+/// them, and the JSON twin carries the same honest shape). A full miss
+/// is `error.GameNotFound` (honest 404, never invented fields); when no
+/// board fetch succeeded at all the first board error propagates (the
+/// serve-layer 502) instead of masking an outage as a 404.
+fn detailBoardFallback(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
+    const today = try self.today(arena);
+    var board_ok = false;
+    var first_err: ?anyerror = null;
+    // Likelihood order: today first (live boards link here), two days
+    // forward (published draws), then fourteen back (a slam's full span).
+    // Seventeen small board fetches worst case, and only on the
+    // summary-4xx path; the common live case costs exactly one.
+    var step: usize = 0;
+    while (step < 17) : (step += 1) {
+        const offset: i32 = if (step == 0) 0 else if (step <= 2) @intCast(step) else -@as(i32, @intCast(step - 2));
+        const day = try core.date.shift(arena, today, offset);
+        const board = self.fetch(arena, league, day) catch |err| {
+            if (first_err == null) first_err = err;
+            continue;
+        };
+        board_ok = true;
+        for (board.games) |game| {
+            if (!std.mem.eql(u8, game.id, game_id)) continue;
+            return .{
+                .id = try copy(arena, game.id),
+                .league = league.slug,
+                .league_name = league.name,
+                .date = try copy(arena, day),
+                .state = game.state,
+                .status = game.status,
+                .venue = game.venue,
+                .attendance = null,
+                .series = null,
+                .network = game.network,
+                .participants = game.participants,
+                .situation = null,
+                .decisions = &.{},
+                .scoring_plays = &.{},
+                .leaders = &.{},
+                .lineups = &.{},
+                .team_stats = &.{},
+                .injuries = &.{},
+                .win_probability = null,
+            };
+        }
+    }
+    if (!board_ok) return first_err.?;
+    return error.GameNotFound;
+}
+
 pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const summary_url = try espn.buildSummaryUrl(arena, self.base_url, endpoint.sport, endpoint.league, game_id);
-    const summary_body = try fetchUrl(self, arena, summary_url);
+    // Tennis-style leagues (atp/wta/f1/ufc/pga) answer `summary?event=`
+    // with HTTP 400: upstream has no detail, not a transient failure.
+    // Degrade to a board-built page (honest board fields only) instead
+    // of 502ing; 5xx/network errors still propagate to the serve-layer
+    // 502 below via the plain `try` in the non-4xx arm.
+    const summary_body = fetchUrl(self, arena, summary_url) catch |err| {
+        if (err == error.UpstreamClientError) return try detailBoardFallback(self, arena, league, game_id);
+        return err;
+    };
     const response = try std.json.parseFromSliceLeaky(SummaryResponse, arena, summary_body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -2156,6 +2227,10 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
 const DetailFake = struct {
     summary_body: []const u8,
     board_body: []const u8,
+    /// Summary status override (default 200): `.bad_request` models the
+    /// tennis-style summary 400 (board fallback), `.bad_gateway` the
+    /// transient 5xx (serve-layer 502, no board contact).
+    summary_status: std.http.Status = .ok,
     /// Alternate board body served when the scoreboard URL carries
     /// `board_alt_dates` (compact YYYYMMDD): models the ET-day board
     /// differing from the UTC-day board for evening games.
@@ -2173,7 +2248,7 @@ const DetailFake = struct {
         const self: *DetailFake = @ptrCast(@alignCast(ptr));
         if (std.mem.indexOf(u8, url, "/summary?") != null) {
             self.summary_calls += 1;
-            return .{ .status = .ok, .body = try arena.dupe(u8, self.summary_body) };
+            return .{ .status = self.summary_status, .body = try arena.dupe(u8, self.summary_body) };
         }
         if (std.mem.indexOf(u8, url, "/scoreboard") != null) {
             self.board_calls += 1;
@@ -5167,6 +5242,81 @@ test "fetchDetail resolves tennis matches listed under groupings" {
     try std.testing.expectEqual(@as(usize, 2), detail.participants[1].lines.len);
     try std.testing.expectEqualStrings("7(7)", detail.participants[1].lines[0].display);
     try std.testing.expectEqualStrings("6", detail.participants[1].lines[1].display);
+}
+
+test "fetchDetail degrades to the board row when the summary 400s" {
+    // Tennis-style leagues answer `summary?event=` with HTTP 400 (live
+    // ATP/WTA verified): upstream has no detail, so the page degrades to
+    // the board row — names, set scores, status, venue — with every
+    // summary-only section empty (renderers skip them; the JSON twin
+    // carries the same honest shape). The fixture match is dated the fake
+    // clock's today (2026-09-07), so the fallback hits on its first board.
+    const board =
+        \\{"events":[{"id":"189-2026","name":"US Open","date":"2026-09-07T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"groupings":[{"grouping":{"displayName":"Men's Singles"},"competitions":[{"id":"184607","date":"2026-09-07T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"venue":{"fullName":"New York, USA"},"broadcasts":[{"names":["ESPN+"]}],"competitors":[{"id":"1","order":2,"winner":false,"athlete":{"displayName":"Roberto Carballes Baena"},"linescores":[{"value":6,"tiebreak":3,"winner":false},{"value":3,"winner":false}]},{"id":"2","order":1,"winner":true,"athlete":{"displayName":"Jacob Fearnley"},"linescores":[{"value":7,"tiebreak":7,"winner":true},{"value":6,"winner":true}]}]}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = "{}", .board_body = board, .summary_status = .bad_request };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("atp").?, "184607");
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.board_calls);
+    try std.testing.expectEqualStrings("184607", detail.id);
+    try std.testing.expectEqualStrings("atp", detail.league);
+    try std.testing.expectEqualStrings("2026-09-07", detail.date);
+    try std.testing.expectEqualStrings("post", detail.state);
+    try std.testing.expectEqualStrings("Final", detail.status);
+    try std.testing.expectEqualStrings("New York, USA", detail.venue.?);
+    try std.testing.expectEqualStrings("ESPN+", detail.network.?);
+    try std.testing.expectEqual(@as(usize, 2), detail.participants.len);
+    try std.testing.expectEqualStrings("Roberto Carballes Baena", detail.participants[0].name);
+    try std.testing.expectEqualStrings("", detail.participants[0].abbreviation);
+    try std.testing.expectEqualStrings("0", detail.participants[0].score);
+    try std.testing.expectEqualStrings("Jacob Fearnley", detail.participants[1].name);
+    try std.testing.expectEqualStrings("2", detail.participants[1].score);
+    try std.testing.expect(detail.participants[1].winner);
+    try std.testing.expectEqualStrings("6(3)", detail.participants[0].lines[0].display);
+    try std.testing.expectEqualStrings("7(7)", detail.participants[1].lines[0].display);
+    // Degraded means empty, never invented: no leaders/lineups/
+    // situation/scoring/decisions/stats/injuries/series/attendance.
+    try std.testing.expectEqual(@as(usize, 0), detail.leaders.len);
+    try std.testing.expectEqual(@as(usize, 0), detail.lineups.len);
+    try std.testing.expectEqual(@as(usize, 0), detail.scoring_plays.len);
+    try std.testing.expectEqual(@as(usize, 0), detail.decisions.len);
+    try std.testing.expectEqual(@as(usize, 0), detail.team_stats.len);
+    try std.testing.expectEqual(@as(usize, 0), detail.injuries.len);
+    try std.testing.expect(detail.situation == null);
+    try std.testing.expect(detail.series == null);
+    try std.testing.expect(detail.attendance == null);
+    try std.testing.expect(detail.win_probability == null);
+}
+
+test "fetchDetail keeps the 502 when the summary 5xxs" {
+    // Transient upstream failure: no board contact, the summary error
+    // propagates (serve layer 502), distinct from the 4xx degrade path.
+    var fake = DetailFake{ .summary_body = "{}", .board_body = detail_board_fixture, .summary_status = .bad_gateway };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.UpstreamResponse,
+        detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "401816828"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.board_calls);
+}
+
+test "fetchDetail 404s when the summary 400s and no board holds the id" {
+    // Upstream has no detail AND no board lists the game: an unknown id,
+    // so the miss is GameNotFound (serve layer 404), never an invented
+    // page. The scan walks today +2/-14 (17 boards worst case).
+    var fake = DetailFake{ .summary_body = "{}", .board_body = "{\"events\":[]}", .summary_status = .bad_request };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(
+        error.GameNotFound,
+        detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("atp").?, "nope"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 17), fake.board_calls);
 }
 
 test "board leaders map the combined table, absent stays empty" {
