@@ -1390,3 +1390,23 @@ test "detail lineups replace leaders when a batting group ships" {
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
 
+test "game detail renders no team marks in text or HTML" {
+    // Verified, not assumed: the detail view never emits braille logos
+    // (no art site exists here), so the game route's `art` flag is
+    // accepted-and-ignored — proven by zero braille for mark-shipping
+    // teams (PHI) in both formats.
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const output = try renderText(std.testing.allocator, testDetail(), false, null, null);
+    defer std.testing.allocator.free(output);
+    var i: usize = 0;
+    while (i + 1 < output.len) : (i += 1) {
+        try std.testing.expect(!(output[i] == 0xE2 and output[i + 1] >= 0xA0 and output[i + 1] <= 0xA3));
+    }
+    const page = try detailHtml(std.testing.allocator, testDetail(), null, null);
+    defer std.testing.allocator.free(page);
+    var j: usize = 0;
+    while (j + 1 < page.len) : (j += 1) {
+        try std.testing.expect(!(page[j] == 0xE2 and page[j + 1] >= 0xA0 and page[j + 1] <= 0xA3));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+}

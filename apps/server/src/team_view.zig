@@ -17,14 +17,18 @@ const tz = @import("tz.zig");
 /// next games. `height` reaches the overflow tails (`+N more (?height=M)`
 /// with query links in the footer); last games always show so recent form
 /// reads at a glance. Empty when nothing is scheduled.
-pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16) ![]u8 {
+/// Team-mark art kill-switch (`?art=off`): when `art` is false the logo
+/// block above the header is skipped outright — no dangling blank row —
+/// while the header and every section align exactly as with art on.
+pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16, art: bool) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     // Team logo mark above the header when the generator has one: raw
     // braille lines, no box, no padding (color sidecar when asked).
-    if (core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark| {
+    const art_mark = if (art) core.art.teamArt(view.league, view.team.abbrev, .xs) else null;
+    if (art_mark) |mark| {
         const use_mark = if (color)
             core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse mark
         else
@@ -178,6 +182,11 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
     return out.toOwnedSlice();
 }
 
+/// Wrapper with art on: existing callers keep rendering exactly as before.
+pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: bool, width: ?u16, height: ?u16) ![]u8 {
+    return renderTextArt(allocator, view, color, width, height, true);
+}
+
 /// One schedule row plus its probable starter, shared by every section
 /// so Today/Last/Next overflow all read the same.
 fn writeTeamGameFull(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, game: schedule.GameRef, cols: usize, color: bool) !void {
@@ -258,7 +267,7 @@ fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, game: schedule
 /// never ANSI, with links. Schedule rows link to their game views; the
 /// nav mirrors the scoreboard pages. Logo marks render as plain braille
 /// (no SGR in HTML). Sections breathe through blank lines, never rules.
-pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_slug: []const u8, width: ?u16, height: ?u16) ![]u8 {
+pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league_slug: []const u8, width: ?u16, height: ?u16, art: bool) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -270,9 +279,12 @@ pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_sl
     // Colored logo mark as HTML rows: SGR runs become rgb spans via
     // `table.writeArtLineHtml` (mono marks emit plain glyphs). No box,
     // no padding — art lines are ragged by nature.
-    if (core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse
-        core.art.teamArt(view.league, view.team.abbrev, .xs)) |mark|
-    {
+    const html_mark = if (art)
+        core.art.teamArtColor(view.league, view.team.abbrev, .xs) orelse
+            core.art.teamArt(view.league, view.team.abbrev, .xs)
+    else
+        null;
+    if (html_mark) |mark| {
         var lines = std.mem.splitScalar(u8, mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -451,6 +463,11 @@ fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const
     if (css != null) try w.writeAll("</span>");
     if (game.id.len > 0) try w.writeAll("</a>");
     try w.writeByte('\n');
+}
+
+/// Wrapper with art on: existing callers keep rendering exactly as before.
+pub fn teamHtml(allocator: std.mem.Allocator, view: schedule.TeamView, league_slug: []const u8, width: ?u16, height: ?u16) ![]u8 {
+    return teamHtmlArt(allocator, view, league_slug, width, height, true);
 }
 
 /// One-byte HTML escaper for `table.writeArtLineHtml`: escape `&<>"'`,
@@ -1020,4 +1037,70 @@ test "team trailers hint at ?height= and empty results read ET" {
     try std.testing.expect(std.mem.indexOf(u8, quiet, "9/7 - 1:05 PM ET, 1/15 - 7:00 PM ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "EDT") == null);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "EST") == null);
+}
+
+fn containsBraille(s: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < s.len) : (i += 1) {
+        if (s[i] == 0xE2 and s[i + 1] >= 0xA0 and s[i + 1] <= 0xA3) return true;
+    }
+    return false;
+}
+
+test "art off strips the team logo, header leads with no dangling blank" {
+    const arena = std.testing.allocator;
+    // Precondition: PHI really ships a mark, so the strip is meaningful.
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const view = testView();
+    const on = try renderText(arena, view, false, null, null);
+    defer arena.free(on);
+    try std.testing.expect(containsBraille(on));
+    const off = try renderTextArt(arena, view, false, null, null, false);
+    defer arena.free(off);
+    try std.testing.expect(!containsBraille(off));
+    _ = try std.unicode.Utf8View.init(off);
+    // No dangling blank art row: the header opens the page.
+    try std.testing.expect(std.mem.startsWith(u8, off, "Philadelphia Phillies (PHI)"));
+    // Layout intact: art-off equals art-on minus the leading mark block
+    // (braille lines plus the single blank breathing row after them).
+    var header_at: usize = 0;
+    var on_lines = std.mem.splitScalar(u8, on, '\n');
+    while (on_lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "Philadelphia Phillies (PHI)")) break;
+        header_at += line.len + 1;
+    }
+    try std.testing.expect(header_at < on.len);
+    try std.testing.expectEqualStrings(on[header_at..], off);
+    // Sections survive: record, live, last, next, probables.
+    for ([_][]const u8{ "80-63", "LIVE NOW", "Last 5:", "Next 5:", "Probable: Jesus Luzardo" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, off, token) != null);
+    }
+    // Colored art-off skips the mark too (not just uncolors it).
+    const off_color = try renderTextArt(arena, view, true, null, null, false);
+    defer arena.free(off_color);
+    try std.testing.expect(!containsBraille(off_color));
+    try std.testing.expect(std.mem.indexOf(u8, off_color, "\x1b[1;31m") != null);
+    // Art on is the default: the wrapper renders byte-identically.
+    const explicit = try renderTextArt(arena, view, false, null, null, true);
+    defer arena.free(explicit);
+    try std.testing.expectEqualStrings(on, explicit);
+}
+
+test "art-off team HTML carries no marks, no logo spans" {
+    const arena = std.testing.allocator;
+    const view = testView();
+    const page = try teamHtmlArt(arena, view, "mlb", null, null, false);
+    defer arena.free(page);
+    try std.testing.expect(!containsBraille(page));
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Philadelphia Phillies (PHI)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") != null);
+    _ = try std.unicode.Utf8View.init(page);
+    // Art on keeps its spans (precondition check, mirrors the text test).
+    const on_page = try teamHtml(arena, view, "mlb", null, null);
+    defer arena.free(on_page);
+    if (core.art.teamArtColor("mlb", "PHI", .xs) != null) {
+        try std.testing.expect(std.mem.indexOf(u8, on_page, "<span style=\"color:rgb(") != null);
+    }
 }

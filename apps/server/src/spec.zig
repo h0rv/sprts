@@ -205,6 +205,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  ?color=0 color off, ?color=1 color on\n" ++
             "  ?width=N ?height=N terminal size cap\n" ++
             "  ?0 one-line per game, text-only\n" ++
+            "  ?art=off strips team-mark art for tofu terminals, anything else art on\n" ++
             "\n" ++
             "JSON DIGEST OUTAGES\n" ++
             "  /api/v1/all never 404s or 502s: a failed league is a zero-game board plus its slug in degraded.\n" ++
@@ -273,7 +274,7 @@ test "llms.txt is plain agent surface with every operation" {
     for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings" }) |id| {
         try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
     }
-    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "digits", "mlb", "nfl", "Base URL" }) |token| {
+    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "?art=off", "digits", "mlb", "nfl", "Base URL" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, doc, token) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, doc, "\x1b") == null);
