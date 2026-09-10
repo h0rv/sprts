@@ -543,16 +543,32 @@ fn scoringLines(allocator: std.mem.Allocator, plays: []const detail.DetailScorin
     for (plays) |play| {
         const score = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ play.away_score, play.home_score });
         defer allocator.free(score);
-        var buf: std.Io.Writer.Allocating = .init(allocator);
-        errdefer buf.deinit();
-        try writeCell(&buf.writer, play.period, period_w, null, false);
-        try buf.writer.writeByte(' ');
-        try writeCell(&buf.writer, score, score_w, null, false);
-        try buf.writer.writeByte(' ');
-        try writeCell(&buf.writer, play.text, total -| period_w -| 1 -| score_w -| 1, null, false);
-        const raw = try buf.toOwnedSlice();
-        defer allocator.free(raw);
-        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
+        // Play text wraps (like situation lines) instead of truncating:
+        // the period/score prefix rides the first row, continuations
+        // indent to the text column. Never lose live info to an ellipsis.
+        var prefix: std.Io.Writer.Allocating = .init(allocator);
+        defer prefix.deinit();
+        try writeCell(&prefix.writer, play.period, period_w, null, false);
+        try prefix.writer.writeByte(' ');
+        try writeCell(&prefix.writer, score, score_w, null, false);
+        try prefix.writer.writeByte(' ');
+        const head = try prefix.toOwnedSlice();
+        defer allocator.free(head);
+        const text_w = total -| period_w -| 1 -| score_w -| 1;
+        const wrapped = try table.wrapLines(allocator, play.text, text_w);
+        defer freeLines(allocator, wrapped);
+        if (wrapped.len == 0) {
+            try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, head, " ")));
+            continue;
+        }
+        const indent = try allocator.alloc(u8, head.len);
+        defer allocator.free(indent);
+        @memset(indent, ' ');
+        for (wrapped, 0..) |row, i| {
+            const line = try std.fmt.allocPrint(allocator, "{s}{s}", .{ if (i == 0) head else indent, row });
+            defer allocator.free(line);
+            try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, line, " ")));
+        }
     }
     return out.toOwnedSlice(allocator);
 }
@@ -1408,4 +1424,22 @@ test "game detail renders no team marks in text or HTML" {
         try std.testing.expect(!(page[j] == 0xE2 and page[j + 1] >= 0xA0 and page[j + 1] <= 0xA3));
     }
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+}
+
+test "detail scoring plays wrap long text instead of truncating" {
+    var game = testDetail();
+    game.state = "in";
+    game.scoring_plays = &.{
+        .{ .period = "Q2", .text = "7-0 Eli Raridon 2 Yd pass from Drake Maye (Anders Carlson Kick)", .away_score = "7", .home_score = "0" },
+    };
+    const output = try renderText(std.testing.allocator, game, false, null, null);
+    defer std.testing.allocator.free(output);
+    _ = try std.unicode.Utf8View.init(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Anders Carlson Kick") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "(And…") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Scoring") != null);
+    const page = try detailHtml(std.testing.allocator, game, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Anders Carlson Kick") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
