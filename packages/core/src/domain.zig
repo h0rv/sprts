@@ -1,3 +1,13 @@
+pub const LineScore = struct {
+    period: ?i64 = null,
+    display: []const u8 = "",
+
+    pub const jsonschema = .{
+        .name = "LineScore",
+        .description = "One period's score for one side of a game, e.g. a quarter or a tennis set.",
+    };
+};
+
 pub const Participant = struct {
     id: []const u8,
     name: []const u8,
@@ -6,6 +16,12 @@ pub const Participant = struct {
     winner: bool,
     home_away: ?[]const u8 = null,
     record: ?[]const u8 = null,
+    /// Per-period breakdown (quarters, periods, innings, sets) when the
+    /// provider supplies one; empty otherwise.
+    lines: []const LineScore = &.{},
+    /// Recent-results string (e.g. soccer "WDDLD") when the provider
+    /// supplies one; null otherwise.
+    form: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "Participant",
@@ -13,6 +29,8 @@ pub const Participant = struct {
         .fields = .{
             .home_away = .{ .description = "The team-sport side when the provider supplies one." },
             .record = .{ .description = "The win-loss style overall record when the provider supplies one." },
+            .lines = .{ .description = "Per-period scores when the provider supplies them; empty otherwise." },
+            .form = .{ .description = "Recent-results string (e.g. soccer WDDLD) when the provider supplies one." },
         },
     };
 };
@@ -27,6 +45,18 @@ pub const Game = struct {
     /// TV broadcaster (first ESPN `broadcasts[].names` entry, geo feed
     /// short name as fallback); null when the provider supplies none.
     network: ?[]const u8 = null,
+    /// Venue full name from the ESPN competition (racing falls back to
+    /// the event circuit); null when the provider supplies none.
+    venue: ?[]const u8 = null,
+    /// Betting line from the first ESPN odds entry (`details`, e.g.
+    /// "LAR -3.5"); null when the provider supplies none.
+    odds: ?[]const u8 = null,
+    /// Over/under total from the same odds entry (e.g. "48.5"); null
+    /// when the provider supplies none.
+    over_under: ?[]const u8 = null,
+    /// Per-game statistical leaders (e.g. "Drew Lock 16/22, 187 YDS");
+    /// empty when the provider supplies none.
+    leaders: []const []const u8 = &.{},
 
     pub const jsonschema = .{
         .name = "Game",
@@ -34,6 +64,10 @@ pub const Game = struct {
         .fields = .{
             .starts_at = .{ .format = "date-time" },
             .network = .{ .description = "TV broadcaster when the provider supplies one." },
+            .venue = .{ .description = "Venue full name when the provider supplies one." },
+            .odds = .{ .description = "Betting line when the provider supplies one." },
+            .over_under = .{ .description = "Over/under total when the provider supplies one." },
+            .leaders = .{ .description = "Per-game statistical leader strings when the provider supplies them." },
         },
     };
 };

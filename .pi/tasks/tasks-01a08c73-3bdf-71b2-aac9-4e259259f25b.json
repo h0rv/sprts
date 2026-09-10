@@ -1,0 +1,49 @@
+{
+  "nextId": 5,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Baseline: read provider+core+spec, run tests",
+      "description": "Read AGENTS.md (done), provider.zig, core domain/detail/schedule/standings, spec.zig; run baseline tests for apps/server and packages/core. Identify current normalization coverage per league family.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789062815286,
+      "updatedAt": 1789063293267
+    },
+    {
+      "id": "2",
+      "subject": "Core model additions (domain+detail)",
+      "description": "Additive fields only: domain Game (venue, odds, over_under, leaders) + Participant (lines, form) + LineScore struct; detail GameDetail (odds, over_under, injuries, win_probability). jsonschema descriptions per pattern.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789063293267,
+      "updatedAt": 1789063948898
+    },
+    {
+      "id": "3",
+      "subject": "Provider parsing + tests for gap fixes",
+      "description": "Board: venue (comp, circuit fallback), odds/over_under, competitor linescores incl. tennis tiebreaks, comp-level leaders, soccer form, tennis groupings day-filtered with sets-won scores. Detail: injuries, win_probability, pickcenter/odds. Fixture tests present+absent per field.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789063293267,
+      "updatedAt": 1789063948898
+    },
+    {
+      "id": "4",
+      "subject": "Verify, commit, report",
+      "description": "Run apps/server + packages/core tests, commit in worktree, report SHA + per-league gap table.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789063293268,
+      "updatedAt": 1789063948899
+    }
+  ]
+}

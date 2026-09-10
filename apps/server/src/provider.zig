@@ -236,6 +236,12 @@ const Event = struct {
     date: []const u8 = "",
     status: ?Status = null,
     competitions: []const Competition = &.{},
+    /// Racing carries the track here instead of a competition venue
+    /// (`circuit.fullName`, e.g. "Madring"); every other sport omits it.
+    circuit: ?BoardCircuit = null,
+    /// Tennis carries tournament draws here (event-level competitions
+    /// stay empty); every other sport omits them.
+    groupings: ?[]const BoardGrouping = null,
 };
 
 const Status = struct { type: StatusType = .{} };
@@ -251,6 +257,57 @@ const Competition = struct {
     competitors: []const Competitor = &.{},
     broadcasts: []const ScoreboardBroadcast = &.{},
     geoBroadcasts: []const ScoreboardGeoBroadcast = &.{},
+    venue: ?BoardVenue = null,
+    odds: ?[]const BoardOdds = null,
+    leaders: ?[]const BoardLeaderCat = null,
+};
+/// ESPN competition venue: only `fullName` is surfaced (city + court
+/// details stay upstream). Absent on sparse payloads.
+const BoardVenue = struct {
+    fullName: []const u8 = "",
+};
+/// ESPN racing circuit (event level): the track name standing in for a
+/// competition venue on sessions that carry none of their own.
+const BoardCircuit = struct {
+    fullName: []const u8 = "",
+};
+/// ESPN odds entry: `details` is the line ("LAR -3.5", "BOU +150"),
+/// `overUnder` the total (48.5, 2.5). Either may be absent per sport.
+const BoardOdds = struct {
+    details: []const u8 = "",
+    overUnder: std.json.Value = .null,
+};
+/// ESPN board linescore: quarter/period/set score. Display text wins,
+/// else the numeric value; tennis sets add `tiebreak` ("7(7)").
+/// `period` is explicit on team sports, absent on tennis sets (order).
+const BoardLinescore = struct {
+    value: std.json.Value = .null,
+    displayValue: std.json.Value = .null,
+    period: ?i64 = null,
+    tiebreak: std.json.Value = .null,
+    winner: ?bool = null,
+};
+/// ESPN board leader category (football-style combined table): the
+/// category label plus one entry per leader, each carrying its athlete.
+const BoardLeaderCat = struct {
+    name: []const u8 = "",
+    displayName: []const u8 = "",
+    leaders: []const BoardLeaderEntry = &.{},
+};
+const BoardLeaderEntry = struct {
+    displayValue: std.json.Value = .null,
+    value: std.json.Value = .null,
+    athlete: ?SummaryAthlete = null,
+};
+/// ESPN tennis draw: the grouping label plus that draw's matches.
+/// Matches reuse `Competition` (same keys: id/date/status/
+/// competitors/broadcasts/venue); round/notes stay upstream.
+const BoardGrouping = struct {
+    grouping: ?BoardGroupingMeta = null,
+    competitions: []const Competition = &.{},
+};
+const BoardGroupingMeta = struct {
+    displayName: []const u8 = "",
 };
 /// ESPN competition broadcast: `names` carries the TV networks
 /// (e.g. `["ESPN"]`); every other field is ignored.
@@ -290,6 +347,8 @@ const Competitor = struct {
     team: ?Team = null,
     athlete: ?Athlete = null,
     records: []const Record = &.{},
+    linescores: ?[]const BoardLinescore = null,
+    form: ?[]const u8 = null,
 };
 const Record = struct {
     type: []const u8 = "",
@@ -312,6 +371,171 @@ const Identity = struct {
     abbreviation: []const u8,
 };
 
+/// Venue for one board game: the competition venue first, else the
+/// event circuit (racing sessions carry no venue of their own), else
+/// null (absent stays absent).
+fn competitionVenue(competition: Competition, event: Event) ?[]const u8 {
+    if (competition.venue) |venue| if (venue.fullName.len > 0) return venue.fullName;
+    if (event.circuit) |circuit| if (circuit.fullName.len > 0) return circuit.fullName;
+    return null;
+}
+
+const OddsFields = struct {
+    odds: ?[]const u8 = null,
+    over_under: ?[]const u8 = null,
+};
+
+/// First odds entry that carries anything wins (details and total stay
+/// coherent: both come from the same book entry). Null/absent entries
+/// and empty details fall through; nothing yields nulls.
+fn oddsFields(arena: std.mem.Allocator, entries: ?[]const BoardOdds) !OddsFields {
+    const list = entries orelse return .{};
+    for (list) |entry| {
+        const over = try jsonText(arena, entry.overUnder);
+        if (entry.details.len > 0) return .{ .odds = entry.details, .over_under = over };
+        if (over != null) return .{ .over_under = over };
+    }
+    return .{};
+}
+
+/// Per-period display for one board competitor: display text, else the
+/// numeric value, else "-" (the detail fallback). Tennis sets append
+/// their tiebreak ("7(7)"); explicit periods win, else payload order.
+fn competitorLines(arena: std.mem.Allocator, linescores: ?[]const BoardLinescore) ![]const core.domain.LineScore {
+    const list = linescores orelse return &.{};
+    var out: std.ArrayList(core.domain.LineScore) = .empty;
+    for (list, 0..) |line, index| {
+        const base = (try jsonText(arena, line.displayValue)) orelse (try jsonText(arena, line.value)) orelse "-";
+        const tiebreak = try jsonText(arena, line.tiebreak);
+        const display = if (tiebreak) |points|
+            (if (points.len > 0) try std.fmt.allocPrint(arena, "{s}({s})", .{ base, points }) else base)
+        else
+            base;
+        try out.append(arena, .{
+            .period = line.period orelse @as(i64, @intCast(index + 1)),
+            .display = display,
+        });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Combined board leader table (football-style): every category, up to 2
+/// entries each, as "{name} {displayValue}". Bare numbers take their
+/// category label (the detail soccer rule); empty names/values skip.
+fn boardLeaders(arena: std.mem.Allocator, groups: ?[]const BoardLeaderCat) ![]const []const u8 {
+    const list = groups orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (list) |category| {
+        for (category.leaders[0..@min(category.leaders.len, 2)]) |entry| {
+            const name = athleteName(entry.athlete) orelse continue;
+            const display = (try jsonText(arena, entry.displayValue)) orelse (try jsonText(arena, entry.value)) orelse "";
+            if (display.len == 0) continue;
+            if (isBareNumber(display)) {
+                const label: []const u8 = if (category.displayName.len > 0)
+                    category.displayName
+                else if (category.name.len > 0)
+                    category.name
+                else
+                    "total";
+                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ name, label, display }));
+            } else {
+                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, display }));
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Sets won from a tennis match's set linescores (winner flags), as
+/// text. Null when no sets are posted yet (unplayed matches score "").
+fn setsWon(arena: std.mem.Allocator, competitor: Competitor) !?[]const u8 {
+    const lines = competitor.linescores orelse return null;
+    if (lines.len == 0) return null;
+    var won: i64 = 0;
+    for (lines) |line| {
+        if (line.winner orelse false) won += 1;
+    }
+    return try std.fmt.allocPrint(arena, "{d}", .{won});
+}
+
+/// One board participant from a raw competitor. Null when the competitor
+/// carries neither a team nor an athlete (nothing to name). The
+/// `score_override` (tennis sets-won) wins over the score/order rules.
+fn boardParticipant(
+    arena: std.mem.Allocator,
+    competitor: Competitor,
+    competitors_len: usize,
+    score_override: ?[]const u8,
+) !?core.domain.Participant {
+    const identity: Identity = identity: {
+        if (competitor.team) |team| break :identity Identity{
+            .id = team.id,
+            .name = if (team.displayName.len > 0) team.displayName else team.name,
+            .abbreviation = team.abbreviation,
+        };
+        if (competitor.athlete) |athlete| break :identity Identity{
+            .id = competitor.id,
+            .name = if (athlete.displayName.len > 0) athlete.displayName else athlete.fullName,
+            .abbreviation = "",
+        };
+        return null;
+    };
+    const record: ?[]const u8 = record: {
+        for (competitor.records) |r| {
+            if (std.mem.eql(u8, r.type, "total") and r.summary.len > 0) break :record r.summary;
+        }
+        break :record null;
+    };
+    const score = if (score_override) |explicit|
+        explicit
+    else if (competitor.score.len > 0)
+        competitor.score
+    else if (competitors_len > 2 and competitor.order > 0)
+        try std.fmt.allocPrint(arena, "#{d}", .{competitor.order})
+    else
+        "";
+    return .{
+        .id = identity.id,
+        .name = identity.name,
+        .abbreviation = identity.abbreviation,
+        .score = score,
+        .winner = competitor.winner,
+        .home_away = if (competitor.homeAway.len > 0) competitor.homeAway else null,
+        .record = record,
+        .lines = try competitorLines(arena, competitor.linescores),
+        .form = competitor.form,
+    };
+}
+
+const BoardGameArgs = struct {
+    id: []const u8,
+    name: []const u8,
+    starts_at: []const u8,
+    state: []const u8,
+    status: []const u8,
+    participants: []const core.domain.Participant,
+    network: ?[]const u8,
+    venue: ?[]const u8,
+    odds: OddsFields,
+    leaders: []const []const u8,
+};
+
+fn assembleBoardGame(args: BoardGameArgs) core.domain.Game {
+    return .{
+        .id = args.id,
+        .name = args.name,
+        .starts_at = args.starts_at,
+        .state = args.state,
+        .status = args.status,
+        .participants = args.participants,
+        .network = args.network,
+        .venue = args.venue,
+        .odds = args.odds.odds,
+        .over_under = args.odds.over_under,
+        .leaders = args.leaders,
+    };
+}
+
 pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, body: []const u8) !core.domain.Scoreboard {
     const response = try std.json.parseFromSliceLeaky(ScoreboardResponse, arena, body, .{
         .ignore_unknown_fields = true,
@@ -322,40 +546,9 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
         for (event.competitions, 0..) |competition, competition_index| {
             var participants: std.ArrayList(core.domain.Participant) = .empty;
             for (competition.competitors) |competitor| {
-                const identity: Identity = identity: {
-                    if (competitor.team) |team| break :identity Identity{
-                        .id = team.id,
-                        .name = if (team.displayName.len > 0) team.displayName else team.name,
-                        .abbreviation = team.abbreviation,
-                    };
-                    if (competitor.athlete) |athlete| break :identity Identity{
-                        .id = competitor.id,
-                        .name = if (athlete.displayName.len > 0) athlete.displayName else athlete.fullName,
-                        .abbreviation = "",
-                    };
-                    continue;
-                };
-                const record: ?[]const u8 = record: {
-                    for (competitor.records) |r| {
-                        if (std.mem.eql(u8, r.type, "total") and r.summary.len > 0) break :record r.summary;
-                    }
-                    break :record null;
-                };
-                const score = if (competitor.score.len > 0)
-                    competitor.score
-                else if (competition.competitors.len > 2 and competitor.order > 0)
-                    try std.fmt.allocPrint(arena, "#{d}", .{competitor.order})
-                else
-                    "";
-                try participants.append(arena, .{
-                    .id = identity.id,
-                    .name = identity.name,
-                    .abbreviation = identity.abbreviation,
-                    .score = score,
-                    .winner = competitor.winner,
-                    .home_away = if (competitor.homeAway.len > 0) competitor.homeAway else null,
-                    .record = record,
-                });
+                if (try boardParticipant(arena, competitor, competition.competitors.len, null)) |participant| {
+                    try participants.append(arena, participant);
+                }
             }
             const status_type = if (competition.status) |status|
                 status.type
@@ -364,7 +557,7 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
             else
                 StatusType{};
             const game_id = if (competition.id.len > 0) competition.id else if (competition_index == 0) event.id else try std.fmt.allocPrint(arena, "{s}-{d}", .{ event.id, competition_index });
-            try games.append(arena, .{
+            try games.append(arena, assembleBoardGame(.{
                 .id = game_id,
                 .name = if (event.name.len > 0) event.name else event.shortName,
                 .starts_at = if (competition.date.len > 0) competition.date else event.date,
@@ -372,7 +565,46 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
                 .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
                 .participants = try participants.toOwnedSlice(arena),
                 .network = competitionNetwork(competition),
-            });
+                .venue = competitionVenue(competition, event),
+                .odds = try oddsFields(arena, competition.odds),
+                .leaders = try boardLeaders(arena, competition.leaders),
+            }));
+        }
+        // Tennis tournaments carry no event-level competitions: the
+        // draws live under `groupings`. Only matches dated the requested
+        // day board (dateless callers match nothing, never everything).
+        if (event.groupings) |groupings| {
+            for (groupings) |grouping| {
+                for (grouping.competitions) |match| {
+                    if (match.date.len < 10) continue;
+                    if (!std.mem.eql(u8, match.date[0..10], day)) continue;
+                    var participants: std.ArrayList(core.domain.Participant) = .empty;
+                    for (match.competitors) |competitor| {
+                        const sets = try setsWon(arena, competitor);
+                        if (try boardParticipant(arena, competitor, match.competitors.len, sets)) |participant| {
+                            try participants.append(arena, participant);
+                        }
+                    }
+                    const status_type = if (match.status) |status|
+                        status.type
+                    else if (event.status) |status|
+                        status.type
+                    else
+                        StatusType{};
+                    try games.append(arena, assembleBoardGame(.{
+                        .id = if (match.id.len > 0) match.id else event.id,
+                        .name = if (event.name.len > 0) event.name else event.shortName,
+                        .starts_at = if (match.date.len > 0) match.date else event.date,
+                        .state = status_type.state,
+                        .status = if (status_type.shortDetail.len > 0) status_type.shortDetail else status_type.description,
+                        .participants = try participants.toOwnedSlice(arena),
+                        .network = competitionNetwork(match),
+                        .venue = competitionVenue(match, event),
+                        .odds = try oddsFields(arena, match.odds),
+                        .leaders = try boardLeaders(arena, match.leaders),
+                    }));
+                }
+            }
         }
     }
     return .{
@@ -846,6 +1078,16 @@ const SummaryResponse = struct {
     // values, e.g. "21/25, 320 YDS, 3 TD"). Preferred over the boxscore
     // fallback when present; the wire shape (`leaders: []string`) is same.
     leaders: ?[]const SummaryTopTeam = null,
+    // Injury report: per-team entries with status + athlete; details
+    // carry the body part when ESPN specifies one.
+    injuries: ?[]const SummaryInjuryTeam = null,
+    // Win-probability samples across the game; the last entry is the
+    // current (live) or final probability. Empty when ESPN ships none.
+    winprobability: ?[]const SummaryWinProb = null,
+    // Game odds: `pickcenter` when ESPN centers them there (football
+    // post-game), else `odds`. Same entry shape as the board odds.
+    pickcenter: ?[]const BoardOdds = null,
+    odds: ?[]const BoardOdds = null,
 };
 
 const SummaryHeader = struct {
@@ -983,6 +1225,25 @@ const SummaryTopEntry = struct {
     displayValue: std.json.Value = .null,
     value: std.json.Value = .null,
     athlete: ?SummaryAthlete = null,
+};
+
+const SummaryInjuryTeam = struct {
+    team: ?SummaryTeam = null,
+    injuries: []const SummaryInjury = &.{},
+};
+
+const SummaryInjury = struct {
+    status: std.json.Value = .null,
+    athlete: ?SummaryAthlete = null,
+    details: ?SummaryInjuryDetails = null,
+};
+
+const SummaryInjuryDetails = struct {
+    type: []const u8 = "",
+};
+
+const SummaryWinProb = struct {
+    homeWinPercentage: ?f64 = null,
 };
 
 fn refId(ref: ?SummaryIdRef) ?[]const u8 {
@@ -1850,6 +2111,55 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
     // depth: box-score team totals ride the already-fetched summary payload.
     const team_stats = try boxTeamStats(arena, response.boxscore);
 
+    // Injury report: one line per entry (team abbreviated, status, body
+    // part when specified). Entries without a name or a status skip;
+    // no report yields an empty list, never an error.
+    var injuries: std.ArrayList([]const u8) = .empty;
+    if (response.injuries) |teams| {
+        for (teams) |entry| {
+            const abbr: []const u8 = if (entry.team) |team| team.abbreviation else "?";
+            const prefix: []const u8 = if (abbr.len > 0 and !std.mem.eql(u8, abbr, "?"))
+                try std.fmt.allocPrint(arena, "{s} ", .{abbr})
+            else
+                "";
+            for (entry.injuries) |injury| {
+                const name = athleteName(injury.athlete) orelse continue;
+                const status = (try jsonText(arena, injury.status)) orelse "";
+                if (status.len == 0) continue;
+                const suffix: []const u8 = if (injury.details) |details|
+                    (if (details.type.len > 0) try std.fmt.allocPrint(arena, " ({s})", .{details.type}) else "")
+                else
+                    "";
+                try injuries.append(arena, try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ prefix, name, status, suffix }));
+            }
+        }
+    }
+
+    // Win probability: the last sample's home share, labeled with the
+    // home abbreviation (the feed's perspective). Empty or percentage-
+    // less samples yield null, never a fabricated zero.
+    var win_probability: ?[]const u8 = null;
+    if (response.winprobability) |samples| {
+        if (samples.len > 0) {
+            if (samples[samples.len - 1].homeWinPercentage) |share| {
+                var home_abbr: ?[]const u8 = null;
+                for (competition.competitors) |competitor| {
+                    if (!std.mem.eql(u8, competitor.homeAway, "home")) continue;
+                    home_abbr = if (competitor.team) |team| team.abbreviation else null;
+                    break;
+                }
+                if (home_abbr) |abbr| {
+                    win_probability = try std.fmt.allocPrint(arena, "{s} {d:.1}%", .{ abbr, share * 100 });
+                }
+            }
+        }
+    }
+
+    // Detail odds ride the summary payload: pickcenter first (football
+    // centers post-game odds there), then `odds`. The board row may
+    // carry none (post-game boards drop them), so no board fallback.
+    const detail_odds = try oddsFields(arena, response.pickcenter orelse response.odds);
+
     return .{
         .id = try copy(arena, game.id),
         .league = league.slug,
@@ -1871,6 +2181,10 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .lineups = try lineups.toOwnedSlice(arena),
         // depth: box-score team totals (optional; empty when not supplied).
         .team_stats = team_stats,
+        .odds = detail_odds.odds,
+        .over_under = detail_odds.over_under,
+        .injuries = try injuries.toOwnedSlice(arena),
+        .win_probability = win_probability,
     };
 }
 
@@ -4745,3 +5059,248 @@ test "past-date game alias parses and resolves to the canonical game" {
     try std.testing.expectEqualStrings("401", findGameByMatchup(board, "MIN", "DET").?.id);
     try std.testing.expect(findGameByMatchup(board, "nyy", "bos") == null);
 }
+
+// ---- Per-sport DATA gaps (appended; existing tests above untouched) ----
+//
+// Verified live 2026-09-10 (8 requests): NFL board (?week=1) + summary,
+// WNBA/EPL/NHL/ATP/F1/UFC boards. PGA unaudited (budget); NBA/NCAAM/NCAAM
+// inferred from WNBA (same basketball shape), NCAAF from NFL, WTA/other
+// soccer from ATP/EPL. Every fix below rides a payload the fetch already
+// makes: zero new upstream requests.
+
+test "board venue reads competition first, circuit fallback, else null" {
+    // NFL shape: competition venue wins.
+    const with_venue =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","venue":{"fullName":"Lumen Field"},"competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"25","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    // F1 shape: sessions carry no venue; the event circuit stands in.
+    const with_circuit =
+        \\{"events":[{"id":"600057443","name":"Spanish Grand Prix","date":"2026-09-11T11:30Z","status":{"type":{"state":"pre","shortDetail":"9/11"}},"circuit":{"fullName":"Madring"},"competitions":[{"id":"401839103","date":"2026-09-11T11:30Z","competitors":[]}]}]}
+    ;
+    // Neither: absent stays absent.
+    const bare =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"id":"9","date":"2026-09-06T17:00Z","competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nfl = try parseAndNormalize(arena, core.leagues.find("nfl").?, "2026-09-09", with_venue);
+    try std.testing.expectEqualStrings("Lumen Field", nfl.games[0].venue.?);
+    const f1 = try parseAndNormalize(arena, core.leagues.find("f1").?, "2026-09-11", with_circuit);
+    try std.testing.expectEqualStrings("Madring", f1.games[0].venue.?);
+    try std.testing.expectEqual(@as(usize, 0), f1.games[0].participants.len);
+    const plain = try parseAndNormalize(arena, core.leagues.find("mlb").?, "2026-09-06", bare);
+    try std.testing.expect(plain.games[0].venue == null);
+}
+
+test "board odds thread details and total, null stays null" {
+    // NFL pre-game: details plus a numeric total.
+    const pre =
+        \\{"events":[{"id":"401872657","name":"SF at LAR","date":"2026-09-11T00:35Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitions":[{"id":"401872657","date":"2026-09-11T00:35Z","odds":[{"details":"LAR -3.5","overUnder":48.5}],"competitors":[{"homeAway":"away","team":{"id":"25","displayName":"49ers","abbreviation":"SF"}},{"homeAway":"home","team":{"id":"11","displayName":"Rams","abbreviation":"LAR"}}]}]}]}
+    ;
+    // Total without a line: odds stays null, the total still threads.
+    const total_only =
+        \\{"events":[{"id":"8","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"id":"8","date":"2026-09-06T17:00Z","odds":[{"overUnder":2.5}],"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    // NFL post-game: ESPN drops odds entirely (null), never a stale line.
+    const post =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","odds":null,"competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"25","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nfl = core.leagues.find("nfl").?;
+    const lined = try parseAndNormalize(arena, nfl, "2026-09-10", pre);
+    try std.testing.expectEqualStrings("LAR -3.5", lined.games[0].odds.?);
+    try std.testing.expectEqualStrings("48.5", lined.games[0].over_under.?);
+    const totals = try parseAndNormalize(arena, nfl, "2026-09-06", total_only);
+    try std.testing.expect(totals.games[0].odds == null);
+    try std.testing.expectEqualStrings("2.5", totals.games[0].over_under.?);
+    const final = try parseAndNormalize(arena, nfl, "2026-09-09", post);
+    try std.testing.expect(final.games[0].odds == null);
+    try std.testing.expect(final.games[0].over_under == null);
+}
+
+test "board linescores thread quarters, absent stays empty" {
+    // NFL post-game quarters ride the board payload itself.
+    const final =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"Patriots","abbreviation":"NE"},"linescores":[{"value":0,"displayValue":"0","period":1},{"value":7,"displayValue":"7","period":2}]},{"homeAway":"home","score":"13","team":{"id":"25","displayName":"Seahawks","abbreviation":"SEA"},"linescores":[{"value":0,"displayValue":"0","period":1},{"value":0,"displayValue":"0","period":2}]}]}]}]}
+    ;
+    // Pre-game: no linescores key at all.
+    const pre =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"id":"9","date":"2026-09-06T17:00Z","competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nfl = core.leagues.find("nfl").?;
+    const board = try parseAndNormalize(arena, nfl, "2026-09-09", final);
+    const away = board.games[0].participants[0];
+    try std.testing.expectEqual(@as(usize, 2), away.lines.len);
+    try std.testing.expectEqual(@as(i64, 1), away.lines[0].period.?);
+    try std.testing.expectEqualStrings("0", away.lines[0].display);
+    try std.testing.expectEqualStrings("7", away.lines[1].display);
+    const scheduled = try parseAndNormalize(arena, nfl, "2026-09-06", pre);
+    try std.testing.expectEqual(@as(usize, 0), scheduled.games[0].participants[0].lines.len);
+}
+
+test "tennis set scores thread values with tiebreaks" {
+    // Live ATP shape: numeric values, no display text, tiebreaks on
+    // the breaker set only.
+    const fixture =
+        \\{"events":[{"id":"189-2026","name":"US Open","date":"2026-08-24T15:05Z","groupings":[{"grouping":{"displayName":"Men's Singles"},"competitions":[{"id":"184607","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"1","order":2,"winner":false,"athlete":{"displayName":"Roberto Carballes Baena"} ,"linescores":[{"value":6,"tiebreak":3,"winner":false},{"value":3,"winner":false}]},{"id":"2","order":1,"winner":true,"athlete":{"displayName":"Jacob Fearnley"},"linescores":[{"value":7,"tiebreak":7,"winner":true},{"value":6,"winner":true}]}]}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const board = try parseAndNormalize(arena_state.allocator(), core.leagues.find("atp").?, "2026-08-24", fixture);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    const loser = board.games[0].participants[0];
+    try std.testing.expectEqualStrings("0", loser.score);
+    try std.testing.expectEqualStrings("6(3)", loser.lines[0].display);
+    try std.testing.expectEqualStrings("3", loser.lines[1].display);
+    const winner = board.games[0].participants[1];
+    try std.testing.expectEqualStrings("2", winner.score);
+    try std.testing.expectEqualStrings("7(7)", winner.lines[0].display);
+}
+
+test "tennis draws board only their day, else nothing" {
+    const tournament =
+        \\{"events":[{"id":"189-2026","name":"US Open","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"venue":{"displayName":"New York, USA"},"groupings":[{"grouping":{"displayName":"Men's Singles"},"competitions":[{"id":"184607","date":"2026-08-24T15:05Z","startDate":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"venue":{"fullName":"New York, USA"},"broadcasts":[{"names":["ESPN+"]}],"competitors":[{"id":"1","order":2,"winner":false,"athlete":{"displayName":"Roberto Carballes Baena"},"linescores":[{"value":6,"tiebreak":3,"winner":false}]},{"id":"2","order":1,"winner":true,"athlete":{"displayName":"Jacob Fearnley"},"linescores":[{"value":7,"tiebreak":7,"winner":true}]}]},{"id":"184608","date":"2026-08-25T15:05Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"id":"3","order":1,"athlete":{"displayName":"Scheduled One"}},{"id":"4","order":2,"athlete":{"displayName":"Scheduled Two"}}]}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const atp = core.leagues.find("atp").?;
+    // Match day: the dated match boards with its draw context.
+    const day = try parseAndNormalize(arena, atp, "2026-08-24", tournament);
+    try std.testing.expectEqual(@as(usize, 1), day.games.len);
+    try std.testing.expectEqualStrings("184607", day.games[0].id);
+    try std.testing.expectEqualStrings("US Open", day.games[0].name);
+    try std.testing.expectEqualStrings("New York, USA", day.games[0].venue.?);
+    try std.testing.expectEqualStrings("ESPN+", day.games[0].network.?);
+    try std.testing.expectEqualStrings("Roberto Carballes Baena", day.games[0].participants[0].name);
+    // Next day: only the scheduled match; unplayed sets score blank.
+    const next = try parseAndNormalize(arena, atp, "2026-08-25", tournament);
+    try std.testing.expectEqual(@as(usize, 1), next.games.len);
+    try std.testing.expectEqualStrings("184608", next.games[0].id);
+    try std.testing.expectEqualStrings("", next.games[0].participants[0].score);
+    try std.testing.expectEqual(@as(usize, 0), next.games[0].participants[0].lines.len);
+    // Off days (and the dateless lookup placeholder) board nothing.
+    const off = try parseAndNormalize(arena, atp, "2026-09-10", tournament);
+    try std.testing.expectEqual(@as(usize, 0), off.games.len);
+    const dateless = try parseAndNormalize(arena, atp, "0000-00-00", tournament);
+    try std.testing.expectEqual(@as(usize, 0), dateless.games.len);
+}
+
+test "board leaders map the combined table, absent stays empty" {
+    // Live NFL post-game shape: combined categories, team refs ignored.
+    const with_leaders =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","leaders":[{"name":"passingYards","displayName":"Passing Leader","leaders":[{"displayValue":"16/22, 187 YDS, 1 TD","value":187,"athlete":{"displayName":"Drew Lock"}}]},{"name":"tackles","displayName":"Tackles","leaders":[{"displayValue":9,"value":9,"athlete":{"displayName":"Jordyn Brooks"}}]}],"competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"25","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    // Null table (every pre-game board): empty, never an error.
+    const without =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"id":"9","date":"2026-09-06T17:00Z","leaders":null,"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nfl = core.leagues.find("nfl").?;
+    const board = try parseAndNormalize(arena, nfl, "2026-09-09", with_leaders);
+    try std.testing.expectEqual(@as(usize, 2), board.games[0].leaders.len);
+    try std.testing.expectEqualStrings("Drew Lock 16/22, 187 YDS, 1 TD", board.games[0].leaders[0]);
+    // Bare numbers take their category label (the detail soccer rule).
+    try std.testing.expectEqualStrings("Jordyn Brooks Tackles 9", board.games[0].leaders[1]);
+    const bare = try parseAndNormalize(arena, nfl, "2026-09-06", without);
+    try std.testing.expectEqual(@as(usize, 0), bare.games[0].leaders.len);
+}
+
+test "soccer form threads, absent stays null" {
+    // Live EPL shape: per-competitor recent-results string.
+    const with_form =
+        \\{"events":[{"id":"401879285","name":"BRE at BOU","date":"2026-09-12T14:00Z","competitions":[{"id":"401879285","date":"2026-09-12T14:00Z","competitors":[{"homeAway":"away","score":"0","team":{"id":"1","displayName":"Brentford","abbreviation":"BRE"},"form":"WDDLD"},{"homeAway":"home","score":"0","team":{"id":"2","displayName":"Bournemouth","abbreviation":"BOU"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const board = try parseAndNormalize(arena_state.allocator(), core.leagues.find("epl").?, "2026-09-12", with_form);
+    try std.testing.expectEqualStrings("WDDLD", board.games[0].participants[0].form.?);
+    try std.testing.expect(board.games[0].participants[1].form == null);
+}
+
+test "detail injuries thread statuses, absent stays empty" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"injuries":[{"team":{"id":"26","abbreviation":"SEA"},"injuries":[{"status":"Doubtful","athlete":{"displayName":"Sam Darnold"},"details":{"type":"Hip"}},{"status":"Out","athlete":{"displayName":"No Detail Man"}}]},{"team":{"id":"17","abbreviation":"NE"},"injuries":[]}]}
+    ;
+    const board =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("nfl").?, "401872656");
+    try std.testing.expectEqual(@as(usize, 2), detail.injuries.len);
+    try std.testing.expectEqualStrings("SEA Sam Darnold Doubtful (Hip)", detail.injuries[0]);
+    try std.testing.expectEqualStrings("SEA No Detail Man Out", detail.injuries[1]);
+
+    // No report key at all: empty list, never an error.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "7");
+    try std.testing.expectEqual(@as(usize, 0), bare.injuries.len);
+}
+
+test "detail win probability reads the last sample, absent stays null" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"winprobability":[{"homeWinPercentage":0.6127},{"homeWinPercentage":1.0}]}
+    ;
+    const board =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const detail = try detailAdapter(&fake).fetchDetail(arena, core.leagues.find("nfl").?, "401872656");
+    try std.testing.expectEqualStrings("SEA 100.0%", detail.win_probability.?);
+
+    // Empty samples and missing keys both stay null (never a zero).
+    const empty_summary =
+        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"winprobability":[]}
+    ;
+    var empty_fake = DetailFake{ .summary_body = empty_summary, .board_body = board };
+    const empty = try detailAdapter(&empty_fake).fetchDetail(arena, core.leagues.find("nfl").?, "401872656");
+    try std.testing.expect(empty.win_probability == null);
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
+    try std.testing.expect(bare.win_probability == null);
+}
+
+test "detail odds prefer pickcenter, fall back to odds, absent stays null" {
+    const board =
+        \\{"events":[{"id":"401872656","name":"NE at SEA","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","competitors":[{"homeAway":"away","score":"10","team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"13","team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    const summary_both =
+        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"pickcenter":[{"details":"SEA -3","overUnder":44.5}],"odds":[{"details":"NE +3","overUnder":44.5}]}
+    ;
+    const summary_odds =
+        \\{"header":{"competitions":[{"id":"401872656","date":"2026-09-10T00:20Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"17","homeAway":"away","winner":false,"score":10,"team":{"id":"17","displayName":"New England Patriots","abbreviation":"NE"}},{"id":"26","homeAway":"home","winner":true,"score":13,"team":{"id":"26","displayName":"Seattle Seahawks","abbreviation":"SEA"}}]}]},"odds":[{"details":"NE +3"}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nfl = core.leagues.find("nfl").?;
+    // Pickcenter wins over `odds` when both ship.
+    var both = DetailFake{ .summary_body = summary_both, .board_body = board };
+    const centered = try detailAdapter(&both).fetchDetail(arena, nfl, "401872656");
+    try std.testing.expectEqualStrings("SEA -3", centered.odds.?);
+    try std.testing.expectEqualStrings("44.5", centered.over_under.?);
+    // Odds alone still threads.
+    var fallback = DetailFake{ .summary_body = summary_odds, .board_body = board };
+    const via_odds = try detailAdapter(&fallback).fetchDetail(arena, nfl, "401872656");
+    try std.testing.expectEqualStrings("NE +3", via_odds.odds.?);
+    try std.testing.expect(via_odds.over_under == null);
+    // Neither: nulls, never an error.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
+    try std.testing.expect(bare.odds == null);
+    try std.testing.expect(bare.over_under == null);
+}
+
