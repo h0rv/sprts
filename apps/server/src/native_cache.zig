@@ -8,7 +8,8 @@
 //!   pre-canonicalized (lowercase via `edge_cache.canonicalSlug` /
 //!   `canonicalAbbr`); canonicalization stays in the serve layer exactly
 //!   like the worker's `serveBoard`/`serveTeam`.
-//! - Fresh windows serve directly (board/detail 30s, team 60s); a stale
+//! - Fresh windows serve directly (board/detail 30s, 10s when the stored
+//!   payload has any live game; team 60s); a stale
 //!   entry (board/detail 300s, team 600s) is served only when the upstream
 //!   fetch fails, else the error propagates (the native 502). The TTL
 //!   constants are reused from `edge_cache`, not redeclared.
@@ -65,6 +66,10 @@ fn kindOf(key: Key) Kind {
 /// board window; team renders track the 60s schedule window. Standings
 /// track the schedule window too: tables move at schedule cadence (a game
 /// final at a time), not at live-score cadence.
+///
+/// This is the STATIC default: `put` stores board/detail entries under the
+/// content-derived window (`freshWindowFor`), so a live payload always
+/// expires after 10s even though this function still reports 30s.
 pub fn freshTtl(kind: Kind) i64 {
     return switch (kind) {
         .board, .detail => edge.fresh_ttl_s,
@@ -82,11 +87,29 @@ pub fn staleTtl(kind: Kind) i64 {
     };
 }
 
+/// Fresh window for a STORED payload, derived from rendered content: a
+/// board/detail with any `in` game (details also count a live situation)
+/// expires after the 10s live window, everything else after the static
+/// `freshTtl` above. `put` uses this, so the TTL always tracks the content
+/// that was actually cached — never the request.
+fn freshWindowFor(kind: Kind, data: Data) i64 {
+    return switch (kind) {
+        .board => if (edge.isLiveBoard(data.board)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
+        .detail => if (edge.isLiveDetail(data.detail)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
+        .team, .standings => edge.schedule_fresh_ttl_s,
+    };
+}
+
 /// Cache key. Components mirror the `edge_cache` namespaces; see the
 /// module docs for why the render format is not part of the data key.
+/// Board/detail keys carry the TTL variant (`live`): a live render cached
+/// at t=0 under the live key can never satisfy a final lookup at t=29 as
+/// fresh — the keys differ, so the stale variant simply misses. Callers
+/// must not guess the variant up front (liveness is only known post-fetch);
+/// use `getOrFetchBoard`/`getOrFetchDetail`, which probe both.
 pub const Key = union(enum) {
-    board: struct { slug: []const u8, day: []const u8 },
-    detail: struct { slug: []const u8, id: []const u8 },
+    board: struct { slug: []const u8, day: []const u8, live: bool },
+    detail: struct { slug: []const u8, id: []const u8, live: bool },
     team: struct { slug: []const u8, abbr: []const u8 },
     standings: struct { slug: []const u8 },
     teams: struct { slug: []const u8 },
@@ -100,10 +123,12 @@ const KeyContext = struct {
             .board => |b| {
                 h.update(b.slug);
                 h.update(b.day);
+                h.update(if (b.live) "v=live" else "v=final");
             },
             .detail => |d| {
                 h.update(d.slug);
                 h.update(d.id);
+                h.update(if (d.live) "v=live" else "v=final");
             },
             .team => |t| {
                 h.update(t.slug);
@@ -122,8 +147,8 @@ const KeyContext = struct {
     pub fn eql(_: KeyContext, a: Key, b: Key) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
-            .board => |x| std.mem.eql(u8, x.slug, b.board.slug) and std.mem.eql(u8, x.day, b.board.day),
-            .detail => |x| std.mem.eql(u8, x.slug, b.detail.slug) and std.mem.eql(u8, x.id, b.detail.id),
+            .board => |x| std.mem.eql(u8, x.slug, b.board.slug) and std.mem.eql(u8, x.day, b.board.day) and x.live == b.board.live,
+            .detail => |x| std.mem.eql(u8, x.slug, b.detail.slug) and std.mem.eql(u8, x.id, b.detail.id) and x.live == b.detail.live,
             .team => |x| std.mem.eql(u8, x.slug, b.team.slug) and std.mem.eql(u8, x.abbr, b.team.abbr),
             .standings => |x| std.mem.eql(u8, x.slug, b.standings.slug),
             .teams => |x| std.mem.eql(u8, x.slug, b.teams.slug),
@@ -431,10 +456,12 @@ pub const NativeCache = struct {
             .board => |b| .{ .board = .{
                 .slug = try store.allocator().dupe(u8, b.slug),
                 .day = try store.allocator().dupe(u8, b.day),
+                .live = b.live,
             } },
             .detail => |d| .{ .detail = .{
                 .slug = try store.allocator().dupe(u8, d.slug),
                 .id = try store.allocator().dupe(u8, d.id),
+                .live = d.live,
             } },
             .team => |t| .{ .team = .{
                 .slug = try store.allocator().dupe(u8, t.slug),
@@ -451,7 +478,7 @@ pub const NativeCache = struct {
         const entry = Entry{
             .store = store,
             .data = owned_data,
-            .fresh_until = at + freshTtl(kind),
+            .fresh_until = at + freshWindowFor(kind, data),
             .stale_until = at + staleTtl(kind),
         };
 
@@ -498,6 +525,69 @@ pub const NativeCache = struct {
             return err;
         };
         cache.put(key, data, at) catch |err| {
+            std.log.warn("native cache store failed: {t}", .{err});
+        };
+        return .{ .data = data, .outcome = .miss };
+    }
+
+    /// Board fetch through both TTL variants. Liveness is only known
+    /// post-fetch, so the fresh probe checks the live key first, then the
+    /// final key; the payload is stored under its content-derived variant
+    /// (with the matching 10s/30s window via `freshWindowFor`). Stale
+    /// fallback probes both variants; 404-authoritative errors bypass it.
+    pub fn getOrFetchBoard(
+        cache: *NativeCache,
+        arena: std.mem.Allocator,
+        slug: []const u8,
+        day: []const u8,
+        at: i64,
+        ctx: *anyopaque,
+        fetch: FetchFn,
+    ) !Cached {
+        const live_key: Key = .{ .board = .{ .slug = slug, .day = day, .live = true } };
+        const final_key: Key = .{ .board = .{ .slug = slug, .day = day, .live = false } };
+        return cache.getOrFetchSplit(arena, live_key, final_key, at, ctx, fetch);
+    }
+
+    /// Detail fetch through both TTL variants; same scheme as
+    /// `getOrFetchBoard` keyed on `(slug, id)`.
+    pub fn getOrFetchDetail(
+        cache: *NativeCache,
+        arena: std.mem.Allocator,
+        slug: []const u8,
+        id: []const u8,
+        at: i64,
+        ctx: *anyopaque,
+        fetch: FetchFn,
+    ) !Cached {
+        const live_key: Key = .{ .detail = .{ .slug = slug, .id = id, .live = true } };
+        const final_key: Key = .{ .detail = .{ .slug = slug, .id = id, .live = false } };
+        return cache.getOrFetchSplit(arena, live_key, final_key, at, ctx, fetch);
+    }
+
+    fn getOrFetchSplit(
+        cache: *NativeCache,
+        arena: std.mem.Allocator,
+        live_key: Key,
+        final_key: Key,
+        at: i64,
+        ctx: *anyopaque,
+        fetch: FetchFn,
+    ) !Cached {
+        if (try cache.getFresh(arena, live_key, at)) |data| return .{ .data = data, .outcome = .hit };
+        if (try cache.getFresh(arena, final_key, at)) |data| return .{ .data = data, .outcome = .hit };
+        const data = fetch(ctx, arena) catch |err| {
+            if (err == error.GameNotFound or err == error.TeamNotFound or err == error.UnsupportedLeague) return err;
+            if (try cache.getStale(arena, live_key, at)) |stale| return .{ .data = stale, .outcome = .stale };
+            if (try cache.getStale(arena, final_key, at)) |stale| return .{ .data = stale, .outcome = .stale };
+            return err;
+        };
+        const live = switch (data) {
+            .board => |b| edge.isLiveBoard(b),
+            .detail => |d| edge.isLiveDetail(d),
+            .team, .standings => false,
+        };
+        cache.put(if (live) live_key else final_key, data, at) catch |err| {
             std.log.warn("native cache store failed: {t}", .{err});
         };
         return .{ .data = data, .outcome = .miss };
@@ -573,7 +663,7 @@ fn fakeClock(_: std.Io) i64 {
     return 1788739200; // 2026-09-07T00:00:00Z
 }
 
-const board_key: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-06" } };
+const board_key: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-06", .live = false } };
 
 test "fresh hit avoids a second upstream fetch" {
     var cache = testCache();
@@ -648,7 +738,7 @@ test "not-found errors bypass even a live stale entry" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const t0: i64 = 1_000_000;
-    const detail_key: Key = .{ .detail = .{ .slug = "mlb", .id = "7" } };
+    const detail_key: Key = .{ .detail = .{ .slug = "mlb", .id = "7", .live = false } };
 
     const DetailFake = struct {
         fn fetch(ctx: *anyopaque, a: std.mem.Allocator) anyerror!Data {
@@ -768,7 +858,7 @@ test "keys are case-sensitive: callers canonicalize like the edge" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const upper: Key = .{ .board = .{ .slug = "MLB", .day = "2026-09-06" } };
+    const upper: Key = .{ .board = .{ .slug = "MLB", .day = "2026-09-06", .live = false } };
     try std.testing.expect((try cache.getFresh(arena, upper, 1_000_000)) == null);
     // Same components in different namespaces never collide.
     const team_key: Key = .{ .team = .{ .slug = "mlb", .abbr = "2026-09-06" } };
@@ -784,9 +874,9 @@ test "capacity bounds the map, reaping expired entries first" {
     const arena = arena_state.allocator();
     const old: Data = .{ .board = FakeBoard.boardFixture() };
     const t0: i64 = 1_000_000;
-    const k1: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-01" } };
-    const k2: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-02" } };
-    const k3: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-03" } };
+    const k1: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-01", .live = false } };
+    const k2: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-02", .live = false } };
+    const k3: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-03", .live = false } };
     try cache.put(k1, old, t0);
     try cache.put(k2, old, t0);
     try std.testing.expectEqual(@as(usize, 2), try cache.count());
@@ -795,7 +885,7 @@ test "capacity bounds the map, reaping expired entries first" {
     try std.testing.expectEqual(@as(usize, 2), try cache.count());
     try std.testing.expect((try cache.getFresh(arena, k3, t0 + edge.stale_ttl_s + 1)) != null);
     // Nothing expired: inserting a fourth evicts the soonest-stale entry.
-    const k4: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-04" } };
+    const k4: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-04", .live = false } };
     try cache.put(k4, old, t0 + edge.stale_ttl_s + 1);
     try std.testing.expectEqual(@as(usize, 2), try cache.count());
     try std.testing.expect((try cache.getFresh(arena, k4, t0 + edge.stale_ttl_s + 1)) != null);
@@ -899,4 +989,146 @@ test "standings entries use the schedule windows and survive the cache" {
         error.UnsupportedLeague,
         cache.getOrFetch(arena, key, t0 + edge.schedule_fresh_ttl_s, &fake, StandingsFake.fetch),
     );
+}
+
+/// Single-game board fake with caller-chosen states (inline fixture, no
+/// live ESPN): `states` lends each game its `state` (`"in"`/`"post"`).
+const StateBoardFake = struct {
+    calls: usize = 0,
+    states: []const []const u8,
+
+    fn fetch(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Data {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const games = try arena.alloc(domain.Game, self.states.len);
+        for (self.states, 0..) |state, i| {
+            games[i] = .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = state,
+                .status = "Top 7th",
+                .participants = &.{},
+            };
+        }
+        return .{ .board = .{
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .source = "test",
+            .games = games,
+        } };
+    }
+};
+
+/// Single-game detail fake with a caller-chosen state/situation.
+const StateDetailFake = struct {
+    calls: usize = 0,
+    state: []const u8,
+    situation: bool,
+
+    fn fetch(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!Data {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return .{ .detail = try cloneGameDetail(arena, .{
+            .id = "9",
+            .league = "mlb",
+            .league_name = "MLB",
+            .date = "2026-09-06",
+            .state = self.state,
+            .status = "Bot 6th",
+            .participants = &.{},
+            .situation = if (self.situation) .{ .balls = 2, .strikes = 1, .outs = 1 } else null,
+        }) };
+    }
+};
+
+test "live boards refresh on the 10s window" {
+    var cache = testCache();
+    defer cache.deinit();
+    const live_states = [_][]const u8{"in"};
+    var fake = StateBoardFake{ .states = &live_states };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t0: i64 = 1_000_000;
+
+    const first = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, first.outcome);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    // Still fresh at +9s without touching upstream ...
+    const hit = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0 + edge.live_fresh_ttl_s - 1, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.hit, hit.outcome);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    // ... but expired at +10s: the window rolls, upstream refetches.
+    const refetch = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0 + edge.live_fresh_ttl_s, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, refetch.outcome);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "final boards keep the 30s window" {
+    var cache = testCache();
+    defer cache.deinit();
+    const final_states = [_][]const u8{"post"};
+    var fake = StateBoardFake{ .states = &final_states };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t0: i64 = 1_000_000;
+
+    _ = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0, &fake, StateBoardFake.fetch);
+    const hit = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0 + edge.fresh_ttl_s - 1, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.hit, hit.outcome);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const refetch = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0 + edge.fresh_ttl_s, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, refetch.outcome);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "a mixed board with one live game counts as live" {
+    var cache = testCache();
+    defer cache.deinit();
+    const mixed_states = [_][]const u8{ "post", "in", "pre" };
+    var fake = StateBoardFake{ .states = &mixed_states };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t0: i64 = 1_000_000;
+
+    _ = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0, &fake, StateBoardFake.fetch);
+    // Live variant entry: the final key alone never hits ...
+    const live_key: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-06", .live = true } };
+    const final_key: Key = .{ .board = .{ .slug = "mlb", .day = "2026-09-06", .live = false } };
+    try std.testing.expect((try cache.getFresh(arena, live_key, t0)) != null);
+    try std.testing.expect((try cache.getFresh(arena, final_key, t0)) == null);
+    // ... and the 10s window applies: expired at +10s.
+    try std.testing.expect((try cache.getFresh(arena, live_key, t0 + edge.live_fresh_ttl_s)) == null);
+    const refetch = try cache.getOrFetchBoard(arena, "mlb", "2026-09-06", t0 + edge.live_fresh_ttl_s, &fake, StateBoardFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, refetch.outcome);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "live details refresh on the 10s window, finals on 30s" {
+    var cache = testCache();
+    defer cache.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t0: i64 = 1_000_000;
+
+    var live_fake = StateDetailFake{ .state = "in", .situation = true };
+    _ = try cache.getOrFetchDetail(arena, "mlb", "9", t0, &live_fake, StateDetailFake.fetch);
+    const live_hit = try cache.getOrFetchDetail(arena, "mlb", "9", t0 + edge.live_fresh_ttl_s - 1, &live_fake, StateDetailFake.fetch);
+    try std.testing.expectEqual(Outcome.hit, live_hit.outcome);
+    try std.testing.expectEqual(@as(usize, 1), live_fake.calls);
+    const live_refetch = try cache.getOrFetchDetail(arena, "mlb", "9", t0 + edge.live_fresh_ttl_s, &live_fake, StateDetailFake.fetch);
+    try std.testing.expectEqual(Outcome.miss, live_refetch.outcome);
+    try std.testing.expectEqual(@as(usize, 2), live_fake.calls);
+
+    var final_fake = StateDetailFake{ .state = "post", .situation = false };
+    _ = try cache.getOrFetchDetail(arena, "mlb", "10", t0, &final_fake, StateDetailFake.fetch);
+    const final_hit = try cache.getOrFetchDetail(arena, "mlb", "10", t0 + edge.fresh_ttl_s - 1, &final_fake, StateDetailFake.fetch);
+    try std.testing.expectEqual(Outcome.hit, final_hit.outcome);
+    try std.testing.expectEqual(@as(usize, 1), final_fake.calls);
 }

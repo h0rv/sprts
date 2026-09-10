@@ -13,6 +13,17 @@
 //!   `<board>/f<epoch/30>` proves age < 30s on a hit (TTL max-age=30);
 //!   `<board>/s<epoch/300>` proves age < 300s and is served only when the
 //!   upstream fetch fails (manual stale-on-upstream-error, else 502).
+//! - Boards/details with any in-progress game (`state == "in"`; details
+//!   also count a present live `situation`) refresh on a shorter 10s
+//!   window: `<board>/fl<epoch/10>` proves age < 10s. The TTL variant is
+//!   part of the key twice over — the render-variant tag carries `/v/live`
+//!   vs `/v/final` AND the live bucket uses a distinct `fl` prefix with a
+//!   10s divisor — so a live render cached at t=0 can never satisfy a
+//!   final lookup at t=29 as fresh (or vice versa): the variant segments
+//!   differ even when the bucket numbers coincide (epoch 0 yields both f0
+//!   and fl0). Liveness derives from the RENDERED content (post-fetch),
+//!   never the request, so both variants are probed (live first) before
+//!   fetching. The 300s stale window is shared by both variants.
 //! - Only successful renders are ever stored; errors are never cached.
 //!
 //! Note on the format tag: the Workers Cache API `match`/`put` pair ignores
@@ -27,6 +38,11 @@ const router = @import("router.zig");
 
 /// Fresh window in seconds (`TTL max-age=30`).
 pub const fresh_ttl_s: i64 = 30;
+/// Fresh window for live boards/details: any `in` game on the board (or an
+/// `in` detail game) refreshes every 10s instead of 30s. Keyed as a
+/// separate `fl<epoch/10>` bucket under a `/v/live` variant tag (see the
+/// module docs); the 300s stale window below is shared by both variants.
+pub const live_fresh_ttl_s: i64 = 10;
 /// Stale window in seconds (serve stale on upstream error up to 300s).
 pub const stale_ttl_s: i64 = 300;
 
@@ -85,9 +101,30 @@ pub fn detailKey(arena: std.mem.Allocator, slug: []const u8, id: []const u8, tag
     return std.fmt.allocPrint(arena, "sprts/v1/detail/{s}/{s}/{s}", .{ slug, id, tag });
 }
 
-/// Fresh detail key: detail key + 30s bucket. A hit in the current bucket
-/// proves the entry is less than 30s old.
-pub fn detailFreshKey(arena: std.mem.Allocator, detail_key: []const u8, epoch_s: i64) ![]u8 {
+/// True when any game on the board is in progress (`state == "in"`). A
+/// mixed board (one live game among finals) counts as live.
+pub fn isLiveBoard(board: core.domain.Scoreboard) bool {
+    for (board.games) |game| {
+        if (std.mem.eql(u8, game.state, "in")) return true;
+    }
+    return false;
+}
+
+/// True when the detail game is in progress: `state == "in"`, or a live
+/// situation is present (the provider only attaches one to `in` games, so
+/// both readings agree in practice; either suffices).
+pub fn isLiveDetail(detail: core.detail.GameDetail) bool {
+    if (std.mem.eql(u8, detail.state, "in")) return true;
+    return detail.situation != null;
+}
+
+/// Fresh detail key: detail key + bucket. Final content uses the 30s `f`
+/// bucket (a hit proves age < 30s); live content uses the 10s `fl` bucket
+/// (a hit proves age < 10s). The `fl` prefix namespaces the TTL variant in
+/// the bucket segment itself, backing the `/v/live` tag segment: even when
+/// `epoch/10` and `epoch/30` yield the same number, `fl0` never equals `f0`.
+pub fn detailFreshKey(arena: std.mem.Allocator, detail_key: []const u8, epoch_s: i64, live: bool) ![]u8 {
+    if (live) return std.fmt.allocPrint(arena, "{s}/fl{d}", .{ detail_key, @divFloor(epoch_s, live_fresh_ttl_s) });
     return std.fmt.allocPrint(arena, "{s}/f{d}", .{ detail_key, @divFloor(epoch_s, fresh_ttl_s) });
 }
 
@@ -97,9 +134,11 @@ pub fn detailStaleKey(arena: std.mem.Allocator, detail_key: []const u8, epoch_s:
     return std.fmt.allocPrint(arena, "{s}/s{d}", .{ detail_key, @divFloor(epoch_s, stale_ttl_s) });
 }
 
-/// Fresh key: board key + 30s bucket. A hit in the current bucket proves the
-/// entry is less than 30s old.
-pub fn freshKey(arena: std.mem.Allocator, board_key: []const u8, epoch_s: i64) ![]u8 {
+/// Fresh key: board key + bucket. Final content uses the 30s `f` bucket
+/// (a hit proves age < 30s); live content uses the 10s `fl` bucket (a hit
+/// proves age < 10s). Same `fl`-namespacing scheme as `detailFreshKey`.
+pub fn freshKey(arena: std.mem.Allocator, board_key: []const u8, epoch_s: i64, live: bool) ![]u8 {
+    if (live) return std.fmt.allocPrint(arena, "{s}/fl{d}", .{ board_key, @divFloor(epoch_s, live_fresh_ttl_s) });
     return std.fmt.allocPrint(arena, "{s}/f{d}", .{ board_key, @divFloor(epoch_s, fresh_ttl_s) });
 }
 
@@ -175,11 +214,11 @@ test "fresh and stale buckets bound entry age" {
     const board = try boardKey(arena, "mlb", "2026-09-06", "json");
     defer arena.free(board);
 
-    const fresh_start = try freshKey(arena, board, 0);
+    const fresh_start = try freshKey(arena, board, 0, false);
     defer arena.free(fresh_start);
-    const fresh_end = try freshKey(arena, board, 29);
+    const fresh_end = try freshKey(arena, board, 29, false);
     defer arena.free(fresh_end);
-    const fresh_next = try freshKey(arena, board, 30);
+    const fresh_next = try freshKey(arena, board, 30, false);
     defer arena.free(fresh_next);
     try std.testing.expectEqualStrings(fresh_start, fresh_end);
     try std.testing.expect(!std.mem.eql(u8, fresh_start, fresh_next));
@@ -234,11 +273,11 @@ test "detail fresh and stale buckets bound entry age" {
     const base = try detailKey(arena, "mlb", "401816828", "json");
     defer arena.free(base);
 
-    const fresh_start = try detailFreshKey(arena, base, 0);
+    const fresh_start = try detailFreshKey(arena, base, 0, false);
     defer arena.free(fresh_start);
-    const fresh_end = try detailFreshKey(arena, base, 29);
+    const fresh_end = try detailFreshKey(arena, base, 29, false);
     defer arena.free(fresh_end);
-    const fresh_next = try detailFreshKey(arena, base, 30);
+    const fresh_next = try detailFreshKey(arena, base, 30, false);
     defer arena.free(fresh_next);
     try std.testing.expectEqualStrings(fresh_start, fresh_end);
     try std.testing.expect(!std.mem.eql(u8, fresh_start, fresh_next));
@@ -430,4 +469,127 @@ test "standings keys namespace by league and format with schedule windows" {
     defer arena.free(stale_c);
     try std.testing.expectEqualStrings(stale_a, stale_b);
     try std.testing.expect(!std.mem.eql(u8, stale_a, stale_c));
+}
+
+fn liveTestGame(state: []const u8) core.domain.Game {
+    return .{
+        .id = "1",
+        .name = "",
+        .starts_at = "2026-09-06T17:00Z",
+        .state = state,
+        .status = if (std.mem.eql(u8, state, "in")) "Top 7th" else "Final",
+        .participants = &.{},
+    };
+}
+
+test "live boards use the 10s fresh window under a namespaced key" {
+    const arena = std.testing.allocator;
+    const live_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{liveTestGame("in")},
+    };
+    const final_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{liveTestGame("post")},
+    };
+    // Mixed board: one live game among finals still counts as live.
+    const mixed_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{ liveTestGame("post"), liveTestGame("in"), liveTestGame("pre") },
+    };
+    try std.testing.expect(isLiveBoard(live_board));
+    try std.testing.expect(isLiveBoard(mixed_board));
+    try std.testing.expect(!isLiveBoard(final_board));
+    try std.testing.expect(!isLiveBoard(.{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{},
+    }));
+
+    const base = try boardKey(arena, "mlb", "2026-09-06", "json");
+    defer arena.free(base);
+
+    // 10s window: stable within the bucket, rolls across the boundary.
+    const live_start = try freshKey(arena, base, 0, true);
+    defer arena.free(live_start);
+    const live_end = try freshKey(arena, base, 9, true);
+    defer arena.free(live_end);
+    const live_next = try freshKey(arena, base, 10, true);
+    defer arena.free(live_next);
+    try std.testing.expectEqualStrings(live_start, live_end);
+    try std.testing.expect(!std.mem.eql(u8, live_start, live_next));
+
+    // Namespaced: a live render cached at t=0 must not satisfy a final
+    // lookup at t=29 as fresh — the `fl` prefix differs even when the
+    // bucket numbers coincide (epoch 0 yields f0 and fl0).
+    const final_start = try freshKey(arena, base, 0, false);
+    defer arena.free(final_start);
+    try std.testing.expect(!std.mem.eql(u8, live_start, final_start));
+    const final_late = try freshKey(arena, base, 29, false);
+    defer arena.free(final_late);
+    try std.testing.expectEqualStrings(final_start, final_late);
+    try std.testing.expect(!std.mem.eql(u8, live_start, final_late));
+}
+
+test "live details use the 10s window; a live situation alone counts" {
+    const arena = std.testing.allocator;
+    const live: core.detail.GameDetail = .{
+        .id = "9",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "in",
+        .status = "Bot 6th",
+        .participants = &.{},
+        .situation = .{ .balls = 2, .strikes = 1, .outs = 1 },
+    };
+    const final: core.detail.GameDetail = .{
+        .id = "9",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
+    };
+    // Situation without an `in` state still reads as live (the provider
+    // only attaches situations to live games; either signal suffices).
+    const situation_only: core.detail.GameDetail = .{
+        .id = "9",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
+        .situation = .{ .balls = 0, .strikes = 0, .outs = 2 },
+    };
+    try std.testing.expect(isLiveDetail(live));
+    try std.testing.expect(isLiveDetail(situation_only));
+    try std.testing.expect(!isLiveDetail(final));
+
+    const base = try detailKey(arena, "mlb", "9", "json");
+    defer arena.free(base);
+    const live_start = try detailFreshKey(arena, base, 0, true);
+    defer arena.free(live_start);
+    const live_end = try detailFreshKey(arena, base, 9, true);
+    defer arena.free(live_end);
+    const live_next = try detailFreshKey(arena, base, 10, true);
+    defer arena.free(live_next);
+    try std.testing.expectEqualStrings(live_start, live_end);
+    try std.testing.expect(!std.mem.eql(u8, live_start, live_next));
+    const final_start = try detailFreshKey(arena, base, 0, false);
+    defer arena.free(final_start);
+    try std.testing.expect(!std.mem.eql(u8, live_start, final_start));
 }

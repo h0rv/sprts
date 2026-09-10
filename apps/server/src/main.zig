@@ -223,10 +223,12 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respond(request, body, format, .ok, commonHeaders());
                 return;
             }
-            const key: server_app.native_cache.Key = .{ .board = .{ .slug = slug, .day = day } };
+            // TTL variants resolve inside getOrFetchBoard: liveness is only
+            // known post-fetch, so both the live (10s) and final (30s)
+            // entries are probed before fetching.
             var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchBoardPayload) catch |err| {
+            const cached = cache.getOrFetchBoard(arena, slug, day, cache.now(), &fetch_ctx, fetchBoardPayload) catch |err| {
                 upstream_ms = elapsedMs(start, io);
                 status = .bad_gateway;
                 std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
@@ -256,9 +258,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             for (&core.leagues.all, 0..) |*league, i| {
                 sections[i] = .{ .league = league };
                 const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
-                const key: server_app.native_cache.Key = .{ .board = .{ .slug = slug, .day = day } };
                 var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
-                if (cache.getOrFetch(arena, key, at, &fetch_ctx, fetchBoardPayload)) |cached| {
+                if (cache.getOrFetchBoard(arena, slug, day, at, &fetch_ctx, fetchBoardPayload)) |cached| {
                     sections[i].board = cached.data.board;
                 } else |_| {
                     sections[i].board = null;
@@ -283,10 +284,9 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 return;
             };
             const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
-            const key: server_app.native_cache.Key = .{ .detail = .{ .slug = slug, .id = game_route.id } };
             var fetch_ctx = DetailFetchCtx{ .adapter = adapter, .league = league, .id = game_route.id };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchDetailPayload) catch |err| switch (err) {
+            const cached = cache.getOrFetchDetail(arena, slug, game_route.id, cache.now(), &fetch_ctx, fetchDetailPayload) catch |err| switch (err) {
                 error.GameNotFound => {
                     upstream_ms = elapsedMs(start, io);
                     status = .not_found;
