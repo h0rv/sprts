@@ -93,6 +93,40 @@ Use `?format=text` or `?format=html` to force a format. The response
 also honors `Accept: application/json` for scripts. ANSI color is on by
 default for text output. Use `?color=0` to turn it off.
 
+## Pretty games, lineups, streams, and terminal tweaks
+
+```sh
+curl localhost:8080/mlb/2026-09-09/min-det     # date game alias, 302 to /{league}/{id}
+curl localhost:8080/nfl/2026/week1/ne-sea     # football week alias, 302 likewise
+curl localhost:8080/mlb/PHI/today             # today's game, else the team page
+curl 'localhost:8080/mlb?art=off'              # strip braille team marks
+curl -N 'localhost:8080/mlb?stream=sse'        # live text feed (or Accept: text/event-stream)
+```
+
+- Game aliases are human only (no `/api/v1/` twins, JSON keeps ids) and
+  never render: `/{league}/{YYYY-MM-DD}/{away}-{home}` (lowercase abbrevs;
+  `today|tomorrow|yesterday` also work) and football-only
+  `/{league}/{YYYY}/week{N}/{away}-{home}` (N = 1-99) both 302 to the
+  canonical `/{league}/{id}`. A doubleheader shares the pair, so the first
+  board listing wins.
+- `/{league}/{abbr}/today` redirects to the team's game today and falls
+  back to the team page when there is none. The `/api/v1/` twin keeps the
+  API address family on redirect.
+- Baseball game pages (`/{league}/{id}`) print full starting lineups, nine
+  per side with order, position, and H-AB, when ESPN ships a batting group.
+  Lineups replace the leaders section; other sports keep leaders.
+- `?stream=sse` (also `1`/`true`, any case) or `Accept: text/event-stream`
+  streams the scoreboard as text-only SSE: `data:` lines with blank-line
+  terminators, a clear-screen escape per event for in-place redraw, and
+  `: ping` keepalives. Use `curl -N`. JSON and HTML always return a single
+  response.
+- `?art=off` (any case) strips the braille team-mark logos for terminals
+  without braille. Anything else, including absent, keeps art on. Layout is
+  unchanged, just no art rows. `?0` one-line output never prints marks.
+- Text home pages (`/` and `/all`) print a plaintext ASCII `sprts` banner
+  above the heading. HTML and JSON never show it; `?quiet=1` drops it with
+  the rest of the header chrome.
+
 ## Repository layout
 
 - `apps/server` contains the HTTP server and ESPN adapter.
