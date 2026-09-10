@@ -62,17 +62,23 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     if (game.venue) |venue| {
         try w.writeByte('\n');
         if (game.attendance) |crowd| {
-            const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
-            defer allocator.free(line);
-            try table.writeLine(w, line, cols, null, color);
+            if (crowd != 0) {
+                const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
+                defer allocator.free(line);
+                try table.writeLine(w, line, cols, null, color);
+            } else {
+                try table.writeLine(w, venue, cols, null, color);
+            }
         } else {
             try table.writeLine(w, venue, cols, null, color);
         }
     } else if (game.attendance) |crowd| {
-        try w.writeByte('\n');
-        const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
-        defer allocator.free(line);
-        try table.writeLine(w, line, cols, null, color);
+        if (crowd != 0) {
+            try w.writeByte('\n');
+            const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
+            defer allocator.free(line);
+            try table.writeLine(w, line, cols, null, color);
+        }
     }
     if (maxPeriod(game) > 0) {
         try w.writeByte('\n');
@@ -230,17 +236,23 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     if (game.venue) |venue| {
         try w.writeByte('\n');
         if (game.attendance) |crowd| {
-            const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
-            defer allocator.free(line);
-            try render.writeHtmlLine(w, allocator, line, cols, null, null);
+            if (crowd != 0) {
+                const line = try std.fmt.allocPrint(allocator, "{s} ({d})", .{ venue, crowd });
+                defer allocator.free(line);
+                try render.writeHtmlLine(w, allocator, line, cols, null, null);
+            } else {
+                try render.writeHtmlLine(w, allocator, venue, cols, null, null);
+            }
         } else {
             try render.writeHtmlLine(w, allocator, venue, cols, null, null);
         }
     } else if (game.attendance) |crowd| {
-        try w.writeByte('\n');
-        const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
-        defer allocator.free(line);
-        try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        if (crowd != 0) {
+            try w.writeByte('\n');
+            const line = try std.fmt.allocPrint(allocator, "Attendance {d}", .{crowd});
+            defer allocator.free(line);
+            try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        }
     }
     if (maxPeriod(game) > 0) {
         try w.writeByte('\n');
@@ -805,6 +817,29 @@ test "detail leaders group players under team totals" {
     try std.testing.expect(std.mem.indexOf(u8, page, "ATL  Drake Baldwin") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"dim\">ATL H-AB") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+
+test "detail text suppresses zero attendance but keeps nonzero" {
+    // Live UCL audit: unknown crowds rendered as "Spotify Camp Nou
+    // (0)". A zero crowd now reads as a bare venue (and a missing
+    // venue reads as nothing), while a real crowd still shows.
+    var silent = testDetail();
+    silent.venue = "Spotify Camp Nou";
+    silent.attendance = 0;
+    const quiet = try renderText(std.testing.allocator, silent, false, null, null);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "Spotify Camp Nou") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "(0)") == null);
+    const quiet_html = try detailHtml(std.testing.allocator, silent, null, null);
+    defer std.testing.allocator.free(quiet_html);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_html, "Spotify Camp Nou") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_html, "(0)") == null);
+    var loud = testDetail();
+    loud.venue = "Spotify Camp Nou";
+    loud.attendance = 50578;
+    const noisy = try renderText(std.testing.allocator, loud, false, null, null);
+    defer std.testing.allocator.free(noisy);
+    try std.testing.expect(std.mem.indexOf(u8, noisy, "Spotify Camp Nou (50578)") != null);
 }
 
 test "detail text shows the live situation chip" {
