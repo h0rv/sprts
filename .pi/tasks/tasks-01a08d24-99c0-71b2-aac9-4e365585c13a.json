@@ -1,0 +1,60 @@
+{
+  "nextId": 6,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Core: slug fields + pure helpers",
+      "description": "Add slug field + pure slug helpers (duel/event-N, href builder with numeric fallback) and unit tests in packages/core domain.zig; add slug to detail.GameDetail. Verify no use of legacy domain.GameDetail/TeamView shapes.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074650647,
+      "updatedAt": 1789074885876
+    },
+    {
+      "id": "2",
+      "subject": "Provider: stamp slugs, no extra fetch",
+      "description": "Stamp Game.slug in parseAndNormalize, copy board-game slug into detailFetch result; add round-trip tests (slug resolves via findGameByMatchupN/findGameByOrdinal); dupe slug in native_cache cloneScoreboard/cloneGameDetail.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074650647,
+      "updatedAt": 1789075168954
+    },
+    {
+      "id": "3",
+      "subject": "Renderers: emit human links everywhere",
+      "description": "Human-form links in scoreboard text pointers + HTML status hrefs (thread board date), home HTML hrefs, team schedule text+HTML rows (base-pair slugs from own/opponent), today redirects in main+worker; keep numeric rendering; update affected tests.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074650647,
+      "updatedAt": 1789075691216
+    },
+    {
+      "id": "4",
+      "subject": "JSON schema + docs (help, llms.txt)",
+      "description": "Add slug to Game/DetailGame jsonschema metadata; present slugs as primary + numeric as legacy in help.zig copy + spec.zig llms.txt; touch up router alias comments; update help/spec tests.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074650647,
+      "updatedAt": 1789075998490
+    },
+    {
+      "id": "5",
+      "subject": "Test, verify, commit, report",
+      "description": "Run packages/core tests and apps/server tests with mise toolchain; fix failures; commit inside worktree and report SHA + scheme + files + counts.",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789074650648,
+      "updatedAt": 1789076005329
+    }
+  ]
+}
