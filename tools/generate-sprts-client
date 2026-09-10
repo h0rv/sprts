@@ -1,0 +1,74 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+generated="$repo_root/clients/sprts/src/generated.zig"
+generator=${OPENAPI2ZIG:-openapi2zig}
+base_url=${SPRTS_OPENAPI_BASE_URL:-http://localhost:8080/api/v1}
+port=${SPRTS_PORT:-${PORT:-8080}}
+spec=${SPRTS_OPENAPI_SPEC:-}
+server_pid=""
+tmp_spec=""
+
+cleanup() {
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    if [ -n "$tmp_spec" ]; then
+        rm -f "$tmp_spec"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+if ! command -v "$generator" >/dev/null 2>&1; then
+    echo "openapi2zig is required. Run 'mise install' or set OPENAPI2ZIG." >&2
+    exit 1
+fi
+
+if [ -z "$spec" ]; then
+    # No checked-in spec: serve it from a locally-started server.
+    tmp_spec=$(mktemp /tmp/sprts-openapi.XXXXXX.json)
+    spec="$tmp_spec"
+    (cd "$repo_root/apps/server" && zig build) || {
+        echo "failed to build the server" >&2
+        exit 1
+    }
+    server_bin="$repo_root/apps/server/zig-out/bin/sprts"
+    PORT="$port" "$server_bin" & server_pid=$!
+    tries=0
+    until curl -sf "http://127.0.0.1:$port/openapi.json" -o "$spec"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 60 ]; then
+            echo "server did not serve /openapi.json in time" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+elif [ ! -f "$spec" ]; then
+    echo "sprts spec not found: $spec" >&2
+    exit 1
+fi
+
+tmp_out=$(mktemp /tmp/sprts-generated.XXXXXX.zig)
+"$generator" generate \
+    -i "$spec" \
+    -o "$tmp_out" \
+    --base-url "$base_url"
+
+new_sum=$(grep -o 'Checksum: [0-9a-f]*' "$tmp_out" || true)
+old_sum=""
+if [ -f "$generated" ]; then
+    old_sum=$(grep -o 'Checksum: [0-9a-f]*' "$generated" || true)
+fi
+if [ -n "$old_sum" ] && [ "$new_sum" = "$old_sum" ]; then
+    echo "generated client unchanged ($new_sum)"
+    rm -f "$tmp_out"
+    exit 0
+fi
+mkdir -p "$(dirname "$generated")"
+mv "$tmp_out" "$generated"
+zig fmt "$generated"
