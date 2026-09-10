@@ -1158,9 +1158,11 @@ fn scoringPlayPeriod(arena: std.mem.Allocator, period: ?SummaryPeriod) ![]const 
 }
 
 /// Top-level leaders (football-style): up to 2 teams, 2 categories each,
-/// 2 entries each, as "{name} {displayValue}". The display values are
-/// self-describing ("21/25, 320 YDS, 3 TD"); entries without a name or a
-/// value are skipped.
+/// 2 entries each, as "{name} {displayValue}" when the display value is
+/// self-describing ("21/25, 320 YDS, 3 TD"). Soccer categories ship bare
+/// numbers instead ("5" under "Shots"), so bare values render with
+/// their category label ("Dani Olmo Shots 5") rather than a bare
+/// number. Entries without a name or a value are skipped.
 fn topLeaders(arena: std.mem.Allocator, groups: ?[]const SummaryTopTeam, out: *std.ArrayList([]const u8)) !void {
     const list = groups orelse return;
     for (list[0..@min(list.len, 2)]) |group| {
@@ -1169,30 +1171,39 @@ fn topLeaders(arena: std.mem.Allocator, groups: ?[]const SummaryTopTeam, out: *s
                 const name = athleteName(entry.athlete) orelse continue;
                 const display = (try jsonText(arena, entry.displayValue)) orelse (try jsonText(arena, entry.value)) orelse "";
                 if (display.len == 0) continue;
-                try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, display }));
+                if (isBareNumber(display)) {
+                    const label: []const u8 = if (category.displayName.len > 0)
+                        category.displayName
+                    else if (category.name.len > 0)
+                        try humanizeStatKey(arena, category.name)
+                    else
+                        "total";
+                    try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ name, label, display }));
+                } else {
+                    try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, display }));
+                }
             }
         }
     }
 }
 
 /// Boxscore leaders fallback (team totals plus top performers per side).
-/// The totals label is `names[0]`; football groups omit `names` and key
-/// columns by stat id instead, so the label falls back to a humanized
-/// first key ("completions/passingAttempts" -> "Completions/passing
-/// attempts") instead of the bare "total".
+/// The column label is the first non-empty `names` entry (soccer groups
+/// may carry empty names); football groups omit `names` and key columns
+/// by stat id instead, so the label falls back to a humanized first
+/// non-empty key ("completions/passingAttempts" -> "Completions/passing
+/// attempts") instead of the bare "total". Athlete rows with bare
+/// numbers ("5") carry the same label ("Dani Olmo Shots 5");
+/// self-describing composites ("2-4", "18/33") keep the historical
+/// bare shape.
 fn boxscoreLeaders(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *std.ArrayList([]const u8)) !void {
     const groups = boxscore.players[0..@min(boxscore.players.len, 2)];
     for (groups) |group| {
         const abbr: []const u8 = if (group.team) |team| team.abbreviation else "?";
         for (group.statistics[0..@min(group.statistics.len, 1)]) |stats| {
+            const label = try statLabel(arena, stats.names, stats.keys);
             if (stats.totals.len > 0) {
                 const total = (try jsonText(arena, stats.totals[0])) orelse "?";
-                const label: []const u8 = if (stats.names.len > 0)
-                    stats.names[0]
-                else if (stats.keys.len > 0)
-                    try humanizeStatKey(arena, stats.keys[0])
-                else
-                    "total";
                 try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ abbr, label, total }));
             }
             for (stats.athletes[0..@min(stats.athletes.len, 4)]) |entry| {
@@ -1206,7 +1217,11 @@ fn boxscoreLeaders(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *st
                 if (entry.stats.len > 0) {
                     const head = (try jsonText(arena, entry.stats[0])) orelse "";
                     if (head.len > 0) {
-                        try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, head }));
+                        if (isBareNumber(head)) {
+                            try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s} {s}", .{ name, label, head }));
+                        } else {
+                            try out.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ name, head }));
+                        }
                         continue;
                     }
                 }
@@ -1214,6 +1229,28 @@ fn boxscoreLeaders(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *st
             }
         }
     }
+}
+
+/// First usable column label for a boxscore stat group: the first
+/// non-empty `names` entry, else a humanized first non-empty key, else
+/// "total". Soccer groups may carry empty names, so a blank entry must
+/// not win over a usable key.
+fn statLabel(arena: std.mem.Allocator, names: []const []const u8, keys: []const []const u8) ![]const u8 {
+    for (names) |name| if (name.len > 0) return name;
+    for (keys) |key| if (key.len > 0) return try humanizeStatKey(arena, key);
+    return "total";
+}
+
+/// A leader value with no self-describing structure ("5", "108") needs
+/// its stat label attached; composites ("2-4", "18/33",
+/// "21/25, 320 YDS, 3 TD") already read on their own and keep the
+/// historical shape.
+fn isBareNumber(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| {
+        if ((c < '0' or c > '9') and c != '.' and c != ',') return false;
+    }
+    return true;
 }
 
 /// Starting lineups from the boxscore batting group (keys carrying
@@ -1456,8 +1493,11 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         if (info.venue) |building| {
             if (building.fullName.len > 0) venue = building.fullName;
         }
+        // ESPN reports 0 for unknown attendance (soccer); a zero crowd
+        // is "missing", never a "(0)" suffix downstream.
         attendance = switch (info.attendance) {
-            .integer => |n| n,
+            .integer => |n| if (n > 0) n else null,
+            .float => |f| if (f > 0) @intFromFloat(f) else null,
             else => null,
         };
     }
@@ -3181,6 +3221,47 @@ test "humanizeStatKey spaces camel humps" {
     try std.testing.expectEqualStrings("Completions/passing attempts", try humanizeStatKey(arena, "completions/passingAttempts"));
     try std.testing.expectEqualStrings("Passing yards", try humanizeStatKey(arena, "passingYards"));
     try std.testing.expectEqualStrings("H-AB", try humanizeStatKey(arena, "H-AB"));
+}
+
+const ucl_detail_board =
+    \\{"events":[{"id":"784123","name":"Inter Milan at FC Barcelona","date":"2026-04-15T19:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"784123","date":"2026-04-15T19:00Z","competitors":[{"homeAway":"away","score":"2","winner":false,"team":{"id":"110","displayName":"Inter Milan","abbreviation":"INT"}},{"homeAway":"home","score":"3","winner":true,"team":{"id":"83","displayName":"FC Barcelona","abbreviation":"BAR"}}]}]}]}
+;
+
+test "fetchDetail labels bare-number soccer top leaders and drops zero attendance" {
+    // Live UCL audit: soccer top-level categories ship bare numbers
+    // ("5" under "Shots"), which used to render as "Dani Olmo 5",
+    // and ESPN reports 0 for unknown attendance ("Spotify Camp Nou
+    // (0)"). Both now read labeled / suppressed.
+    const summary =
+        \\{"header":{"competitions":[{"id":"784123","date":"2026-04-15T19:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"110","homeAway":"away","winner":false,"score":2,"team":{"id":"110","displayName":"Inter Milan","abbreviation":"INT"}},{"id":"83","homeAway":"home","winner":true,"score":3,"team":{"id":"83","displayName":"FC Barcelona","abbreviation":"BAR"}}]}]},"leaders":[{"team":{"id":"83","abbreviation":"BAR"},"leaders":[{"name":"shots","displayName":"Shots","leaders":[{"displayValue":5,"athlete":{"displayName":"Dani Olmo","fullName":"Dani Olmo"}}]},{"name":"passes","displayName":"Passes","leaders":[{"displayValue":108,"athlete":{"displayName":"Pau Cubarsí","fullName":"Pau Cubarsí"}}]}]}],"gameInfo":{"attendance":0,"venue":{"fullName":"Spotify Camp Nou"}}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = ucl_detail_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("ucl").?, "784123");
+    try std.testing.expectEqual(@as(usize, 2), detail.leaders.len);
+    try std.testing.expectEqualStrings("Dani Olmo Shots 5", detail.leaders[0]);
+    try std.testing.expectEqualStrings("Pau Cubarsí Passes 108", detail.leaders[1]);
+    try std.testing.expectEqualStrings("Spotify Camp Nou", detail.venue.?);
+    try std.testing.expect(detail.attendance == null);
+}
+
+test "fetchDetail labels key-only soccer boxscore leaders with empty names" {
+    // Soccer boxscore groups may carry empty `names` with key-only
+    // columns; the totals label and bare athlete values must still read
+    // labeled via humanized keys, never bare numbers.
+    const summary =
+        \\{"header":{"competitions":[{"id":"784123","date":"2026-04-15T19:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"110","homeAway":"away","winner":false,"score":2,"team":{"id":"110","displayName":"Inter Milan","abbreviation":"INT"}},{"id":"83","homeAway":"home","winner":true,"score":3,"team":{"id":"83","displayName":"FC Barcelona","abbreviation":"BAR"}}]}]},"boxscore":{"players":[{"team":{"id":"83","abbreviation":"BAR"},"statistics":[{"names":["",""],"keys":["goals","assists"],"totals":[3,2],"athletes":[{"athlete":{"id":"9001","displayName":"Dani Olmo","fullName":"Dani Olmo"},"stats":[2,1]}]}]}]},"gameInfo":{"attendance":50578,"venue":{"fullName":"Spotify Camp Nou"}}}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = ucl_detail_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("ucl").?, "784123");
+    try std.testing.expectEqual(@as(usize, 2), detail.leaders.len);
+    try std.testing.expectEqualStrings("BAR Goals 3", detail.leaders[0]);
+    try std.testing.expectEqualStrings("Dani Olmo Goals 2", detail.leaders[1]);
+    // Nonzero attendance still parses through.
+    try std.testing.expectEqual(@as(i64, 50578), detail.attendance.?);
 }
 
 test "fetchTeam renders TBD for timeValid-false kickoffs" {
