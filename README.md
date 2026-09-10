@@ -1,165 +1,101 @@
 # sprts
 
-sprts is a small server for live sports scores and schedules. `curl` gets
-plain text, browsers get the same table in a minimal page with clickable
-links, and scripts can use the versioned JSON API. The server does not use
-accounts, ads, tracking, or client side JavaScript.
+Live sports scores as plain text, HTML, and JSON, from one server.
 
-## Run it
+![demo](assets/demo.gif)
 
-Install the tools and start the server:
+## Try it
+
+No install needed. The live server answers curl and browsers alike.
+
+```sh
+curl https://sprts.horv.co/mlb
+curl 'https://sprts.horv.co/mlb?date=2026-09-06'
+curl https://sprts.horv.co/api/v1/mlb
+curl -N 'https://sprts.horv.co/mlb?stream=sse'
+```
+
+## Interfaces
+
+* Web: open `https://sprts.horv.co/mlb` in a browser for the same scores with clickable links.
+* TUI: `sprts-tui` puts the scores in your terminal, with keys to move, change days, and open games.
+* API: `/api/v1/mlb` returns the same board as JSON, and `/openapi.json` describes every route.
+* SSE: `?stream=sse` streams the text board for `curl -N`, and `/mlb/tour` plays that stream in a browser terminal.
+
+## Shell client
+
+`tools/sprts` needs only curl. Copy it to your path:
+
+```sh
+install -m755 tools/sprts ~/.local/bin/sprts
+sprts mlb
+sprts mlb 2026-09-06
+sprts mlb --watch
+```
+
+## TUI client
+
+Linux or macOS, installs to `~/.local/bin/sprts-tui`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/h0rv/sprts/main/apps/cli/scripts/install.sh | sh
+```
+
+```sh
+sprts-tui                  # full screen when output is a terminal
+sprts-tui mlb              # one league
+sprts-tui mlb --plain      # print and exit
+sprts-tui --date tomorrow  # another day
+```
+
+Keys: j and k move, h and l change the day, enter opens a game or team, s shows standings, slash filters, r refreshes, q quits.
+
+## Run the server
 
 ```sh
 mise install
 mise run serve
 ```
 
-The server listens on port 8080. Open `http://localhost:8080/mlb` in a browser,
-or run:
-
-```sh
-curl localhost:8080/mlb
-curl localhost:8080/api/v1/mlb
-curl 'localhost:8080/mlb?date=2026-09-06'
-```
-
-Set `PORT` or `SPRTS_PORT` to change the port. Set `SPRTS_HOST` to change the
-listen address. The default address is `0.0.0.0`.
-
-## Shell CLI
-
-`tools/sprts.sh` is a dependency-free (`curl` only) shell function. Drop it
-in `~/.local/bin/` as `sprts` (it runs directly) or source it from your rc
-file, then register favorites:
-
-```sh
-cp tools/sprts.sh ~/.local/bin/sprts && chmod +x ~/.local/bin/sprts
-export SPRTS_LEAGUE=mlb SPRTS_TEAM=PHI   # e.g. in .zshrc
-```
-
-```sh
-sprts                  # home: every league today
-sprts mlb              # scoreboard
-sprts mlb phi          # team page
-sprts mlb 401816856    # one game (digits = game id)
-sprts mlb tomorrow     # any date word or YYYY-MM-DD
-sprts team             # $SPRTS_LEAGUE/$SPRTS_TEAM
-sprts watch mlb        # re-curl every 15s until Ctrl-C
-sprts --json mlb       # /api/v1/... instead of text
-```
-
-For push-style updates instead of polling, stream server-sent events:
-
-```sh
-curl -N 'https://sprts.horv.co/mlb?stream=sse'
-```
-
-## Run it with Docker
+The server listens on port 8080. Set `PORT` or `SPRTS_PORT` to change it, and `SPRTS_HOST` to change the address. With Docker:
 
 ```sh
 docker build -t sprts .
 docker run --rm -p 8080:8080 sprts
 ```
 
-The image contains the certificate bundle needed to call ESPN over HTTPS. The
-`/healthz` route returns HTTP 200 when the server can accept requests.
-
-## Deploy it on Cloudflare
-
-The Cloudflare entry point runs the same Zig server in a Workers Container. It
-does not contain a second application backend.
-
-```sh
-mise exec -- npm install
-mise exec -- npm run cf:check
-mise exec -- npm run cf:deploy
-```
-
-The checked in Wrangler configuration maps the Worker to `sprts.horv.co`.
-Cloudflare Containers require a Workers Paid plan on the target account.
+`/healthz` returns 200 when the server is up.
 
 ## Routes
 
-`/{league}` and `/` return plain text to terminal clients and a minimal
-HTML page with clickable links to browsers. Use the `date=YYYY-MM-DD`
-query parameter to select a date. The `/api/v1/{league}` route always
-returns JSON, and `/api/v1/leagues` lists the supported league slugs.
-`/{league}/{id}` (all digits) is one game with linescore and scoring
-plays, and `/{league}/{abbr}` is one team's last result and upcoming
-schedule; both serve JSON under `/api/v1/` too. The machine-readable
-spec is generated from the server source and served at `/openapi.json`.
+* `/` and `/all`: every league today.
+* `/{league}`: one scoreboard, as in `/mlb`.
+* `/{league}/{id}`: one game, with linescore and plays.
+* `/{league}/{abbr}`: one team, as in `/mlb/phi`.
+* `/{league}/standings`: the current table.
+* `/api/v1/...`: the same shapes as JSON.
+* `/openapi.json`, `/docs`, `/llms.txt`: spec, reference, and agent guide.
+* `/:help`: the full route and flag list, in the terminal too.
 
-Use `?format=text` or `?format=html` to force a format. The response
-also honors `Accept: application/json` for scripts. ANSI color is on by
-default for text output. Use `?color=0` to turn it off.
+Flags: `?date=YYYY-MM-DD`, `?week=N` for football, `?0` for one line output, `?format=text|html`, `?color=0`, `?art=off`, `?stream=sse`. Date words like `today` and `tomorrow` also work.
 
-## Pretty games, lineups, streams, and terminal tweaks
+## Docs
 
-```sh
-curl localhost:8080/mlb/2026-09-09/min-det     # date game alias, 302 to /{league}/{id}
-curl localhost:8080/nfl/2026/week1/ne-sea     # football week alias, 302 likewise
-curl localhost:8080/mlb/PHI/today             # today's game, else the team page
-curl 'localhost:8080/mlb?art=off'              # strip braille team marks
-curl -N 'localhost:8080/mlb?stream=sse'        # live text feed (or Accept: text/event-stream)
-```
+* Live reference: `https://sprts.horv.co/docs`
+* Agent guide: `https://sprts.horv.co/llms.txt`
+* Streaming: `docs/STREAMING.md`
+* Rendering: `docs/RENDERER.md`
+* TUI client: `apps/cli/README.md`
 
-- Game aliases are human only (no `/api/v1/` twins, JSON keeps ids) and
-  never render: `/{league}/{YYYY-MM-DD}/{away}-{home}` (lowercase abbrevs;
-  `today|tomorrow|yesterday` also work) and football-only
-  `/{league}/{YYYY}/week{N}/{away}-{home}` (N = 1-99) both 302 to the
-  canonical `/{league}/{id}`. A doubleheader shares the pair, so the first
-  board listing wins.
-- `/{league}/{abbr}/today` redirects to the team's game today and falls
-  back to the team page when there is none. The `/api/v1/` twin keeps the
-  API address family on redirect.
-- Baseball game pages (`/{league}/{id}`) print full starting lineups, nine
-  per side with order, position, and H-AB, when ESPN ships a batting group.
-  Lineups replace the leaders section; other sports keep leaders.
-- `?stream=sse` (also `1`/`true`, any case) or `Accept: text/event-stream`
-  streams the scoreboard as text-only SSE: `data:` lines with blank-line
-  terminators, a clear-screen escape per event for in-place redraw, and
-  `: ping` keepalives. Use `curl -N`. JSON and HTML always return a single
-  response.
-- `?art=off` (any case) strips the braille team-mark logos for terminals
-  without braille. Anything else, including absent, keeps art on. Layout is
-  unchanged, just no art rows. `?0` one-line output never prints marks.
-- Text home pages (`/` and `/all`) print a plaintext ASCII `sprts` banner
-  above the heading. HTML and JSON never show it; `?quiet=1` drops it with
-  the rest of the header chrome.
-
-## Repository layout
-
-- `apps/server` contains the HTTP server and ESPN adapter.
-- `packages/core` contains provider independent sports types.
-- `clients/espn` contains the generated and independently installable client.
-- The public API spec is generated from `apps/server/src/spec.zig`
-  (zchema is the single source of truth) and served at `/openapi.json`.
-
-Each package has its own `build.zig` and `build.zig.zon`. You can build and test
-it without the other app code. Run `mise run check` at the repository root to
-check all packages.
-
-## Update the ESPN client
-
-The client is generated from the checked in ESPN OpenAPI document. Run:
+## Develop
 
 ```sh
+mise run check
 mise run generate:espn
 ```
 
-The task uses the mise managed openapi2zig 0.5.6 release. The generator skips
-the output file when its checksum has not changed.
-
-The ESPN API and OpenAPI document are unofficial. ESPN can change the service
-without notice. Follow ESPN's terms and rate limits when you run this service.
-
-## Add a league or provider
-
-Add a league entry in `packages/core/src/leagues.zig`, then add its ESPN keys in
-`apps/server/src/provider.zig`. A new provider implements the same operation as
-`EspnAdapter.fetch` and returns a `core.domain.Scoreboard`. Routes and renderers
-do not depend on ESPN response types.
+`mise run check` builds and tests every package. Scores come from ESPN through a generated client, so regenerate it after the OpenAPI file changes. See `AGENTS.md` for the full notes.
 
 ## License
 
-sprts is available under the MIT License. See `LICENSE`.
+MIT. See `LICENSE`.
