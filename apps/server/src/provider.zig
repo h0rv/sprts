@@ -3870,7 +3870,31 @@ pub fn findGameByMatchup(board: core.domain.Scoreboard, away: []const u8, home: 
     return findGameByMatchupN(board, away, home, 1);
 }
 
-/// True when the board carries at least one event no abbr pair can ever
+/// Ordinal lookup for the human `event[-N]` aliases: the Nth game on the
+/// board in listed order (1-based), counting EVERY game — duels and
+/// non-duels alike. N of 0, or past the last game, misses (the caller
+/// 404s, never a wrong redirect). This is the only alias form that can
+/// name a non-duel, by design (see below).
+///
+/// Scheme choice, with evidence. Name slugs were rejected: a UFC card
+/// boards ~14 bouts under ONE event name (every bout names the card, so a
+/// slug collides 14 ways), an F1 weekend boards ~3 sessions under one
+/// Grand Prix name (practice/quali/race collide), and a PGA tournament
+/// boards one field of ~95 abbreviation-less athletes (no pair exists at
+/// all). Names are also unstable: sponsor prefixes come and go
+/// ("Pirelli Italian Grand Prix" vs "Italian Grand Prix"), cards get
+/// renamed, and a slug would rot or collide. Tennis proves the same point
+/// at duel size: two athletes, empty abbreviations, so no abbr pair can
+/// match — and surname slugs are fragile (diacritics, shared surnames,
+/// hyphenation). The board ordinal is deterministic from the fetched
+/// slate alone: date + position, no string normalization, stable within
+/// the day, and it can never resolve to the wrong game (out-of-range is
+/// a 404). Duels keep their abbr pairs; `event-N` reaches everything.
+pub fn findGameByOrdinal(board: core.domain.Scoreboard, n: u16) ?*const core.domain.Game {
+    if (n == 0) return null;
+    if (n > board.games.len) return null;
+    return &board.games[n - 1];
+}
 /// match: anything but a two-participant game with both abbreviations set
 /// (fight cards, race sessions, tournament fields, athlete duels). The
 /// alias miss message uses this to tell a duel-only dead end apart from a
@@ -3888,12 +3912,14 @@ pub fn boardHasNonDuels(board: core.domain.Scoreboard) bool {
 /// "game not found" on all-duel days (likely a typo'd pair); when the
 /// board also carries cards, races, or tournaments — events without
 /// abbreviations, so no abbr pair can ever match them — the message says
-/// the aliases are duel-only and points at the day board for the event id.
-/// `browse` is the caller's board address (`/{slug}?date={day}` for the
-/// date form, `/{slug}?week={N}` for the week form).
+/// the duel aliases are duel-only and points at the ordinal form plus the
+/// day board for the event list. `browse` is the caller's board address
+/// (`/{slug}?date={day}` for the date form, `/{slug}?week={N}` for the
+/// week form); the ordinal example reuses the board's own date so the
+/// hint stays copy-pasteable.
 pub fn aliasMissMessage(arena: std.mem.Allocator, board: core.domain.Scoreboard, browse: []const u8) ![]u8 {
     if (!boardHasNonDuels(board)) return arena.dupe(u8, "game not found");
-    return std.fmt.allocPrint(arena, "game not found; aliases match two team abbreviations only — cards, races, and tournaments have none, browse {s} for the event id", .{browse});
+    return std.fmt.allocPrint(arena, "game not found; duel aliases match two team abbreviations only — cards, races, tournaments, and name-only duels use /{s}/{s}/event-N (N = game number on the day board), browse {s} for the event list", .{ board.league, board.date, browse });
 }
 
 fn isDuel(game: *const core.domain.Game, first: []const u8, second: []const u8) bool {
@@ -4226,6 +4252,325 @@ test "aliasMissMessage hints the board only past duels" {
     try std.testing.expect(std.mem.indexOf(u8, hinted, "game not found") != null);
     try std.testing.expect(std.mem.indexOf(u8, hinted, "two team abbreviations") != null);
     try std.testing.expect(std.mem.indexOf(u8, hinted, "/ufc?date=2026-09-05") != null);
+    // The hint names the ordinal form with a copy-pasteable board date.
+    try std.testing.expect(std.mem.indexOf(u8, hinted, "event-N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hinted, "/ufc/2026-09-05/event-N") != null);
+}
+
+/// UFC card fixture: 14 bouts, ONE shared event name. A name slug could
+/// never pick a bout (14-way collision); the ordinal names each bout by
+/// board position. Abbr pairs match nothing here (empty abbreviations).
+fn ufcCardBoard() core.domain.Scoreboard {
+    return .{
+        .league = "ufc",
+        .league_name = "UFC",
+        .date = "2026-09-05",
+        .source = "test",
+        .games = @constCast(&[_]core.domain.Game{
+            .{ .id = "bout-01", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T22:00Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a1", .name = "Fighter A1", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b1", .name = "Fighter B1", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-02", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T22:20Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a2", .name = "Fighter A2", .abbreviation = "", .score = "", .winner = false },
+                .{ .id = "b2", .name = "Fighter B2", .abbreviation = "", .score = "", .winner = true },
+            }) },
+            .{ .id = "bout-03", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T22:40Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a3", .name = "Fighter A3", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b3", .name = "Fighter B3", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-04", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T23:00Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a4", .name = "Fighter A4", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b4", .name = "Fighter B4", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-05", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T23:20Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a5", .name = "Fighter A5", .abbreviation = "", .score = "", .winner = false },
+                .{ .id = "b5", .name = "Fighter B5", .abbreviation = "", .score = "", .winner = true },
+            }) },
+            .{ .id = "bout-06", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-05T23:40Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a6", .name = "Fighter A6", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b6", .name = "Fighter B6", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-07", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T00:00Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a7", .name = "Fighter A7", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b7", .name = "Fighter B7", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-08", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T00:20Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a8", .name = "Fighter A8", .abbreviation = "", .score = "", .winner = false },
+                .{ .id = "b8", .name = "Fighter B8", .abbreviation = "", .score = "", .winner = true },
+            }) },
+            .{ .id = "bout-09", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T00:40Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a9", .name = "Fighter A9", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b9", .name = "Fighter B9", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-10", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T01:00Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a10", .name = "Fighter A10", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b10", .name = "Fighter B10", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-11", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T01:20Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a11", .name = "Fighter A11", .abbreviation = "", .score = "", .winner = false },
+                .{ .id = "b11", .name = "Fighter B11", .abbreviation = "", .score = "", .winner = true },
+            }) },
+            .{ .id = "bout-12", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T01:40Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a12", .name = "Fighter A12", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b12", .name = "Fighter B12", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-13", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T02:00Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a13", .name = "Fighter A13", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b13", .name = "Fighter B13", .abbreviation = "", .score = "", .winner = false },
+            }) },
+            .{ .id = "bout-14", .name = "UFC Fight Night: Hooker vs. Parnasse", .starts_at = "2026-09-06T02:30Z", .state = "post", .status = "Final", .participants = @constCast(&[_]core.domain.Participant{
+                .{ .id = "a14", .name = "Sofia Montenegro", .abbreviation = "", .score = "", .winner = true },
+                .{ .id = "b14", .name = "Delphine Benouaich", .abbreviation = "", .score = "", .winner = false },
+            }) },
+        }),
+    };
+}
+
+/// F1 weekend fixture: 3 sessions, ONE shared Grand Prix name. A name
+/// slug collides 3 ways; the ordinal separates practice/quali/race.
+fn f1WeekendBoard() core.domain.Scoreboard {
+    return .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2025-09-07",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "practice-3",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2025-09-06T10:30Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                    .{ .id = "b", .name = "Lando Norris", .abbreviation = "", .score = "#2", .winner = false },
+                },
+            },
+            .{
+                .id = "qualifying",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2025-09-06T14:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                    .{ .id = "b", .name = "Lando Norris", .abbreviation = "", .score = "#2", .winner = false },
+                    .{ .id = "c", .name = "Oscar Piastri", .abbreviation = "", .score = "#3", .winner = false },
+                },
+            },
+            .{
+                .id = "401737814",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2025-09-07T13:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                    .{ .id = "b", .name = "Lando Norris", .abbreviation = "", .score = "#2", .winner = false },
+                    .{ .id = "c", .name = "Oscar Piastri", .abbreviation = "", .score = "#3", .winner = false },
+                },
+            },
+        },
+    };
+}
+
+test "ordinal reaches every bout on a shared-name UFC card" {
+    const card = ufcCardBoard();
+    try std.testing.expectEqual(@as(usize, 14), card.games.len);
+    // Every bout resolves by position; no abbr pair can name any of them.
+    try std.testing.expectEqualStrings("bout-01", findGameByOrdinal(card, 1).?.id);
+    try std.testing.expectEqualStrings("bout-07", findGameByOrdinal(card, 7).?.id);
+    try std.testing.expectEqualStrings("bout-14", findGameByOrdinal(card, 14).?.id);
+    try std.testing.expect(findGameByOrdinal(card, 15) == null);
+    try std.testing.expect(findGameByOrdinal(card, 0) == null);
+    try std.testing.expect(findGameByMatchupN(card, "sof", "del", 1) == null);
+    try std.testing.expect(boardHasNonDuels(card));
+    // End-to-end shape of the serve path: the ordinal URL parses and the
+    // lookup lands on the fetched board's game id.
+    const router = @import("router.zig");
+    const route = router.parse("/ufc/2026-09-05/event-14");
+    try std.testing.expect(route == .date_event);
+    try std.testing.expectEqualStrings("bout-14", findGameByOrdinal(card, route.date_event.n).?.id);
+    const bare = router.parse("/ufc/2026-09-05/event");
+    try std.testing.expectEqualStrings("bout-01", findGameByOrdinal(card, bare.date_event.n).?.id);
+}
+
+test "ordinal separates same-name F1 sessions" {
+    const weekend = f1WeekendBoard();
+    try std.testing.expectEqualStrings("practice-3", findGameByOrdinal(weekend, 1).?.id);
+    try std.testing.expectEqualStrings("qualifying", findGameByOrdinal(weekend, 2).?.id);
+    try std.testing.expectEqualStrings("401737814", findGameByOrdinal(weekend, 3).?.id);
+    try std.testing.expect(findGameByOrdinal(weekend, 4) == null);
+    try std.testing.expect(findGameByOrdinal(weekend, 0) == null);
+    try std.testing.expect(findGameByMatchupN(weekend, "ver", "nor", 1) == null);
+    const router = @import("router.zig");
+    try std.testing.expect(router.parse("/f1/2025-09-07/event-3").date_event.n == 3);
+}
+
+test "ordinal reaches a PGA field and a name-only tennis duel" {
+    // PGA: one tournament game with a 95-athlete abbreviation-less field
+    // (probe shape); the game itself is event-1, unreachable by any pair.
+    var field_storage: [95]core.domain.Participant = undefined;
+    for (&field_storage, 0..) |*slot, i| slot.* = .{
+        .id = "p",
+        .name = "Golfer",
+        .abbreviation = "",
+        .score = "E",
+        .winner = i == 0,
+    };
+    const pga: core.domain.Scoreboard = .{
+        .league = "pga",
+        .league_name = "PGA Tour",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "tournament-1",
+                .name = "Tour Championship",
+                .starts_at = "2026-09-09T12:00Z",
+                .state = "in",
+                .status = "Round 3",
+                .participants = &field_storage,
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("tournament-1", findGameByOrdinal(pga, 1).?.id);
+    try std.testing.expect(findGameByOrdinal(pga, 2) == null);
+    try std.testing.expect(findGameByMatchupN(pga, "a", "b", 1) == null);
+    try std.testing.expect(boardHasNonDuels(pga));
+    // Tennis: a two-athlete duel with empty abbreviations. No abbr pair
+    // can match (surname slugs rejected: diacritics, shared surnames,
+    // hyphenation), but the ordinal reaches it like any other game.
+    const tennis: core.domain.Scoreboard = .{
+        .league = "atp",
+        .league_name = "ATP",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "tennis-1",
+                .name = "Jannik Sinner vs. Carlos Alcaraz",
+                .starts_at = "2026-09-09T14:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Jannik Sinner", .abbreviation = "", .score = "2", .winner = true },
+                    .{ .id = "b", .name = "Carlos Alcaraz", .abbreviation = "", .score = "1", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("tennis-1", findGameByOrdinal(tennis, 1).?.id);
+    try std.testing.expect(findGameByMatchupN(tennis, "sin", "alc", 1) == null);
+    try std.testing.expect(boardHasNonDuels(tennis));
+    const router = @import("router.zig");
+    try std.testing.expect(router.parse("/atp/2026-09-09/event").date_event.n == 1);
+    try std.testing.expect(router.parse("/pga/2026-09-09/event-1").date_event.n == 1);
+}
+
+test "ordinal counts every game on a mixed board, duels keep pairs" {
+    // Duels and non-duels interleaved: the ordinal counts ALL games in
+    // board order while the duel form keeps working (doubleheader -N too).
+    const mixed: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "d1",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "race-1",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2026-09-09T18:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                    .{ .id = "b", .name = "Lando Norris", .abbreviation = "", .score = "#2", .winner = false },
+                },
+            },
+            .{
+                .id = "d2",
+                .name = "",
+                .starts_at = "2026-09-09T20:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "", .winner = true },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("d1", findGameByOrdinal(mixed, 1).?.id);
+    try std.testing.expectEqualStrings("race-1", findGameByOrdinal(mixed, 2).?.id);
+    try std.testing.expectEqualStrings("d2", findGameByOrdinal(mixed, 3).?.id);
+    try std.testing.expect(findGameByOrdinal(mixed, 4) == null);
+    // Duel lookups are untouched, doubleheader numbering included.
+    try std.testing.expectEqualStrings("d1", findGameByMatchupN(mixed, "min", "det", 1).?.id);
+    try std.testing.expectEqualStrings("d2", findGameByMatchupN(mixed, "min", "det", 2).?.id);
+    try std.testing.expect(findGameByMatchupN(mixed, "min", "det", 3) == null);
+}
+
+test "ordinal survives renames and shared-name collisions" {
+    // Sponsor rename: the same race boards first as "Pirelli Italian
+    // Grand Prix", then as "Italian Grand Prix". A name slug would rot
+    // or need remapping; the ordinal resolves the same game id either way.
+    const before: core.domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2025-09-07",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401737814",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2025-09-07T13:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                },
+            },
+        },
+    };
+    const after: core.domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2025-09-07",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401737814",
+                .name = "Italian Grand Prix",
+                .starts_at = "2025-09-07T13:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("401737814", findGameByOrdinal(before, 1).?.id);
+    try std.testing.expectEqualStrings("401737814", findGameByOrdinal(after, 1).?.id);
+    // Shared-name collision: two bouts, one card name. The ordinal picks
+    // each deterministically; a slug could only ever name one of them.
+    const card = ufcCardBoard();
+    try std.testing.expectEqualStrings("bout-01", findGameByOrdinal(card, 1).?.id);
+    try std.testing.expectEqualStrings("bout-02", findGameByOrdinal(card, 2).?.id);
+    try std.testing.expect(!std.mem.eql(u8, findGameByOrdinal(card, 1).?.id, findGameByOrdinal(card, 2).?.id));
 }
 
 const week_alias_fixture =

@@ -219,8 +219,10 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "\n" ++
             "ALIASES human only, 302 to /{league}/{id} (bare curl prints the stub: use curl -L), no /api/v1/ twins\n" ++
             "  /{league}/YYYY-MM-DD/{away}-{home}[-N] one game by date and teams: /mlb/2026-09-09/min-det (-2 = doubleheader game 2, 1 = first; today/tomorrow/yesterday also work)\n" ++
+            "  /{league}/YYYY-MM-DD/event[-N] Nth game on the day board: /ufc/2026-09-05/event-14 (bare event = 1; every game: bouts, sessions, fields, name-only duels)\n" ++
             "  /{league}/YYYY/weekN/{away}-{home}[-N] football-only week game: /nfl/2026/week1/ne-sea\n" ++
-            "  duel-only: no abbr pair matches cards, races, or tournaments (no abbreviations) - that 404 names the day board for the event id\n" ++
+            "  /{league}/YYYY/weekN/event[-N] Nth game of the football week: /nfl/2026/week1/event-3\n" ++
+            "  duel-only: no abbr pair matches cards, races, tournaments, or name-only duels - those use event-N; that 404 names the ordinal form plus the day board\n" ++
             "\n" ++
             "TEXT HTML JSON\n" ++
             "  Text default: curl localhost:8080/mlb\n" ++
@@ -262,6 +264,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/mlb/401816828?0\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det-2\n" ++
+            "  curl -L localhost:8080/ufc/2026-09-05/event-14\n" ++
             "  curl -L localhost:8080/nfl/2026/week1/ne-sea\n" ++
             "  curl -L localhost:8080/mlb/PHI/today\n" ++
             "  curl localhost:8080/openapi.json\n" ++
