@@ -190,13 +190,22 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
 /// strings, real links, state colors as spans. Blank lines breathe where
 /// the text page breathes; no rules, no borders.
 pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: ?u16, height: ?u16) ![]u8 {
+    return detailHtmlMtime(allocator, game, width, height, 0);
+}
+
+/// Detail HTML with the render epoch for the freshness line: live games
+/// (`state == "in"`) arm `<pre data-live="1">` plus the fresh div and
+/// live script; final games render exactly as `detailHtml` always did
+/// (no marker, no div, no script — static bytes unchanged).
+pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, width: ?u16, height: ?u16, mtime_s: i64) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     const title = try std.fmt.allocPrint(allocator, "{s} game detail", .{game.league_name});
     defer allocator.free(title);
-    try render.pageHead(w, title);
+    const live_page = std.mem.eql(u8, game.state, "in");
+    try render.pageHeadLive(w, title, live_page);
     // Heading names league + full date + zone once (see renderText).
     const zone_tag = try tz.zoneTag(allocator, .et);
     defer allocator.free(zone_tag);
@@ -320,7 +329,14 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
         defer freeLines(allocator, rows);
         for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
-    try w.writeAll("</pre><nav>");
+    try w.writeAll("</pre>");
+    // Live games stream like scoreboards: freshness line plus the updater
+    // script. Final games stay byte-identical to the static render.
+    if (live_page) {
+        try render.writeFreshDiv(w, allocator, mtime_s);
+        try w.writeAll(render.live_script);
+    }
+    try w.writeAll("<nav>");
     try w.print("<a href=\"/{s}?date={s}\">scores</a>", .{ game.league, game.date });
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ game.league, game.id });
     try render.closePageWithNav(w);
@@ -874,6 +890,32 @@ test "detail html wraps in pre and links back" {
     try std.testing.expect(std.mem.indexOf(u8, page, "R   H   E") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "85-58") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "9th Inning 5-4 Riley tripled") != null);
+}
+
+test "live detail pages arm the updater and stamp freshness" {
+    var game = testDetail();
+    game.state = "in";
+    game.status = "Top 7th";
+    const page = try detailHtmlMtime(std.testing.allocator, game, null, null, 1757328000);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre data-live=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"fresh\" data-mtime=\"1757328000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "updated just now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "EventSource") != null);
+    // Live content still renders; additions carry no escapes.
+    try std.testing.expect(std.mem.indexOf(u8, page, "Top 7th") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "final detail pages stay static bytes" {
+    // JS-free stability: a final game carries zero live bytes.
+    const page = try detailHtml(std.testing.allocator, testDetail(), null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "data-live") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "data-mtime") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "EventSource") == null);
 }
 
 test "detail error bodies reuse the shared error renderer" {

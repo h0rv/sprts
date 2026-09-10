@@ -217,7 +217,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 status = .ok;
                 const body = switch (format) {
                     .text => try server_app.render.textWithZoneArt(arena, board, score_route.color orelse color_default, score_route.width, score_route.height, zone, score_route.art),
-                    .html => try server_app.render.scoreHtmlWithZoneArt(arena, board, score_route.width, score_route.height, zone, score_route.art),
+                    .html => try server_app.render.scoreHtmlWithZoneArtMtime(arena, board, score_route.width, score_route.height, zone, score_route.art, now_s),
                     .json => try server_app.render.json(arena, board),
                 };
                 try respond(request, body, format, .ok, commonHeaders());
@@ -242,7 +242,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                     try server_app.help.scoreOneLine(arena, board, score_route.color orelse color_default, score_route.quiet)
                 else
                     try server_app.render.textWithZoneArt(arena, board, score_route.color orelse color_default, score_route.width, score_route.height, zone, score_route.art),
-                .html => try server_app.render.scoreHtmlWithZoneArt(arena, board, score_route.width, score_route.height, zone, score_route.art),
+                .html => try server_app.render.scoreHtmlWithZoneArtMtime(arena, board, score_route.width, score_route.height, zone, score_route.art, now_s),
                 .json => try server_app.render.json(arena, board),
             };
             const extra = cacheHeaders(cache_state);
@@ -312,7 +312,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try server_app.detail_view.renderTextOneLine(arena, game_detail, game_route.color orelse color_default, game_route.quiet)
             else switch (format) {
                 .text => try server_app.detail_view.renderText(arena, game_detail, game_route.color orelse color_default, game_route.width, game_route.height),
-                .html => try server_app.detail_view.detailHtml(arena, game_detail, game_route.width, game_route.height),
+                .html => try server_app.detail_view.detailHtmlMtime(arena, game_detail, game_route.width, game_route.height, now_s),
                 .json => try server_app.detail_view.json(arena, game_detail),
             };
             const extra = cacheHeaders(cache_state);
@@ -671,7 +671,7 @@ fn serveSse(
     });
 
     const initial_text = try server_app.render.textWithZoneArt(arena, initial, color, score_route.width, score_route.height, zone, score_route.art);
-    const initial_frame = try stream.frame(arena, initial_text);
+    const initial_frame = try stream.frameWithMtime(arena, initial_text, adapter.clock(io));
     body_writer.writer.writeAll(initial_frame) catch return;
     // Two-stage flush: the inner writer buffers up to 16KB before emitting
     // a chunk (BodyWriter.flush only flushes the socket side), so drain it
@@ -758,7 +758,7 @@ fn serveSse(
                 const current = stream.fingerprint(board);
                 const next_interval = stream.pollIntervalSec(board);
                 const body = server_app.render.textWithZoneArt(poll_arena, board, color, score_route.width, score_route.height, zone, score_route.art) catch continue;
-                const event = stream.frame(poll_arena, body) catch continue;
+                const event = stream.frameWithMtime(poll_arena, body, now_s) catch continue;
                 {
                     subscriber_mutex.lockUncancelable(io);
                     defer subscriber_mutex.unlock(io);

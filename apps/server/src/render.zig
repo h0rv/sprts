@@ -970,6 +970,16 @@ fn boardHasColorArt(board: domain.Scoreboard, shown: usize) bool {
 /// The title and the table heading both name the zone
 /// (`MLB scores 2026-09-06 ET`); the date nav stays date-only.
 pub fn scoreHtmlWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone, art: bool) ![]u8 {
+    return scoreHtmlWithZoneArtMtime(allocator, board, width, height, zone, art, 0);
+}
+
+/// Scoreboard HTML with the render epoch for the freshness line: live
+/// boards (`state == "in"`) arm `<pre data-live="1">` plus the fresh div
+/// and live script; final boards render exactly as `scoreHtmlWithZoneArt`
+/// always did (no marker, no div, no script — static bytes unchanged).
+// `mtime_s` is the render epoch stamping the fresh div; callers pass the
+// request clock, tests pass a fixed epoch.
+pub fn scoreHtmlWithZoneArtMtime(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone, art: bool, mtime_s: i64) ![]u8 {
     const shown_pre: usize = @min(height orelse board.games.len, board.games.len);
     const body = try textWithZoneArt(allocator, board, false, width, height, zone, art);
     defer allocator.free(body);
@@ -994,11 +1004,18 @@ pub fn scoreHtmlWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboa
     defer allocator.free(tag);
     const title = try std.fmt.allocPrint(allocator, "{s} scores {s} {s}", .{ board.league_name, board.date, tag });
     defer allocator.free(title);
-    try pageHead(w, title);
+    try pageHeadLive(w, title, boardIsLive(board));
     const shown: usize = shown_pre;
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
-    try w.writeAll("</pre><nav>");
+    try w.writeAll("</pre>");
+    // Live pages stream: freshness line plus the updater script. Final
+    // pages stay byte-identical to the static render (no div, no script).
+    if (boardIsLive(board)) {
+        try writeFreshDiv(w, allocator, mtime_s);
+        try w.writeAll(live_script);
+    }
+    try w.writeAll("<nav>");
     try w.print("<a href=\"/{s}?date={s}\">earlier</a>", .{ board.league, previous });
     try w.print("<a href=\"/{s}\">today</a>", .{board.league});
     try w.print("<a href=\"/{s}?date={s}\">later</a>", .{ board.league, next });
@@ -1413,6 +1430,14 @@ pub fn homeHtmlLive(
 /// a stray `\n` after `<pre>` is preserved by `pre-wrap` and renders
 /// as a blank row, shifting that page's logo-to-content gap alone.
 pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
+    return pageHeadLive(w, title, false);
+}
+
+/// Page opener with the live-stream marker: when `live` is true the `<pre>`
+/// carries `data-live="1"`, which arms the live-update script (see
+/// `live_script`); otherwise the opener is byte-identical to `pageHead`, so
+/// static pages keep their exact bytes.
+pub fn pageHeadLive(w: *std.Io.Writer, title: []const u8, live: bool) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
@@ -1421,8 +1446,82 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     // Theme script before the stylesheet: the stored/OS theme lands on
     // `data-theme` ahead of first CSS application, so navigating between
     // pages never flashes the default theme (the reported "reset").
-    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ home_logo_mark ++ "<pre>");
+    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ home_logo_mark);
+    if (live) {
+        try w.writeAll("<pre data-live=\"1\">");
+    } else {
+        try w.writeAll("<pre>");
+    }
 }
+
+/// True when any game on the board is live (`state == "in"`): the page
+/// arms its live-update script and stamps freshness instead of rendering
+/// bare static HTML.
+pub fn boardIsLive(board: domain.Scoreboard) bool {
+    for (board.games) |game| {
+        if (std.mem.eql(u8, game.state, "in")) return true;
+    }
+    return false;
+}
+
+/// Freshness copy for a render age in seconds: seconds under a minute,
+/// minutes under an hour, hours beyond. Mirrors the browser tick in
+/// `live_script` so server and client read the same.
+pub fn freshAgeText(allocator: std.mem.Allocator, age_s: u64) ![]u8 {
+    if (age_s < 10) return allocator.dupe(u8, "updated just now");
+    if (age_s < 60) return std.fmt.allocPrint(allocator, "updated {d}s ago", .{age_s});
+    if (age_s < 3600) return std.fmt.allocPrint(allocator, "updated {d}m ago", .{age_s / 60});
+    return std.fmt.allocPrint(allocator, "updated {d}h ago", .{age_s / 3600});
+}
+
+/// Freshness line for a live HTML page: a `<div class="fresh">` carrying
+/// the render epoch in `data-mtime` (the script upgrades the copy live)
+/// with the at-render text beside it. No-JS readers still see when the
+/// page rendered; text formats never see it (curl stays clean).
+pub fn writeFreshDiv(w: *std.Io.Writer, allocator: std.mem.Allocator, mtime_s: i64) !void {
+    const copy = try freshAgeText(allocator, 0);
+    defer allocator.free(copy);
+    try w.print("<div class=\"fresh\" data-mtime=\"{d}\" style=\"opacity:.65\">{s}</div>", .{ mtime_s, copy });
+}
+
+/// Live-update script for HTML scoreboard/detail pages: when the page
+/// carries a live game (`<pre data-live="1">`) it opens an `EventSource`
+/// to the same URL with `?stream=sse`, swaps the `<pre>` body per frame
+/// (clear-screen prefix stripped, `data:` lines split), stamps arrival
+/// time, and ticks the freshness line every 5s with backoff reconnects.
+/// Without the marker (or without `EventSource`) it returns at once, so
+/// the static page is untouched: the no-JS fallback is today's page.
+pub const live_script =
+    \\<script>(function(){
+    \\var p=document.querySelector('pre[data-live]');
+    \\if(!p||!window.EventSource)return;
+    \\var f=document.querySelector('.fresh');
+    \\var last=f&&f.dataset.mtime?parseInt(f.dataset.mtime,10):Math.floor(Date.now()/1000);
+    \\var wait=1000;
+    \\function fmt(s){
+    \\if(s<10)return 'updated just now';
+    \\if(s<60)return 'updated '+s+'s ago';
+    \\if(s<3600)return 'updated '+Math.floor(s/60)+'m ago';
+    \\return 'updated '+Math.floor(s/3600)+'h ago';}
+    \\function age(){
+    \\var s=Math.max(0,Math.floor(Date.now()/1000)-last);
+    \\if(f)f.textContent=fmt(s);}
+    \\function show(t){
+    \\var lines=t.split('\n');
+    \\for(var i=0;i<lines.length;i++){if(lines[i].indexOf('data:')===0)lines[i]=lines[i].slice(5);}
+    \\t=lines.join('\n').replace(/^\x1b\[2J\x1b\[H/,'');
+    \\p.textContent=t;}
+    \\function connect(){
+    \\var u=new URL(location.href);
+    \\u.searchParams.set('stream','sse');
+    \\var es=new EventSource(u.toString());
+    \\es.onmessage=function(e){show(e.data);last=Math.floor(Date.now()/1000);age();wait=1000;};
+    \\es.onerror=function(){es.close();setTimeout(connect,wait);wait=Math.min(wait*2,30000);};}
+    \\age();
+    \\setInterval(age,5000);
+    \\connect();
+    \\})();</script>
+;
 
 /// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
 /// box-safe bytes through untouched.
@@ -1708,13 +1807,121 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, err, "a&lt;b") != null);
 }
 
+/// `<pre>` body of an HTML page, tolerating the live marker: live pages
+/// open with `<pre data-live="1">`, static pages with bare `<pre>`.
+fn preBody(page: []const u8) []const u8 {
+    const tag_open = std.mem.indexOf(u8, page, "<pre").?;
+    const content = std.mem.indexOfScalarPos(u8, page, tag_open, '>').? + 1;
+    const close = std.mem.indexOf(u8, page, "</pre>").?;
+    return page[content..close];
+}
+
+test "live scoreboard pages arm the updater and stamp freshness" {
+    const live_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expect(boardIsLive(live_board));
+    const page = try scoreHtmlWithZoneArtMtime(std.testing.allocator, live_board, null, null, .et, true, 1757328000);
+    defer std.testing.allocator.free(page);
+    // Marker arms the script; the bare opener is gone.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre data-live=\"1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") == null);
+    // Freshness line carries the render epoch for the script; the no-JS
+    // copy reads fresh at render.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"fresh\" data-mtime=\"1757328000\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "updated just now") != null);
+    // Updater script: same-URL EventSource with ?stream=sse, pre swap,
+    // 5s freshness tick, backoff reconnect, inert without the marker.
+    try std.testing.expect(std.mem.indexOf(u8, page, "EventSource") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "searchParams.set('stream','sse')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "setInterval(age,5000)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "wait=Math.min(wait*2,30000)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live_script, "if(!p||!window.EventSource)return;") != null);
+    // Script stays small: the whole tag under 30 lines.
+    var script_lines: usize = 1;
+    for (live_script) |byte| if (byte == '\n') {
+        script_lines += 1;
+    };
+    try std.testing.expect(script_lines < 30);
+    // Additions carry no escapes: the ANSI-free page contract holds.
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Visible pre text still matches the text renderer byte for byte.
+    try expectVisiblePreText(page, live_board, null, null);
+}
+
+test "final scoreboard pages stay static bytes" {
+    // JS-free stability: with no live game the page carries zero live
+    // bytes — bare opener, no marker, no fresh div, no updater script.
+    const final_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    try std.testing.expect(!boardIsLive(final_board));
+    const page = try scoreHtml(std.testing.allocator, final_board, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "data-live") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "data-mtime") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "class=\"fresh\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "EventSource") == null);
+    try expectVisiblePreText(page, final_board, null, null);
+}
+
+test "freshness copy graduates seconds to minutes to hours" {
+    const cases = [_]struct { age: u64, want: []const u8 }{
+        .{ .age = 0, .want = "updated just now" },
+        .{ .age = 9, .want = "updated just now" },
+        .{ .age = 12, .want = "updated 12s ago" },
+        .{ .age = 59, .want = "updated 59s ago" },
+        .{ .age = 60, .want = "updated 1m ago" },
+        .{ .age = 150, .want = "updated 2m ago" },
+        .{ .age = 3599, .want = "updated 59m ago" },
+        .{ .age = 3600, .want = "updated 1h ago" },
+        .{ .age = 7260, .want = "updated 2h ago" },
+    };
+    for (cases) |case| {
+        const copy = try freshAgeText(std.testing.allocator, case.age);
+        defer std.testing.allocator.free(copy);
+        try std.testing.expectEqualStrings(case.want, copy);
+    }
+}
+
 /// Renders `text` escaped (no tags) and expects it to equal the visible
 /// `<pre>` text of `page` with tags stripped and entities decoded: the
 /// linkifier adds invisible tags only, never layout.
 fn expectVisiblePreText(page: []const u8, board: domain.Scoreboard, width: ?u16, height: ?u16) !void {
-    const open = std.mem.indexOf(u8, page, "<pre>").?;
-    const close = std.mem.indexOf(u8, page, "</pre>").?;
-    const pre = page[open + "<pre>".len .. close];
+    const pre = preBody(page);
     var visible: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer visible.deinit();
     var i: usize = 0;
@@ -2999,9 +3206,7 @@ test "art off drops stacked marks and their interior blanks too" {
 /// art-off page's `<pre>` text must equal the art-off text body, so the
 /// linkifier adds invisible tags only, never layout.
 fn expectVisiblePreTextArt(page: []const u8, board: domain.Scoreboard, width: ?u16, height: ?u16, art: bool) !void {
-    const open = std.mem.indexOf(u8, page, "<pre>").?;
-    const close = std.mem.indexOf(u8, page, "</pre>").?;
-    const pre = page[open + "<pre>".len .. close];
+    const pre = preBody(page);
     var visible: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer visible.deinit();
     var i: usize = 0;

@@ -297,7 +297,7 @@ fn serveBoard(
             try help.scoreOneLine(alloc, board, color, route.quiet)
         else
             try render.textWithZoneArt(alloc, board, color, route.width, route.height, zone, route.art),
-        .html => try render.scoreHtmlWithZoneArt(alloc, board, route.width, route.height, zone, route.art),
+        .html => try render.scoreHtmlWithZoneArtMtime(alloc, board, route.width, route.height, zone, route.art, epoch_s),
         .json => try render.json(alloc, board),
     };
 
@@ -391,7 +391,7 @@ fn serveDetail(
         try detail_view.renderTextOneLine(alloc, game_detail, color, route.quiet)
     else switch (format) {
         .text => try detail_view.renderText(alloc, game_detail, color, route.width, route.height),
-        .html => try detail_view.detailHtml(alloc, game_detail, route.width, route.height),
+        .html => try detail_view.detailHtmlMtime(alloc, game_detail, route.width, route.height, epoch_s),
         .json => try detail_view.json(alloc, game_detail),
     };
 
@@ -442,7 +442,7 @@ fn serveStream(
     // (respecting color/width/height) prefixed with the clear-screen escape
     // via stream.frame, so plain `curl -N` repaints in place.
     const initial_text = try render.textWithZoneArt(alloc, initial, color, route.width, route.height, zone, route.art);
-    const initial_frame = try stream.frame(alloc, initial_text);
+    const initial_frame = try stream.frameWithMtime(alloc, initial_text, epoch_s);
 
     var sse = workers.StreamingResponse.start(.{ .status = .ok });
     sse.setHeader("content-type", stream.content_type);
@@ -485,7 +485,7 @@ fn serveStream(
         if (!stream.changed(last, current)) continue;
         last = current;
         const body = render.textWithZoneArt(alloc, board, color, route.width, route.height, zone, route.art) catch continue;
-        const event = stream.frame(alloc, body) catch continue;
+        const event = stream.frameWithMtime(alloc, body, epochSecondsNow()) catch continue;
         sse.write(event);
         // Per-request arena memory grows with each tick's render; the outer
         // entry arena is freed when the request ends, and frames for a
