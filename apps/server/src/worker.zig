@@ -53,6 +53,7 @@ const digest = @import("digest.zig");
 const stream = @import("stream.zig");
 const tz = @import("tz.zig");
 const tour = @import("tour.zig");
+const vd = @import("view.zig");
 
 const default_base_url = "https://site.api.espn.com/apis/site/v2";
 
@@ -659,9 +660,10 @@ fn boardResponse(body: []const u8, format: router.Format, cache_state: []const u
 }
 
 /// Human shortcut `/{league}/{abbr}/today`: resolve the team's game
-/// today and redirect to its canonical address (game id, or the team
-/// page when none). Fresh-only, no-store; the game id stays canonical
-/// so bookmarks and the JSON API keep one address per game.
+/// today and redirect to its human address (`/{league}/{date}/{slug}`,
+/// the same links every renderer emits), or the team page when none.
+/// The `/api/v1/` twin keeps the numeric id (JSON keeps ids).
+/// Fresh-only, no-store.
 fn serveToday(
     env: *workers.Env,
     alloc: std.mem.Allocator,
@@ -691,7 +693,7 @@ fn serveToday(
         if (route.api)
             try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, game.id })
         else
-            try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id })
+            try vd.scheduleGameHref(alloc, league.slug, route.abbr, game)
     else if (route.api)
         try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, route.abbr })
     else
@@ -708,7 +710,7 @@ fn serveToday(
 
 /// Human game alias, date form `/{league}/{date}/{away}-{home}[-N]`: resolve
 /// the day in the request zone, fetch that board fresh, redirect to the
-/// canonical `/{league}/{id}` (a miss 404s: plain on all-duel days,
+/// numeric (legacy) `/{league}/{id}` (a miss 404s: plain on all-duel days,
 /// duel-only hint past them). Fresh-only,
 /// no-store, no `/api/v1/` twin (serveToday parity).
 fn serveDateAlias(
@@ -754,8 +756,8 @@ fn serveDateAlias(
 /// (football only — gated on the league sport): fetch the week's board with
 /// NO dates param (ESPN resolves the week alone), verify the response season
 /// year against the URL season (ESPN ignores unknown season params — a
-/// mismatch 404s, never misleads), redirect to the canonical game id.
-/// Fresh-only, no-store (serveToday parity).
+/// mismatch 404s, never misleads), redirect to the numeric (legacy) game
+/// id. Fresh-only, no-store (serveToday parity).
 fn serveWeekAlias(
     env: *workers.Env,
     alloc: std.mem.Allocator,

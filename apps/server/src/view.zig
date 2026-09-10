@@ -710,14 +710,42 @@ pub fn gameLine(allocator: std.mem.Allocator, game: schedule.GameRef) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s} {s} {s} {s}", .{ prefix, versus, game.opponent_abbrev, game.result });
 }
 
+/// Human link for one team-schedule row: `/{league}/{ET-date}/{slug}`
+/// where the slug is the bare duel pair (away side first, lowercase),
+/// ordered from the row's home/away flag against the viewed team's
+/// abbreviation. Board order is not in hand here, so no `-N`
+/// doubleheader suffix: the rare second game resolves to its first
+/// (the alias default), never to a wrong day or pairing. Falls back to
+/// the legacy numeric `/{league}/{id}` when either abbreviation is
+/// empty (no pair exists to name). Pure string math, no fetch.
+pub fn scheduleGameHref(allocator: std.mem.Allocator, league: []const u8, own_abbr: []const u8, game: schedule.GameRef) ![]u8 {
+    if (own_abbr.len == 0 or game.opponent_abbrev.len == 0) {
+        return std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league, game.id });
+    }
+    const away, const home_team = if (std.mem.eql(u8, game.home_away, "away"))
+        .{ own_abbr, game.opponent_abbrev }
+    else
+        .{ game.opponent_abbrev, own_abbr };
+    const slug = try domain.duelSlug(allocator, away, home_team);
+    defer allocator.free(slug);
+    const day = try gameDay(allocator, game.date);
+    defer allocator.free(day);
+    return std.fmt.allocPrint(allocator, "/{s}/{s}/{s}", .{ league, day, slug });
+}
+
 /// Schedule line with a game pointer for linking: the base `gameLine`
-/// plus `  /{league}/{id}` so terminals can jump to the game view.
-/// HTML callers link the row instead.
-pub fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, game: schedule.GameRef) ![]u8 {
+/// plus the human `/{league}/{date}/{slug}` address (numeric legacy
+/// fallback inside `scheduleGameHref`) so terminals can jump to the
+/// game view. HTML callers link the row instead. The pointer rides the
+/// same fitted line, so a hostile row wider than the frame truncates it
+/// (the HTML link stays whole); real rows fit with room to spare.
+pub fn gameLineFull(allocator: std.mem.Allocator, league: []const u8, own_abbr: []const u8, game: schedule.GameRef) ![]u8 {
     const base = try gameLine(allocator, game);
     defer allocator.free(base);
     if (game.id.len == 0) return allocator.dupe(u8, base);
-    return std.fmt.allocPrint(allocator, "{s}  /{s}/{s}", .{ base, league, game.id });
+    const href = try scheduleGameHref(allocator, league, own_abbr, game);
+    defer allocator.free(href);
+    return std.fmt.allocPrint(allocator, "{s}  {s}", .{ base, href });
 }
 
 /// Fit `s` to `cols` terminal cells through the shared `table.writeCell`,
@@ -951,9 +979,9 @@ test "team composers keep record, game, and fit semantics" {
     const line = try gameLine(arena, late);
     defer arena.free(line);
     try std.testing.expect(std.mem.startsWith(u8, line, "09-13 "));
-    const full = try gameLineFull(arena, "nfl", late);
+    const full = try gameLineFull(arena, "nfl", "DAL", late);
     defer arena.free(full);
-    try std.testing.expect(std.mem.endsWith(u8, full, "  /nfl/x"));
+    try std.testing.expect(std.mem.endsWith(u8, full, "  /nfl/2026-09-13/dal-nyg"));
     const noid: schedule.GameRef = .{
         .id = "",
         .date = "2026-09-08",
@@ -964,9 +992,36 @@ test "team composers keep record, game, and fit semantics" {
         .state = "post",
         .result = "W 5-3",
     };
-    const bare = try gameLineFull(arena, "nfl", noid);
+    const bare = try gameLineFull(arena, "nfl", "DAL", noid);
     defer arena.free(bare);
     try std.testing.expectEqualStrings("09-08 vs NYG W 5-3", bare);
+    // No opponent abbreviation (nameless bouts): the numeric address.
+    const nameless: schedule.GameRef = .{
+        .id = "bout-9",
+        .date = "2026-09-06T23:00Z",
+        .opponent_abbrev = "",
+        .opponent_name = "",
+        .home_away = "",
+        .status = "Scheduled",
+        .state = "pre",
+        .result = "vs TBD",
+    };
+    const fallback = try scheduleGameHref(arena, "ufc", "", nameless);
+    defer arena.free(fallback);
+    try std.testing.expectEqualStrings("/ufc/bout-9", fallback);
+    // Home side lists second: the opponent opens the pair.
+    const homer = try scheduleGameHref(arena, "mlb", "PHI", .{
+        .id = "9",
+        .date = "2026-09-06T17:00Z",
+        .opponent_abbrev = "NYM",
+        .opponent_name = "New York Mets",
+        .home_away = "home",
+        .status = "Final",
+        .state = "post",
+        .result = "W 5-3",
+    });
+    defer arena.free(homer);
+    try std.testing.expectEqualStrings("/mlb/2026-09-06/nym-phi", homer);
 
     const fitted = try fitLine(arena, "Short line", 52, null, false);
     defer arena.free(fitted);
@@ -1008,16 +1063,22 @@ pub fn scoreboardHeading(
     return std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ league_name, date, zone_tag });
 }
 
-/// Plain-text pointer under each scoreboard game: the first
-/// participant's abbreviation (empty when the game has none). The HTML
-/// renderer turns the status row into a real link instead.
+/// Plain-text pointer under each scoreboard game: the canonical human
+/// address (`/{league}/{date}/{slug}` — duel pair or `event-N`), falling
+/// back to the legacy numeric `/{league}/{id}` when the game carries no
+/// stamped slug, plus the first participant's team pointer (empty when
+/// the game has none). The HTML renderer turns the status row into a
+/// real link instead.
 pub fn scoreGameLink(
     allocator: std.mem.Allocator,
     league: []const u8,
-    game_id: []const u8,
-    first_abbr: []const u8,
+    board_date: []const u8,
+    game: domain.Game,
 ) ![]u8 {
-    return std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{ league, game_id, league, first_abbr });
+    const target = try domain.gameHref(allocator, league, board_date, game);
+    defer allocator.free(target);
+    const first_abbr = if (game.participants.len > 0) game.participants[0].abbreviation else "";
+    return std.fmt.allocPrint(allocator, "game: {s}   team: /{s}/{s}", .{ target, league, first_abbr });
 }
 
 /// One scoreboard participant row, column-aligned like the old table
@@ -1298,10 +1359,28 @@ test "scoreboard composers hold width and hostile input" {
     const heading = try scoreboardHeading(arena, "MLB", "2026-09-06", "ET");
     defer arena.free(heading);
     try std.testing.expectEqualStrings("MLB  2026-09-06 ET", heading);
-    const link = try scoreGameLink(arena, "mlb", "9", "PHI");
+    const link = try scoreGameLink(arena, "mlb", "2026-09-06", .{
+        .id = "9",
+        .name = "",
+        .starts_at = "",
+        .state = "post",
+        .status = "Final",
+        .slug = "phi-nym",
+        .participants = &.{
+            .{ .id = "a", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
+        },
+    });
     defer arena.free(link);
-    try std.testing.expectEqualStrings("game: /mlb/9   team: /mlb/PHI", link);
-    const bare = try scoreGameLink(arena, "mlb", "9", "");
+    try std.testing.expectEqualStrings("game: /mlb/2026-09-06/phi-nym   team: /mlb/PHI", link);
+    // Unstamped games (hand-built boards) keep the legacy numeric pointer.
+    const bare = try scoreGameLink(arena, "mlb", "2026-09-06", .{
+        .id = "9",
+        .name = "",
+        .starts_at = "",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
+    });
     defer arena.free(bare);
     try std.testing.expectEqualStrings("game: /mlb/9   team: /mlb/", bare);
     try std.testing.expectEqualStrings("1;31", statusAnsi("in") orelse "");

@@ -53,7 +53,7 @@ const GamePath = struct {
         .fields = .{
             .id = .{
                 .pattern = "^[0-9]+$",
-                .description = "ESPN game id; digits only, anything else routes to the team view",
+                .description = "ESPN game id; digits only (legacy numeric address, still resolves), anything else routes to the team view; the human slug form is the canonical link and JSON carries both id and slug",
             },
         },
     };
@@ -123,7 +123,9 @@ pub const ApiSpec = z.Spec(.{
     z.endpoint(.GET, "/api/v1/{league}/{id}", .{
         .operation_id = "getGame",
         .summary = "One game with linescore and scoring plays",
-        .description = "The second segment is a game only when it is all digits; anything else routes to the team view.",
+        .description = "The second segment is a game only when it is all digits (legacy numeric address, still resolves); anything else routes to the team view. " ++
+            "The human slug form (/{league}/{date}/{slug}) is the canonical link and 302s here. " ++
+            "Responses carry both: numeric id plus the additive slug day-unique human id.",
         .path = GamePath,
         .responses = .{
             z.case(.ok, core.detail.GameDetail),
@@ -205,7 +207,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
             "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
             "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only, seasontype=T football-only with week. (getScoreboard)\n" ++
-            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
+            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only (legacy numeric address, still resolves). Game and detail JSON carry the additive slug day-unique human id next to id. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
             "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
             "  GET /api/v1/league/teams - Team list: id, abbrev, name per team. JSON-only, same body on the human path. (listTeams)\n" ++
@@ -214,10 +216,12 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  Scoreboard games and game detail carry network when ESPN lists broadcasts (first broadcasts[].names entry, geo-feed fallback); null/absent otherwise.\n" ++
             "\n" ++
             "DIGITS RULE\n" ++
-            "  Second segment all digits is a game: /mlb/401816828.\n" ++
+            "  Game links everywhere use the human slug: /{league}/{date}/{slug} (duel {away}-{home}[-N], else event-N), e.g. /mlb/2026-09-09/min-det.\n" ++
+            "  Second segment all digits is the legacy numeric address and still resolves: /mlb/401816828.\n" ++
             "  Anything else is a team: /mlb/PHI.\n" ++
+            "  JSON carries both: numeric id (resolution address) plus the additive slug (human id).\n" ++
             "\n" ++
-            "ALIASES human only, 302 to /{league}/{id} (bare curl prints the stub: use curl -L), no /api/v1/ twins\n" ++
+            "SLUGS canonical human game ids, 302 to /{league}/{id} (bare curl prints the stub: use curl -L), no /api/v1/ twins\n" ++
             "  /{league}/YYYY-MM-DD/{away}-{home}[-N] one game by date and teams: /mlb/2026-09-09/min-det (-2 = doubleheader game 2, 1 = first; today/tomorrow/yesterday also work)\n" ++
             "  /{league}/YYYY-MM-DD/event[-N] Nth game on the day board: /ufc/2026-09-05/event-14 (bare event = 1; every game: bouts, sessions, fields, name-only duels)\n" ++
             "  /{league}/YYYY/weekN/{away}-{home}[-N] football-only week game: /nfl/2026/week1/ne-sea\n" ++
@@ -261,6 +265,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/api/v1/mlb/teams\n" ++
+            "  curl -L localhost:8080/mlb/2026-09-06/cle-bal\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det\n" ++
             "  curl -L localhost:8080/mlb/2026-09-09/min-det-2\n" ++

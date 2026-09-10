@@ -9,6 +9,7 @@ pub const standings = @import("standings.zig");
 test {
     _ = date;
     _ = detail;
+    _ = domain;
     _ = leagues;
     _ = art;
     _ = schedule;

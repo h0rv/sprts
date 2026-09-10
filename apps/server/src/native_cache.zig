@@ -199,6 +199,7 @@ pub fn cloneScoreboard(a: std.mem.Allocator, board: domain.Scoreboard) !domain.S
         }
         games[i] = .{
             .id = try a.dupe(u8, game.id),
+            .slug = try a.dupe(u8, game.slug),
             .name = try a.dupe(u8, game.name),
             .starts_at = try a.dupe(u8, game.starts_at),
             .state = try a.dupe(u8, game.state),
@@ -269,6 +270,7 @@ pub fn cloneGameDetail(a: std.mem.Allocator, detail: core.detail.GameDetail) !co
     return .{
         .schema_version = try a.dupe(u8, detail.schema_version),
         .id = try a.dupe(u8, detail.id),
+        .slug = try a.dupe(u8, detail.slug),
         .league = try a.dupe(u8, detail.league),
         .league_name = try a.dupe(u8, detail.league_name),
         .date = try a.dupe(u8, detail.date),

@@ -577,12 +577,21 @@ pub fn parseAndNormalize(arena: std.mem.Allocator, league: *const core.leagues.L
             }
         }
     }
+    // Day-unique human ids, stamped once the slate is whole: duel pairs
+    // (`{away}-{home}[-N]`) and board ordinals (`event-N`) derive from
+    // board order alone, so every renderer links them with no extra fetch.
+    // The detail path reuses these rows (see `findBoardGame`), carrying
+    // the same slug into `GameDetail.slug` and JSON.
+    const owned = try games.toOwnedSlice(arena);
+    for (owned, 0..) |*game, i| {
+        game.slug = try core.domain.boardGameSlug(arena, owned, i);
+    }
     return .{
         .league = league.slug,
         .league_name = league.name,
         .date = try copy(arena, day),
         .source = "site.api.espn.com",
-        .games = try games.toOwnedSlice(arena),
+        .games = owned,
     };
 }
 
@@ -2123,6 +2132,10 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
 
     return .{
         .id = try copy(arena, game.id),
+        // Zero new fetches: the slug was stamped on the board row above
+        // from board order, so the detail (and its JSON) carries the same
+        // human id the scoreboard links.
+        .slug = try copy(arena, game.slug),
         .league = league.slug,
         .league_name = league.name,
         .date = try copy(arena, hit.day),
@@ -2224,6 +2237,7 @@ test "fetchDetail enriches the board row with summary fields" {
     try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.board_calls);
     try std.testing.expectEqualStrings("401816828", detail.id);
+    try std.testing.expectEqualStrings("atl-phi", detail.slug);
     try std.testing.expectEqualStrings("mlb", detail.league);
     try std.testing.expectEqualStrings("2026-09-06", detail.date);
     try std.testing.expectEqualStrings("post", detail.state);
@@ -4435,6 +4449,105 @@ test "findGameByMatchupN counts exact before swapped" {
     try std.testing.expect(findGameByMatchupN(board, "min", "det", 3) == null);
 }
 
+test "parseAndNormalize stamps day-unique slugs" {
+    const fixture =
+        \\{"events":[
+        \\ {"id":"1","name":"Minnesota Twins at Detroit Tigers","date":"2026-09-09T17:00Z","competitions":[{"id":"1","competitors":[{"homeAway":"away","score":"2","winner":false,"team":{"id":"a","displayName":"Minnesota Twins","abbreviation":"MIN"}},{"homeAway":"home","score":"5","winner":true,"team":{"id":"h","displayName":"Detroit Tigers","abbreviation":"DET"}}]}]},
+        \\ {"id":"2","name":"Minnesota Twins at Detroit Tigers","date":"2026-09-09T20:00Z","competitions":[{"id":"2","competitors":[{"homeAway":"away","score":"1","winner":true,"team":{"id":"a","displayName":"Minnesota Twins","abbreviation":"MIN"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"h","displayName":"Detroit Tigers","abbreviation":"DET"}}]}]},
+        \\ {"id":"3","name":"New York Yankees at Boston Red Sox","date":"2026-09-09T23:00Z","competitions":[{"id":"3","competitors":[{"homeAway":"away","team":{"id":"c","displayName":"New York Yankees","abbreviation":"NYY"}},{"homeAway":"home","team":{"id":"d","displayName":"Boston Red Sox","abbreviation":"BOS"}}]}]},
+        \\ {"id":"4","name":"Grand Prix","date":"2026-09-09T13:00Z","competitions":[{"id":"4","competitors":[{"order":1,"winner":true,"athlete":{"displayName":"Max Verstappen","fullName":"Max Verstappen","shortName":"M. Verstappen"}}]}]}
+        \\]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-09", fixture);
+    try std.testing.expectEqual(@as(usize, 4), parsed.games.len);
+    try std.testing.expectEqualStrings("min-det", parsed.games[0].slug);
+    try std.testing.expectEqualStrings("min-det-2", parsed.games[1].slug);
+    try std.testing.expectEqualStrings("nyy-bos", parsed.games[2].slug);
+    try std.testing.expectEqualStrings("event-4", parsed.games[3].slug);
+}
+
+test "stamped slugs resolve back through the alias lookups" {
+    // The renderers link `/{league}/{date}/{slug}` with no board in hand
+    // beyond order, so every stamped slug must round-trip through the
+    // same lookups the alias arms serve: duel pairs (exact then swapped
+    // order, `-N` past the first same-order listing) and the ordinal for
+    // everything else. Out-of-range still misses.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "first",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "second",
+                .name = "",
+                .starts_at = "2026-09-09T20:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "1", .winner = true },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "0", .winner = false },
+                },
+            },
+            .{
+                .id = "swapped",
+                .name = "",
+                .starts_at = "2026-09-09T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "", .winner = false },
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "", .winner = false },
+                },
+            },
+            .{
+                .id = "race",
+                .name = "Grand Prix",
+                .starts_at = "2026-09-09T13:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "v", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                },
+            },
+        },
+    };
+    // Same stamping the provider applies (see `parseAndNormalize`).
+    const games = try arena.dupe(core.domain.Game, board.games);
+    for (games, 0..) |*game, i| game.slug = try core.domain.boardGameSlug(arena, games, i);
+    var stamped = board;
+    stamped.games = games;
+    try std.testing.expectEqualStrings("min-det", stamped.games[0].slug);
+    try std.testing.expectEqualStrings("min-det-2", stamped.games[1].slug);
+    try std.testing.expectEqualStrings("det-min", stamped.games[2].slug);
+    try std.testing.expectEqualStrings("event-4", stamped.games[3].slug);
+    try std.testing.expectEqualStrings("first", findGameByMatchupN(stamped, "min", "det", 1).?.id);
+    try std.testing.expectEqualStrings("second", findGameByMatchupN(stamped, "min", "det", 2).?.id);
+    // The swapped listing rides the swapped pass: N counts exact then
+    // swapped, so it is third under this pair and misses past it.
+    try std.testing.expectEqualStrings("swapped", findGameByMatchupN(stamped, "min", "det", 3).?.id);
+    try std.testing.expect(findGameByMatchupN(stamped, "min", "det", 4) == null);
+    try std.testing.expectEqualStrings("swapped", findGameByMatchupN(stamped, "det", "min", 1).?.id);
+    try std.testing.expectEqualStrings("race", findGameByOrdinal(stamped, 4).?.id);
+    try std.testing.expect(findGameByOrdinal(stamped, 5) == null);
+}
+
 test "boardHasNonDuels separates cards and fields from duel days" {
     // All-duel day: every game is two abbr'd participants.
     try std.testing.expect(!boardHasNonDuels(matchupBoard()));
@@ -5203,4 +5316,3 @@ test "detail win probability reads the last sample, absent stays null" {
     const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
     try std.testing.expect(bare.win_probability == null);
 }
-

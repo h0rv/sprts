@@ -75,7 +75,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
             try table.writeLine(w, "Today:", cols, null, color);
             today_open = true;
         }
-        try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+        try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
     }
     for (view.extra_next) |game| {
         if (!game.today) continue;
@@ -84,7 +84,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
             try table.writeLine(w, "Today:", cols, null, color);
             today_open = true;
         }
-        try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+        try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
     }
     // Overflow reach for the footer query link: a height revealing every
     // hidden row on either side.
@@ -92,10 +92,10 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
     if (view.last.len > 0) {
         try w.writeByte('\n');
         try table.writeLine(w, "Last 5:", cols, null, color);
-        for (view.last) |game| try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+        for (view.last) |game| try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
         any_shown = true;
         const shown_extra = view.extra_past[0..@min(view.extra_past.len, height orelse 0)];
-        for (shown_extra) |game| try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+        for (shown_extra) |game| try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
         if (shown_extra.len < view.extra_past.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})  /{s}/{s}?height={d}", .{ view.extra_past.len - shown_extra.len, view.extra_past.len, view.league, view.team.abbrev, view.extra_past.len });
             defer allocator.free(more);
@@ -128,7 +128,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
                 try table.writeLine(w, "Next 5:", cols, null, color);
                 next_open = true;
             }
-            try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+            try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
             shown += 1;
         }
         for (shown_extra) |game| {
@@ -138,7 +138,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
                 try table.writeLine(w, "Next 5:", cols, null, color);
                 next_open = true;
             }
-            try writeTeamGameFull(allocator, w, view.league, game, cols, color);
+            try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
         }
         const hidden = (upcoming_total - shown) + (extra_total - shown_extra_unflagged);
         if (hidden > 0) {
@@ -184,8 +184,8 @@ pub fn renderText(allocator: std.mem.Allocator, view: schedule.TeamView, color: 
 
 /// One schedule row plus its probable starter, shared by every section
 /// so Today/Last/Next overflow all read the same.
-fn writeTeamGameFull(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, game: schedule.GameRef, cols: usize, color: bool) !void {
-    const line = try vd.gameLineFull(allocator, league_slug, game);
+fn writeTeamGameFull(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, own_abbr: []const u8, game: schedule.GameRef, cols: usize, color: bool) !void {
+    const line = try vd.gameLineFull(allocator, league_slug, own_abbr, game);
     defer allocator.free(line);
     try table.writeLine(w, line, cols, null, color);
     if (game.probable.len > 0) {
@@ -245,7 +245,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
     if (view.live) |live| {
         try w.writeByte('\n');
         try render.writeHtmlLine(w, allocator, "LIVE NOW", cols, "live", null);
-        try teamGameHtml(allocator, w, league_slug, live, "live", cols);
+        try teamGameHtml(allocator, w, league_slug, view.team.abbrev, live, "live", cols);
     }
     // Today: flagged upcoming rows top-center (mirrors text). Flagged
     // rows skip Next below, so nothing shows twice.
@@ -257,7 +257,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
             try render.writeHtmlLine(w, allocator, "Today:", cols, null, null);
             today_open = true;
         }
-        try writeTeamGameFullHtml(allocator, w, league_slug, game, null, cols);
+        try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
     }
     for (view.extra_next) |game| {
         if (!game.today) continue;
@@ -266,7 +266,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
             try render.writeHtmlLine(w, allocator, "Today:", cols, null, null);
             today_open = true;
         }
-        try writeTeamGameFullHtml(allocator, w, league_slug, game, null, cols);
+        try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
     }
     const reach_height = @max(view.extra_past.len, view.next.len, view.extra_next.len);
     const more_href = try std.fmt.allocPrint(allocator, "/{s}/{s}?height={d}", .{ league_slug, view.team.abbrev, reach_height });
@@ -275,10 +275,10 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
     if (view.last.len > 0) {
         try w.writeByte('\n');
         try render.writeHtmlLine(w, allocator, "Last 5:", cols, null, null);
-        for (view.last) |game| try teamGameHtml(allocator, w, league_slug, game, null, cols);
+        for (view.last) |game| try teamGameHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
         any_shown = true;
         const shown_extra = view.extra_past[0..@min(view.extra_past.len, height orelse 0)];
-        for (shown_extra) |game| try teamGameHtml(allocator, w, league_slug, game, null, cols);
+        for (shown_extra) |game| try teamGameHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
         if (shown_extra.len < view.extra_past.len) {
             const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ view.extra_past.len - shown_extra.len, view.extra_past.len });
             defer allocator.free(more);
@@ -311,7 +311,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
                 try render.writeHtmlLine(w, allocator, "Next 5:", cols, null, null);
                 next_open = true;
             }
-            try writeTeamGameFullHtml(allocator, w, league_slug, game, null, cols);
+            try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
             shown += 1;
         }
         for (shown_extra) |game| {
@@ -321,7 +321,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
                 try render.writeHtmlLine(w, allocator, "Next 5:", cols, null, null);
                 next_open = true;
             }
-            try writeTeamGameFullHtml(allocator, w, league_slug, game, null, cols);
+            try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
         }
         const hidden = (upcoming_total - shown) + (extra_total - shown_extra_unflagged);
         if (hidden > 0) {
@@ -362,8 +362,8 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
 
 /// One schedule row plus its probable starter as HTML, shared by every
 /// section so Today/Last/Next overflow all read the same.
-fn writeTeamGameFullHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
-    try teamGameHtml(allocator, w, league_slug, game, css, cols);
+fn writeTeamGameFullHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league_slug: []const u8, own_abbr: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
+    try teamGameHtml(allocator, w, league_slug, own_abbr, game, css, cols);
     if (game.probable.len > 0) {
         const line = try std.fmt.allocPrint(allocator, "  Probable: {s}", .{game.probable});
         defer allocator.free(line);
@@ -371,16 +371,21 @@ fn writeTeamGameFullHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league
     }
 }
 
-/// One schedule row as HTML: the fitted line linking to the game view.
-/// Empty ids (should not happen; the provider always sets one) render
-/// as a plain line rather than a dead link.
-fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
+/// One schedule row as HTML: the fitted line linking to the game view
+/// (human slug address, numeric legacy fallback inside). Empty ids
+/// (should not happen; the provider always sets one) render as a plain
+/// line rather than a dead link.
+fn teamGameHtml(allocator: std.mem.Allocator, w: *std.Io.Writer, league: []const u8, own_abbr: []const u8, game: schedule.GameRef, css: ?[]const u8, cols: usize) !void {
     const line = try vd.gameLine(allocator, game);
     defer allocator.free(line);
     const trimmed = try vd.fitLine(allocator, line, cols, null, false);
     defer allocator.free(trimmed);
+    const href = try vd.scheduleGameHref(allocator, league, own_abbr, game);
+    defer allocator.free(href);
     if (game.id.len > 0) {
-        try w.print("<a href=\"/{s}/{s}\">", .{ league, game.id });
+        try w.writeAll("<a href=\"");
+        try render.escapeInto(w, href);
+        try w.writeAll("\">");
     }
     if (css) |class| {
         try w.writeAll("<span class=\"");
@@ -491,7 +496,7 @@ test "team text shows header, live, last, and next with probables" {
     try std.testing.expect(std.mem.indexOf(u8, output, "3-2 Top 7th") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Last 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "W 5-3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/401814694") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/2026-09-05/nym-phi") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Probable: Jesus Luzardo") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "<html") == null);
     _ = try std.unicode.Utf8View.init(output);
@@ -541,8 +546,8 @@ test "team HTML links and never carries ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/scores\">") == null);
     // Schedule rows link to their game views; both last and next shown.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/live1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-05/nym-phi\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-07/atl-phi\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Last 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Next 5:") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/PHI\">") != null);
@@ -809,8 +814,8 @@ test "team depth overflow hides extras by default, height reveals with query lin
     // No Earlier/Later sections: overflow hides behind trailers + footer.
     try std.testing.expect(std.mem.indexOf(u8, output, "Earlier:") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Later:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/old1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/fut1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/2026-09-04/phi-nym") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/mlb/2026-09-09/nym-phi") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "+1 more (?height=1)  /mlb/PHI?height=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "+1 more (?height=2)  /mlb/PHI?height=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "more: /mlb/PHI?height=2") != null);
@@ -825,14 +830,14 @@ test "team depth overflow hides extras by default, height reveals with query lin
     const tall = try renderText(std.testing.allocator, depthOverflowView(), false, null, 9);
     defer std.testing.allocator.free(tall);
     try std.testing.expect(std.mem.indexOf(u8, tall, "L 2-4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tall, "/mlb/old1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tall, "/mlb/2026-09-04/phi-nym") != null);
     try std.testing.expect(std.mem.indexOf(u8, tall, "Probable: Ranger Suarez") != null);
     var lines = std.mem.splitScalar(u8, tall, '\n');
     var found = false;
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "/mlb/fut1") == null) continue;
+        if (std.mem.indexOf(u8, line, "/mlb/2026-09-09/nym-phi") == null) continue;
         found = true;
-        try std.testing.expectEqualStrings("09-09 vs NYM 3:05 PM  /mlb/fut1", line);
+        try std.testing.expectEqualStrings("09-09 vs NYM 3:05 PM  /mlb/2026-09-09/nym-phi", line);
     }
     try std.testing.expect(found);
     // Fully revealed: no trailers, no footer query link.
@@ -856,9 +861,9 @@ test "team depth overflow honors height with trailers" {
     view.extra_next = &refs;
     const capped = try renderText(std.testing.allocator, view, false, null, 2);
     defer std.testing.allocator.free(capped);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/f3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/2026-09-09/nym-phi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/2026-09-10/nym-phi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "/mlb/2026-09-11/nym-phi") == null);
     try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more (?height=3)") != null);
     _ = try std.unicode.Utf8View.init(capped);
 }
@@ -876,7 +881,7 @@ test "team today section leads with flagged rows, skips them below" {
     const next_at = std.mem.indexOf(u8, output, "Next 5:").?;
     try std.testing.expect(today_at < last_at);
     try std.testing.expect(last_at < next_at);
-    try std.testing.expect(std.mem.indexOf(u8, output, "09-07 vs ATL 1:05 PM  /mlb/live1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "09-07 vs ATL 1:05 PM  /mlb/2026-09-07/atl-phi") != null);
     var count: usize = 0;
     var cursor: usize = 0;
     while (std.mem.indexOfPos(u8, output, cursor, "09-07 vs ATL 1:05 PM")) |at| {
@@ -891,7 +896,7 @@ test "team today section leads with flagged rows, skips them below" {
     const page = try teamHtml(std.testing.allocator, view, "mlb", null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "Today:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/live1\">09-07 vs ATL 1:05 PM</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-07/atl-phi\">09-07 vs ATL 1:05 PM</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
 }
 
@@ -907,16 +912,16 @@ test "team depth overflow html links and escapes, never ansi" {
     // No Earlier/Later sections: overflow hides behind trailers + footer.
     try std.testing.expect(std.mem.indexOf(u8, page, "Earlier:") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Later:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "/mlb/old1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "/mlb/fut1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "/mlb/2026-09-04/phi-nym") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "/mlb/2026-09-09/nym-phi") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, ">more</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(page);
     // Explicit height reveals the overflow rows with links and escapes.
     const tall = try teamHtml(std.testing.allocator, view, "mlb", null, 9);
     defer std.testing.allocator.free(tall);
-    try std.testing.expect(std.mem.indexOf(u8, tall, "<a href=\"/mlb/old1\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tall, "<a href=\"/mlb/fut1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tall, "<a href=\"/mlb/2026-09-04/phi-nym\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tall, "<a href=\"/mlb/2026-09-09/nym-phi\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, tall, "A &amp; B &lt;ace&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, tall, ">more</a>") == null);
 
@@ -1025,7 +1030,7 @@ test "art-off team HTML carries no marks, no logo spans" {
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Philadelphia Phillies (PHI)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-05/nym-phi\">") != null);
     _ = try std.unicode.Utf8View.init(page);
     // Art on keeps its spans (precondition check, mirrors the text test).
     const on_page = try teamHtml(arena, view, "mlb", null, null);
@@ -1197,18 +1202,24 @@ test "hostile team schedule reads identically in text and HTML" {
         if (item.live) {
             try std.testing.expect(teamContainsLine(text, fitted));
         } else {
-            const full = try vd.gameLineFull(arena, "mlb", item.game);
+            const full = try vd.gameLineFull(arena, "mlb", view.team.abbrev, item.game);
             defer arena.free(full);
             const fitted_full = try vd.fitLine(arena, full, cols, null, false);
             defer arena.free(fitted_full);
             try std.testing.expect(teamContainsLine(text, fitted_full));
             // Pointer chrome links the surfaces: strip it to reach the
-            // bare row the HTML side links.
+            // bare row the HTML side links. A hostile row wider than the
+            // frame truncates the pointer (the HTML link stays whole);
+            // only suffix-strip when the full line fits.
             if (item.game.id.len > 0) {
-                const pointer = try std.fmt.allocPrint(arena, "  /mlb/{s}", .{item.game.id});
+                const want_href = try vd.scheduleGameHref(arena, "mlb", view.team.abbrev, item.game);
+                defer arena.free(want_href);
+                const pointer = try std.fmt.allocPrint(arena, "  {s}", .{want_href});
                 defer arena.free(pointer);
-                try std.testing.expect(std.mem.endsWith(u8, fitted_full, pointer));
-                try std.testing.expectEqualStrings(fitted, fitted_full[0 .. fitted_full.len - pointer.len]);
+                if (table.textCells(full) <= cols) {
+                    try std.testing.expect(std.mem.endsWith(u8, fitted_full, pointer));
+                    try std.testing.expectEqualStrings(fitted, fitted_full[0 .. fitted_full.len - pointer.len]);
+                }
             } else {
                 try std.testing.expectEqualStrings(fitted, fitted_full);
             }
@@ -1281,7 +1292,7 @@ test "family soccer team view renders draws, standing, and links in text and HTM
     };
     const text = try renderText(arena, team_view, false, null, null);
     defer arena.free(text);
-    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "1st in Premier League", "Last 5:", "D 2-2", "/epl/784120", "Next 5:", "vs TOT 3:00 PM", "/epl/784123" }) |token| {
+    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "1st in Premier League", "Last 5:", "D 2-2", "/epl/2026-09-01/ars-che", "Next 5:", "vs TOT 3:00 PM", "/epl/2026-09-08/tot-ars" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, text, token) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, text, "Probable:") == null);
@@ -1289,7 +1300,7 @@ test "family soccer team view renders draws, standing, and links in text and HTM
     _ = try std.unicode.Utf8View.init(text);
     const page = try teamHtml(arena, team_view, "epl", null, null);
     defer arena.free(page);
-    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "D 2-2", "<a href=\"/epl/784120\">", "<a href=\"/epl/784123\">" }) |token| {
+    for ([_][]const u8{ "Arsenal (ARS)", "18-3-5", "D 2-2", "<a href=\"/epl/2026-09-01/ars-che\">", "<a href=\"/epl/2026-09-08/tot-ars\">" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, page, token) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
@@ -1318,7 +1329,7 @@ test "family soccer team view renders draws, standing, and links in text and HTM
         const fitted = try vd.fitLine(arena, base, cols, null, false);
         defer arena.free(fitted);
         try std.testing.expect(teamContainsLine(seen, fitted));
-        const full = try vd.gameLineFull(arena, "epl", game);
+        const full = try vd.gameLineFull(arena, "epl", team_view.team.abbrev, game);
         defer arena.free(full);
         const fitted_full = try vd.fitLine(arena, full, cols, null, false);
         defer arena.free(fitted_full);

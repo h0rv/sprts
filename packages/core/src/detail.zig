@@ -121,6 +121,11 @@ pub const DetailGame = struct {
     date: []const u8,
     state: []const u8,
     status: []const u8,
+    /// Day-unique human id, copied from the board row the detail enriches
+    /// (`{away}-{home}[-N]` for duels, `event-N` otherwise; see
+    /// `domain.Game.slug`). Additive in JSON next to `id`, which stays the
+    /// resolution address. Empty only when the board row carried none.
+    slug: []const u8 = "",
     venue: ?[]const u8 = null,
     attendance: ?i64 = null,
     series: ?[]const u8 = null,
@@ -153,6 +158,7 @@ pub const DetailGame = struct {
         .fields = .{
             .schema_version = .{ .@"const" = "1" },
             .date = .{ .format = "date" },
+            .slug = .{ .description = "Day-unique human id on the game date: {away}-{home}[-N] for duels, event-N otherwise. Additive; id stays the resolution address." },
             .venue = .{ .description = "Venue full name when the provider supplies one." },
             .attendance = .{ .description = "Ticketed attendance when the provider supplies it." },
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },

@@ -52,21 +52,23 @@ pub const TeamRoute = struct {
 };
 
 /// Human shortcut: `/{league}/{abbr}/today` jumps to the team's game
-/// today (or falls back to its team page when none). The game id stays
-/// canonical — this redirects, never renders — so bookmarks and the JSON
-/// API keep one address per game. `api` preserves the address family on
-/// redirect (`/api/v1/` twins stay API addresses). Display flags are
-/// meaningless on a redirect and stay unset.
+/// today (or falls back to its team page when none). The numeric id stays
+/// the resolution address — this redirects, never renders — while every
+/// renderer links the human form; `api` preserves the address family on
+/// redirect (`/api/v1/` twins stay numeric API addresses). Display flags
+/// are meaningless on a redirect and stay unset.
 pub const TodayRoute = struct {
     league: []const u8,
     abbr: []const u8,
     api: bool,
 };
 
-/// Human game alias, date form: `/{league}/{YYYY-MM-DD}/{away}-{home}`
+/// Human game address, date form: `/{league}/{YYYY-MM-DD}/{away}-{home}`
 /// (lowercase abbrevs, e.g. `/mlb/2026-09-09/min-det`; the relative tokens
-/// `today|tomorrow|yesterday` ride too). Redirects to the canonical
-/// `/{league}/{id}` — never renders, no `/api/v1/` twin (JSON keeps ids).
+/// `today|tomorrow|yesterday` ride too). This is the linked (canonical
+/// presentation) form, but it still 302s to the legacy numeric
+/// `/{league}/{id}` — which keeps rendering — never renders here, and has
+/// no `/api/v1/` twin (JSON keeps ids, plus the additive `slug` field).
 /// A doubleheader (same pair twice one day) takes an optional `-N` suffix
 /// (`/{league}/{date}/{away}-{home}-2`): 1-based among same-pair games in
 /// board order, 1 = first; absent is 1 (current behavior). Out-of-range N
@@ -80,9 +82,11 @@ pub const DateAliasRoute = struct {
     n: ?u16 = null,
 };
 
-/// Human game alias, week form (football only — the serve layer gates on
+/// Human game address, week form (football only — the serve layer gates on
 /// the league sport): `/{league}/{YYYY}/week{N}/{away}-{home}`, e.g.
-/// `/nfl/2026/week1/ne-sea`. Redirects like the date form, no twin.
+/// `/nfl/2026/week1/ne-sea`. A football convenience spelling of the same
+/// canonical scheme: 302s to the legacy numeric address like the date
+/// form, no twin.
 /// Same optional `-N` doubleheader suffix as the date form.
 pub const WeekAliasRoute = struct {
     league: []const u8,
@@ -96,8 +100,9 @@ pub const WeekAliasRoute = struct {
 
 /// Human game ordinal, date form: `/{league}/{YYYY-MM-DD}/event[-N]`
 /// (bare `event` is 1; `event-2` is the second game; the relative tokens
-/// `today|tomorrow|yesterday` ride too). Redirects to the canonical
-/// `/{league}/{id}` — never renders, no `/api/v1/` twin (JSON keeps ids).
+/// `today|tomorrow|yesterday` ride too). The linked form for every game
+/// no abbr pair can name — still 302s to the legacy numeric address,
+/// never renders, no `/api/v1/` twin (JSON keeps ids plus `slug`).
 /// N counts EVERY game on the day board in listed order (duels and
 /// non-duels alike), so every game has a human URL even when no abbr pair
 /// can name it. Out-of-range N misses at lookup (404); malformed shapes
@@ -112,7 +117,7 @@ pub const DateEventRoute = struct {
 
 /// Human game ordinal, week form (football only — the serve layer gates on
 /// the league sport): `/{league}/{YYYY}/week{N}/event[-N]`, e.g.
-/// `/nfl/2026/week1/event-3`. Redirects like the date form, no twin.
+/// `/nfl/2026/week1/event-3`. 302s like the date form, no twin.
 pub const WeekEventRoute = struct {
     league: []const u8,
     season: []const u8,

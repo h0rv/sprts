@@ -381,6 +381,7 @@ fn hasProbables(game: detail.GameDetail) bool {
 fn testDetail() detail.GameDetail {
     return .{
         .id = "401816828",
+        .slug = "atl-phi",
         .league = "mlb",
         .league_name = "MLB",
         .date = "2026-09-06",
@@ -577,8 +578,12 @@ test "detail json validates and carries the schema marker" {
     const output = try json(arena, testDetail());
     try std.testing.expect(std.mem.indexOf(u8, output, "\"schema_version\": \"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "401816828") != null);
+    // Additive slug: the human id rides next to the numeric one, which
+    // stays the resolution address.
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"slug\": \"atl-phi\"") != null);
     const parsed = try std.json.parseFromSliceLeaky(detail.GameDetail, arena, output, .{});
     try std.testing.expectEqualStrings("401816828", parsed.id);
+    try std.testing.expectEqualStrings("atl-phi", parsed.slug);
     try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
     try std.testing.expectEqualStrings("Citizens Bank Park", parsed.venue.?);
 }
@@ -1518,7 +1523,7 @@ fn familyNfl() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "Q4", .text = "Jalen Hurts 1 Yd run (Jake Elliott Kick)", .away_score = "27", .home_score = "24" },
         },
-        .leaders = &.{"KC Passing 320 YDS", "Jalen Hurts 25/34, 280 YDS"},
+        .leaders = &.{ "KC Passing 320 YDS", "Jalen Hurts 25/34, 280 YDS" },
         .team_stats = &.{"KC Total Yards 410"},
     };
 }
@@ -1569,7 +1574,7 @@ fn familyNba() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "Q4", .text = "Jayson Tatum 26-foot three point shot.", .away_score = "112", .home_score = "108" },
         },
-        .leaders = &.{"BOS PTS 112", "Jayson Tatum 34 PTS"},
+        .leaders = &.{ "BOS PTS 112", "Jayson Tatum 34 PTS" },
     };
 }
 
@@ -1619,7 +1624,7 @@ fn familyNhl() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "OT", .text = "David Pastrnak wrist shot, assisted by Brad Marchand.", .away_score = "3", .home_score = "4" },
         },
-        .leaders = &.{"BOS Shots 34", "David Pastrnak 2 G"},
+        .leaders = &.{ "BOS Shots 34", "David Pastrnak 2 G" },
     };
 }
 
@@ -1657,7 +1662,7 @@ fn familySoccer() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "78'", .text = "Bukayo Saka right footed shot from the centre of the box.", .away_score = "1", .home_score = "2" },
         },
-        .leaders = &.{"ARS Shots 14", "Bukayo Saka 1 G"},
+        .leaders = &.{ "ARS Shots 14", "Bukayo Saka 1 G" },
         .team_stats = &.{"ARS Possession 58"},
     };
 }
