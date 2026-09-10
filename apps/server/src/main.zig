@@ -135,9 +135,12 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             status = .ok;
             // Explicit ?date wins verbatim via tz.resolveDay (relative
             // tokens ride the request zone); missing ?date is today.
+            // Boards come from the shared per-league cache entries (same
+            // as /all and the single-board route): fetch-once-per-window
+            // with the live/final TTL split, not 20 fresh upstream
+            // fetches per hit. Outages degrade to links (null boards).
             const day = try server_app.tz.resolveDay(arena, home_route.date, now_s, zone);
-            const boards = try adapter.fetchAll(arena, day);
-            defer server_app.provider.EspnAdapter.releaseAll(boards);
+            const boards = try adapter.fetchAllCached(arena, cache, day, cache.now());
             const color = home_route.color orelse color_default;
             const body = switch (format) {
                 .text => if (home_route.oneline)
@@ -255,18 +258,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         .all => |all_route| {
             status = .ok;
             const day = try server_app.tz.resolveDay(arena, all_route.date, now_s, zone);
-            const at = cache.now();
-            var sections = try arena.alloc(server_app.digest.DigestSection, core.leagues.all.len);
-            for (&core.leagues.all, 0..) |*league, i| {
-                sections[i] = .{ .league = league };
-                const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
-                var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
-                if (cache.getOrFetchBoard(arena, slug, day, at, &fetch_ctx, fetchBoardPayload)) |cached| {
-                    sections[i].board = cached.data.board;
-                } else |_| {
-                    sections[i].board = null;
-                }
-            }
+            // Shared fan-out with home: same per-league cache entries,
+            // fetch-once-per-window across home/board/digest.
+            const results = try adapter.fetchAllCached(arena, cache, day, cache.now());
+            var sections = try arena.alloc(server_app.digest.DigestSection, results.len);
+            for (results, 0..) |result, i| sections[i] = .{ .league = result.league, .board = result.board };
             cache_state = "n/a";
             const color = all_route.color orelse color_default;
             const body = switch (format) {

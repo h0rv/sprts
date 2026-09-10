@@ -1,6 +1,8 @@
 const std = @import("std");
 const core = @import("sprts_core");
 const espn = @import("espn_client");
+const edge_cache = @import("edge_cache.zig");
+const native_cache = @import("native_cache.zig");
 
 pub const ClockFn = *const fn (io: std.Io) i64;
 
@@ -117,6 +119,33 @@ pub const EspnAdapter = struct {
     pub fn releaseAll(results: []LeagueResult) void {
         for (results) |result| if (result.store) |store| store.deinit();
     }
+
+    /// Cache-backed fan-out for home (`/`) and digest (`/all`): one
+    /// `NativeCache.getOrFetchBoard` per league — the SAME `(slug, day)`
+    /// entries the single-board route uses, so home/board/digest share
+    /// fetch-once-per-window with the live (10s) / final (30s) split
+    /// (`getOrFetchBoard` probes both TTL variants; liveness is only known
+    /// post-fetch). A failed league degrades to a null board (`fetchAll`
+    /// parity: one ESPN outage never fails the page); the stale fallback
+    /// still applies inside `getOrFetchBoard`. Boards borrow `arena` (hit
+    /// clones, miss payloads), so callers must NOT `releaseAll` — `store`
+    /// stays null. Sequential: the request arena is not thread-safe, and
+    /// warm hits do no I/O, so threads buy nothing here (`fetchAll` keeps
+    /// them for the uncached worker path).
+    pub fn fetchAllCached(self: EspnAdapter, arena: std.mem.Allocator, cache: *native_cache.NativeCache, day: []const u8, at: i64) ![]LeagueResult {
+        const results = try arena.alloc(LeagueResult, core.leagues.all.len);
+        for (&core.leagues.all, 0..) |*league, i| {
+            results[i] = .{ .league = league };
+            const slug = try edge_cache.canonicalSlug(arena, league.slug);
+            var ctx = BoardCacheCtx{ .adapter = self, .league = league, .day = day };
+            if (cache.getOrFetchBoard(arena, slug, day, at, &ctx, fetchBoardCached)) |cached| {
+                results[i].board = cached.data.board;
+            } else |_| {
+                results[i].board = null;
+            }
+        }
+        return results;
+    }
 };
 
 /// One league's board for the home page. A null board means the fetch
@@ -140,6 +169,16 @@ const FetchArgs = struct {
 fn fetchOne(args: *const FetchArgs) void {
     const store = args.slot.store orelse return;
     args.slot.board = args.adapter.fetch(store.allocator(), args.league, args.day) catch null;
+}
+
+/// Upstream seam for `fetchAllCached`: one normalized board payload per
+/// league, stored by `getOrFetchBoard` under its content-derived TTL
+/// variant (live 10s / final 30s).
+const BoardCacheCtx = struct { adapter: EspnAdapter, league: *const core.leagues.League, day: []const u8 };
+
+fn fetchBoardCached(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!native_cache.Data {
+    const c: *BoardCacheCtx = @ptrCast(@alignCast(ctx));
+    return .{ .board = try c.adapter.fetch(arena, c.league, c.day) };
 }
 
 const Endpoint = struct { sport: []const u8, league: []const u8 };
@@ -549,6 +588,176 @@ test "fetchAll degrades to null boards instead of failing" {
     defer EspnAdapter.releaseAll(results);
     try std.testing.expectEqual(core.leagues.all.len, results.len);
     for (results) |result| try std.testing.expect(result.board == null);
+}
+
+/// Counting fake for `fetchAllCached` (never live ESPN): records every
+/// upstream URL it sees. The fan-out is sequential, so no locking. Serves
+/// a live slate for the MLB endpoint and empty slates elsewhere, so a
+/// refetched board keeps the liveness it was seeded with.
+const CountingTransport = struct {
+    calls: usize = 0,
+    last_url: ?[]const u8 = null,
+    live_body: []const u8,
+    empty_body: []const u8 = "{\"events\":[]}",
+
+    fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, url: []const u8, extra_headers: []const std.http.Header) anyerror!espn.FetchResult {
+        _ = extra_headers;
+        const self: *CountingTransport = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.last_url = try arena.dupe(u8, url);
+        const body = if (std.mem.indexOf(u8, url, "baseball/mlb") != null) self.live_body else self.empty_body;
+        return .{ .status = .ok, .body = try arena.dupe(u8, body) };
+    }
+
+    fn asTransport(self: *CountingTransport) espn.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+const home_cache_day = "2026-09-06";
+
+/// Final seed board for one league; `with_game` adds a single post game so
+/// the test can prove the content came from the cache (the transport
+/// serves only empties for non-MLB endpoints).
+fn seedFinalBoard(league_slug: []const u8, league_name: []const u8, with_game: bool) core.domain.Scoreboard {
+    if (with_game) return .{
+        .league = league_slug,
+        .league_name = league_name,
+        .date = home_cache_day,
+        .source = "seed",
+        .games = &.{.{
+            .id = "seed-1",
+            .name = "Seeded Away at Seeded Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{},
+        }},
+    };
+    return .{
+        .league = league_slug,
+        .league_name = league_name,
+        .date = home_cache_day,
+        .source = "seed",
+        .games = &.{},
+    };
+}
+
+/// Live seed board: one in-progress game, so the entry lands under the
+/// 10s live TTL variant.
+fn seedLiveBoard(league_slug: []const u8, league_name: []const u8) core.domain.Scoreboard {
+    return .{
+        .league = league_slug,
+        .league_name = league_name,
+        .date = home_cache_day,
+        .source = "seed",
+        .games = &.{.{
+            .id = "live-1",
+            .name = "Seeded Away at Seeded Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = "in",
+            .status = "Top 7th",
+            .participants = &.{},
+        }},
+    };
+}
+
+fn homeCacheTestAdapter(fake: *CountingTransport, threaded: *std.Io.Threaded) EspnAdapter {
+    return .{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+}
+
+fn findResult(results: []LeagueResult, slug: []const u8) LeagueResult {
+    for (results) |result| if (std.mem.eql(u8, result.league.slug, slug)) return result;
+    unreachable;
+}
+
+test "fetchAllCached serves seeded entries with zero upstream fetches" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    var cache = native_cache.NativeCache.init(std.testing.allocator, threaded.io(), fakeClock);
+    defer cache.deinit();
+    const t0: i64 = 1_000_000;
+    for (&core.leagues.all) |*league|
+        try cache.put(
+            .{ .board = .{ .slug = league.slug, .day = home_cache_day, .live = false } },
+            .{ .board = seedFinalBoard(league.slug, league.name, std.mem.eql(u8, league.slug, "mlb")) },
+            t0,
+        );
+    var fake = CountingTransport{ .live_body = "{\"events\":[]}" };
+    const adapter = homeCacheTestAdapter(&fake, &threaded);
+    // Near the end of the 30s final window: still zero upstream fetches.
+    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
+    try std.testing.expectEqual(core.leagues.all.len, results.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(fake.last_url == null);
+    for (results, 0..) |result, i| {
+        try std.testing.expectEqualStrings(core.leagues.all[i].slug, result.league.slug);
+        try std.testing.expect(result.board != null);
+        // Boards borrow the request arena: no per-league stores to release.
+        try std.testing.expect(result.store == null);
+    }
+    const mlb = findResult(results, "mlb");
+    try std.testing.expectEqual(@as(usize, 1), mlb.board.?.games.len);
+    try std.testing.expectEqualStrings("seed-1", mlb.board.?.games[0].id);
+}
+
+test "fetchAllCached refetches live boards on the 10s window while finals hold 30s" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    var cache = native_cache.NativeCache.init(std.testing.allocator, threaded.io(), fakeClock);
+    defer cache.deinit();
+    const t0: i64 = 1_000_000;
+    for (&core.leagues.all) |*league| {
+        const live = std.mem.eql(u8, league.slug, "mlb");
+        const board = if (live) seedLiveBoard(league.slug, league.name) else seedFinalBoard(league.slug, league.name, false);
+        try cache.put(
+            .{ .board = .{ .slug = league.slug, .day = home_cache_day, .live = live } },
+            .{ .board = board },
+            t0,
+        );
+    }
+    const live_body =
+        \\{\"events\":[{\"id\":\"9\",\"name\":\"Away at Home\",\"date\":\"2026-09-06T17:00Z\",\"status\":{\"type\":{\"state\":\"in\",\"shortDetail\":\"Top 7th\"}},\"competitions\":[{\"id\":\"9\",\"date\":\"2026-09-06T17:00Z\",\"status\":{\"type\":{\"state\":\"in\",\"shortDetail\":\"Top 7th\"}},\"competitors\":[]}]}]}
+    ;
+    var fake = CountingTransport{ .live_body = live_body };
+    const adapter = homeCacheTestAdapter(&fake, &threaded);
+    const mlb_url = "https://example.test/base/sports/baseball/mlb/scoreboard?dates=20260906";
+
+    // Inside the 10s live window: everything cached, zero fetches, and the
+    // seeded live game is what home would render.
+    const warm = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.live_fresh_ttl_s - 1);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqualStrings("in", findResult(warm, "mlb").board.?.games[0].state);
+
+    // Past the live window but inside the final window: exactly one fetch,
+    // and it is the live league's URL; every final board still hits.
+    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.live_fresh_ttl_s);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings(mlb_url, fake.last_url.?);
+    // The refetch stays live (in-progress slate), so it rolls the 10s
+    // window instead of promoting to the 30s one.
+    const mlb = findResult(results, "mlb");
+    try std.testing.expectEqual(@as(usize, 1), mlb.board.?.games.len);
+    try std.testing.expectEqualStrings("in", mlb.board.?.games[0].state);
+
+    // At t0+29 the live board (re-stored at t0+10 on its 10s window)
+    // refetches while every final board (t0 on the 30s window) still
+    // hits: one fetch again, same URL.
+    fake.calls = 0;
+    fake.last_url = null;
+    _ = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings(mlb_url, fake.last_url.?);
 }
 
 // --- Game detail (wt-detail). Appended; existing scoreboard code above is untouched. ---

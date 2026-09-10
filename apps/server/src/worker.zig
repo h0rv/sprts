@@ -162,6 +162,16 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
             return staticResponse(render.favicon_svg, "image/svg+xml", null);
         },
         .home => |home_route| {
+            // Native-only scope note: the native server serves home
+            // through the shared per-league NativeCache entries
+            // (`fetchAllCached`: fetch-once-per-window across
+            // home/board/digest). The worker has no in-process cache
+            // (stateless isolate), and fanning home out through
+            // per-league edge-cache entries would cost ~60 subrequests
+            // against the 50/invocation budget — the same reason
+            // serveAll keeps its own digest-level entry. So home stays
+            // a direct fetchAll here; no per-league edge traffic is
+            // added by this route.
             var transport_state = WorkerTransport{};
             const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
             const adapter = provider.EspnAdapter{
