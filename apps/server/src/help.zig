@@ -220,7 +220,7 @@ fn htmlHelp(arena: std.mem.Allocator, route: router.HelpRoute) ![]u8 {
     errdefer out.deinit();
     const w = &out.writer;
     try render.pageHead(w, "sprts help");
-    try render.escapeInto(w, body);
+    try render.writeEscapedBodyH1(w, body);
     try w.writeAll("</pre><nav><a href=\"/\">leagues</a><a href=\"/openapi.json\">spec</a>");
     try render.closePageWithNav(w);
     return out.toOwnedSlice();
@@ -513,6 +513,8 @@ test "help HTML is minimal and never carries ANSI" {
     const page = try renderHelp(std.testing.allocator, helpRoute(null, false, false), .html);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, ":help") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);

@@ -217,7 +217,7 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     defer allocator.free(zone_tag);
     const heading = try std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ game.league_name, game.date, zone_tag });
     defer allocator.free(heading);
-    try render.writeHtmlLine(w, allocator, heading, cols, "dim", null);
+    try render.writeHtmlH1(w, allocator, heading, cols, "dim");
     const status_href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ game.league, game.date });
     defer allocator.free(status_href);
     const status = try tz.normalizeEastern(allocator, game.status);
@@ -909,6 +909,8 @@ test "detail html wraps in pre and links back" {
     const page = try detailHtml(std.testing.allocator, testDetail(), null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/401816828\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
