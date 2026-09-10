@@ -26,14 +26,42 @@ pub const EspnAdapter = struct {
 
     /// `week` threads into the ESPN `week=` query param (football honors
     /// it; most sports ignore it). Null is the default date-driven board
-    /// and preserves the historical call shape.
+    /// and preserves the historical call shape. A null `day` omits the
+    /// `dates=` param entirely (ESPN resolves the week alone; sending dates
+    /// alongside a week empties the slate) — the week-alias lookup path.
+    /// Non-null days coerce from `[]const u8`, so existing callers are
+    /// untouched.
     pub fn fetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) !core.domain.Scoreboard {
         return self.fetchWeek(arena, league, day, null);
     }
 
-    pub fn fetchWeek(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, week: ?u16) !core.domain.Scoreboard {
+    pub fn fetchWeek(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16) !core.domain.Scoreboard {
+        const body = try self.fetchWeekBody(arena, league, day, week);
+        // Null day only arrives via fetchWeekBoard below (week-alias
+        // lookup), which labels explicitly; the fallback keeps board.date
+        // well-formed for any future dateless caller.
+        return parseAndNormalize(arena, league, day orelse "0000-00-00", body);
+    }
+
+    /// Lookup for the human week alias (`/{league}/{YYYY}/week{N}/{away}-{home}`,
+    /// football only — enforced by the caller via the league sport): fetch the
+    /// week's board with NO dates param and report the response season year.
+    /// The caller verifies `season_year` against the URL season (ESPN ignores
+    /// unknown season params, so a mismatch must 404, never mislead).
+    /// Normalization day is `{season}-01-01`: unused downstream (only the
+    /// game id is used), a well-formed placeholder keeping board.date valid.
+    pub fn fetchWeekBoard(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, season: []const u8, week: u16) !WeekBoard {
+        const body = try self.fetchWeekBody(arena, league, null, week);
+        const day = try std.fmt.allocPrint(arena, "{s}-01-01", .{season});
+        return .{
+            .board = try parseAndNormalize(arena, league, day, body),
+            .season_year = try parseSeasonYear(arena, body),
+        };
+    }
+
+    fn fetchWeekBody(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16) ![]const u8 {
         const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
-        const compact_day = try core.date.compact(arena, day);
+        const compact_day = if (day) |d| try core.date.compact(arena, d) else null;
         const week_int: ?i64 = if (week) |w| @intCast(w) else null;
         const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, week_int, null, null);
         var status: std.http.Status = undefined;
@@ -52,7 +80,7 @@ pub const EspnAdapter = struct {
             std.log.warn("ESPN returned HTTP {d}", .{@intFromEnum(status)});
             return error.UpstreamResponse;
         }
-        return parseAndNormalize(arena, league, day, body);
+        return body;
     }
 
     pub fn fetchDetail(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, game_id: []const u8) !core.detail.GameDetail {
@@ -3252,4 +3280,281 @@ test "boxscoreLineups keeps starters in order with positions" {
     try std.testing.expectEqualStrings("2-3", leadoff.hitting);
     try std.testing.expectEqualStrings("1", leadoff.runs);
     try std.testing.expectEqualStrings(".255", leadoff.average);
+}
+
+// ---- Human game aliases (additive; existing fns above are untouched) ----
+//
+// `/{league}/{YYYY-MM-DD}/{away}-{home}` (all leagues) and the football-only
+// `/{league}/{YYYY}/week{N}/{away}-{home}` redirect to the canonical
+// `/{league}/{id}` game page. No `/api/v1/` twins (JSON keeps ids).
+
+/// Week-alias board: the normalized week slate plus the raw response's
+/// `season.year` for the caller to verify against the URL season.
+pub const WeekBoard = struct {
+    board: core.domain.Scoreboard,
+    season_year: ?u16,
+};
+
+const WeekSeasonEnvelope = struct {
+    season: ?WeekSeasonBlock = null,
+};
+
+const WeekSeasonBlock = struct {
+    year: std.json.Value = .null,
+};
+
+/// Raw scoreboard envelope `season.year`. Tolerates integer and string
+/// years; null when absent or non-numeric (the caller 404s: a missing year
+/// can never confirm the URL season).
+fn parseSeasonYear(arena: std.mem.Allocator, body: []const u8) !?u16 {
+    const env = try std.json.parseFromSliceLeaky(WeekSeasonEnvelope, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    const year_value = (env.season orelse return null).year;
+    return switch (year_value) {
+        .integer => |n| if (n >= 0 and n <= 9999) @intCast(n) else null,
+        .number_string, .string => |s| std.fmt.parseInt(u16, s, 10) catch null,
+        else => null,
+    };
+}
+
+/// Matchup lookup for the human game aliases: the first game whose two
+/// participants carry non-empty abbreviations matching `away`/`home`,
+/// case-insensitive. Exact away/home order wins first, then the swapped
+/// order; the first board entry wins either way — doubleheaders share the
+/// pair, so the earliest listing is the redirect (documented here, not
+/// disambiguated). Needs two-abbr duels: games without exactly two
+/// participants, or with an empty abbreviation (tennis-style athlete rows),
+/// never match.
+pub fn findGameByMatchup(board: core.domain.Scoreboard, away: []const u8, home: []const u8) ?*const core.domain.Game {
+    for (board.games) |*game| {
+        if (isDuel(game, away, home)) return game;
+    }
+    for (board.games) |*game| {
+        if (isDuel(game, home, away)) return game;
+    }
+    return null;
+}
+
+fn isDuel(game: *const core.domain.Game, first: []const u8, second: []const u8) bool {
+    if (game.participants.len != 2) return false;
+    const a = game.participants[0].abbreviation;
+    const b = game.participants[1].abbreviation;
+    if (a.len == 0 or b.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(a, first) and std.ascii.eqlIgnoreCase(b, second);
+}
+
+fn matchupBoard() core.domain.Scoreboard {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "2",
+                .name = "",
+                .starts_at = "2026-09-09T19:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "c", .name = "Chicago Cubs", .abbreviation = "CHC", .score = "1", .winner = false, .home_away = "away" },
+                    .{ .id = "d", .name = "St. Louis Cardinals", .abbreviation = "STL", .score = "3", .winner = true, .home_away = "home" },
+                },
+            },
+        },
+    };
+}
+
+test "findGameByMatchup matches exact order, swapped, and case" {
+    const board = matchupBoard();
+    // Exact away/home order first.
+    try std.testing.expectEqualStrings("1", findGameByMatchup(board, "min", "det").?.id);
+    try std.testing.expectEqualStrings("2", findGameByMatchup(board, "chc", "stl").?.id);
+    // Swapped order still lands (second pass).
+    try std.testing.expectEqualStrings("1", findGameByMatchup(board, "det", "min").?.id);
+    // Case-insensitive throughout.
+    try std.testing.expectEqualStrings("1", findGameByMatchup(board, "MIN", "DET").?.id);
+    try std.testing.expectEqualStrings("1", findGameByMatchup(board, "Min", "Det").?.id);
+    try std.testing.expectEqualStrings("1", findGameByMatchup(board, "DET", "MIN").?.id);
+}
+
+test "findGameByMatchup misses unknown pairs and non-duels" {
+    const board = matchupBoard();
+    // Unknown abbrevs, cross-game pairs, and half pairs never match.
+    try std.testing.expect(findGameByMatchup(board, "nyy", "bos") == null);
+    try std.testing.expect(findGameByMatchup(board, "min", "stl") == null);
+    try std.testing.expect(findGameByMatchup(board, "min", "min") == null);
+    try std.testing.expect(findGameByMatchup(board, "", "det") == null);
+    // Fewer than two participants, more than two, or an empty abbreviation
+    // (tennis-style athlete rows) never match.
+    const thin: core.domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "solo",
+                .name = "Race",
+                .starts_at = "2026-09-09T10:30Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "v", .name = "Max Verstappen", .abbreviation = "VER", .score = "#1", .winner = true },
+                },
+            },
+            .{
+                .id = "trio",
+                .name = "",
+                .starts_at = "2026-09-09T10:30Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "A Club", .abbreviation = "AAA", .score = "", .winner = false },
+                    .{ .id = "b", .name = "B Club", .abbreviation = "BBB", .score = "", .winner = false },
+                    .{ .id = "c", .name = "C Club", .abbreviation = "CCC", .score = "", .winner = false },
+                },
+            },
+            .{
+                .id = "blank",
+                .name = "",
+                .starts_at = "2026-09-09T10:30Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Player One", .abbreviation = "", .score = "", .winner = false },
+                    .{ .id = "b", .name = "Player Two", .abbreviation = "", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expect(findGameByMatchup(thin, "ver", "x") == null);
+    try std.testing.expect(findGameByMatchup(thin, "aaa", "bbb") == null);
+    try std.testing.expect(findGameByMatchup(thin, "", "") == null);
+    // Empty board never matches.
+    const empty: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{},
+    };
+    try std.testing.expect(findGameByMatchup(empty, "min", "det") == null);
+}
+
+test "findGameByMatchup first wins on doubleheaders" {
+    // A doubleheader shares the pair: the earliest board entry is the
+    // redirect, in exact and swapped order alike.
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "first",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "second",
+                .name = "",
+                .starts_at = "2026-09-09T20:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("first", findGameByMatchup(board, "min", "det").?.id);
+    try std.testing.expectEqualStrings("first", findGameByMatchup(board, "det", "min").?.id);
+}
+
+const week_alias_fixture =
+    \\{"season":{"year":2026},"events":[{"id":"401","name":"NE at SEA","date":"2026-09-07T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"competitors":[{"homeAway":"away","score":"20","winner":true,"team":{"id":"a","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"17","winner":false,"team":{"id":"h","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
+;
+
+fn weekAliasAdapter(fake: *FakeTransportState, io: std.Io) EspnAdapter {
+    return .{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+}
+
+test "fetchWeek null day omits dates, non-null preserves behavior" {
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = weekAliasAdapter(&fake, threaded.io());
+    const nfl = core.leagues.find("nfl").?;
+    _ = try adapter.fetchWeek(arena, nfl, null, 1);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1",
+        fake.seen_url.?,
+    );
+    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", 2);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906&week=2",
+        fake.seen_url.?,
+    );
+}
+
+test "fetchWeekBoard reports the week slate with its season year" {
+    var fake = FakeTransportState{ .body = week_alias_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = weekAliasAdapter(&fake, threaded.io());
+    const result = try adapter.fetchWeekBoard(arena, core.leagues.find("nfl").?, "2026", 1);
+    // No dates param: ESPN resolves the week alone.
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1",
+        fake.seen_url.?,
+    );
+    try std.testing.expect(result.season_year.? == 2026);
+    // Normalization day is the season placeholder (only the id is used).
+    try std.testing.expectEqualStrings("2026-01-01", result.board.date);
+    try std.testing.expectEqualStrings("401", findGameByMatchup(result.board, "ne", "sea").?.id);
+    try std.testing.expectEqualStrings("401", findGameByMatchup(result.board, "sea", "ne").?.id);
+    try std.testing.expect(findGameByMatchup(result.board, "kc", "buf") == null);
+}
+
+test "season year tolerates string years and absence" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":2026}}")).? == 2026);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":\"2026\"}}")).? == 2026);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"events\":[]}")) == null);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{}}")) == null);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":null}}")) == null);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":\"soon\"}}")) == null);
 }

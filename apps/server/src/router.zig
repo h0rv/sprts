@@ -49,6 +49,28 @@ pub const TodayRoute = struct {
     api: bool,
 };
 
+/// Human game alias, date form: `/{league}/{YYYY-MM-DD}/{away}-{home}`
+/// (lowercase abbrevs, e.g. `/mlb/2026-09-09/min-det`; the relative tokens
+/// `today|tomorrow|yesterday` ride too). Redirects to the canonical
+/// `/{league}/{id}` — never renders, no `/api/v1/` twin (JSON keeps ids).
+pub const DateAliasRoute = struct {
+    league: []const u8,
+    date: []const u8,
+    away: []const u8,
+    home: []const u8,
+};
+
+/// Human game alias, week form (football only — the serve layer gates on
+/// the league sport): `/{league}/{YYYY}/week{N}/{away}-{home}`, e.g.
+/// `/nfl/2026/week1/ne-sea`. Redirects like the date form, no twin.
+pub const WeekAliasRoute = struct {
+    league: []const u8,
+    season: []const u8,
+    week: u16,
+    away: []const u8,
+    home: []const u8,
+};
+
 /// Standings tab (`/{league}/standings`, plaintextsports parity with the
 /// Schedule/Standings/Teams tabs). No date or week: the endpoint is the
 /// current table only. Display flags ride along like every human route.
@@ -92,6 +114,8 @@ pub const Route = union(enum) {
     game: GameRoute,
     team: TeamRoute,
     today: TodayRoute,
+    date_alias: DateAliasRoute,
+    week_alias: WeekAliasRoute,
     standings: StandingsRoute,
     help: HelpRoute,
     openapi,
@@ -155,14 +179,47 @@ pub fn parse(target: []const u8) Route {
         if (std.mem.indexOfScalar(u8, segment, '/')) |slash2| {
             const seg2 = segment[0..slash2];
             const seg3 = segment[slash2 + 1 ..];
+            const api = std.mem.startsWith(u8, path, api_prefix);
             if (seg2.len > 0 and std.mem.eql(u8, seg3, "today") and
                 !isHelpSegment(seg2) and !isStandingsSegment(seg2))
             {
                 return .{ .today = .{
                     .league = league,
                     .abbr = seg2,
-                    .api = std.mem.startsWith(u8, path, api_prefix),
+                    .api = api,
                 } };
+            }
+            // Human game aliases (human URLs only — no /api/v1/ twins,
+            // JSON keeps ids): date form `/{league}/{date}/{away}-{home}`
+            // and football week form `/{league}/{YYYY}/week{N}/{matchup}`.
+            // Anything else stays not_found.
+            if (!api) {
+                if (isAliasDate(seg2)) {
+                    if (parseMatchup(seg3)) |matchup| {
+                        return .{ .date_alias = .{
+                            .league = league,
+                            .date = seg2,
+                            .away = matchup.away,
+                            .home = matchup.home,
+                        } };
+                    }
+                } else if (isSeason(seg2)) {
+                    if (std.mem.indexOfScalar(u8, seg3, '/')) |slash3| {
+                        const week_seg = seg3[0..slash3];
+                        const duel = seg3[slash3 + 1 ..];
+                        if (parseWeekSegment(week_seg)) |week| {
+                            if (parseMatchup(duel)) |matchup| {
+                                return .{ .week_alias = .{
+                                    .league = league,
+                                    .season = seg2,
+                                    .week = week,
+                                    .away = matchup.away,
+                                    .home = matchup.home,
+                                } };
+                            }
+                        }
+                    }
+                }
             }
             return .not_found;
         }
@@ -235,6 +292,48 @@ pub fn parse(target: []const u8) Route {
 fn isAllDigits(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// Date-ish second segment of the date alias: strict YYYY-MM-DD or one of
+/// the relative tokens the scoreboard honors (lowercase-exact, like ?date=).
+fn isAliasDate(s: []const u8) bool {
+    return dates.validate(s) or dates.isRelativeToken(s);
+}
+
+/// Four-digit season for the week alias (`/{league}/{YYYY}/week{N}/...`).
+fn isSeason(s: []const u8) bool {
+    if (s.len != 4) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// `week{N}` selector, N = 1-99 (prefix case-insensitive, like standings).
+fn parseWeekSegment(s: []const u8) ?u16 {
+    if (s.len < 5 or s.len > 6) return null;
+    if (!std.ascii.eqlIgnoreCase(s[0..4], "week")) return null;
+    var n: u16 = 0;
+    for (s[4..]) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n < 1 or n > 99) return null;
+    return n;
+}
+
+/// `{away}-{home}` duel: exactly one `-`, both sides 1-8 ASCII alnum.
+fn parseMatchup(s: []const u8) ?struct { away: []const u8, home: []const u8 } {
+    const dash = std.mem.indexOfScalar(u8, s, '-') orelse return null;
+    if (std.mem.indexOfScalar(u8, s[dash + 1 ..], '-') != null) return null;
+    const away = s[0..dash];
+    const home = s[dash + 1 ..];
+    if (!isAliasAbbr(away) or !isAliasAbbr(home)) return null;
+    return .{ .away = away, .home = home };
+}
+
+fn isAliasAbbr(s: []const u8) bool {
+    if (s.len == 0 or s.len > 8) return false;
+    for (s) |c| if (!std.ascii.isAlphanumeric(c)) return false;
     return true;
 }
 
@@ -631,6 +730,80 @@ test "today shortcut parses team scope with address family" {
     try std.testing.expect(parse("/mlb/standings/today") == .not_found);
     // Query strings ride along ignored (redirects carry no query).
     try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/today?color=0").today.abbr);
+}
+
+test "date alias parses date and matchup, human only" {
+    const alias = parse("/mlb/2026-09-09/min-det").date_alias;
+    try std.testing.expectEqualStrings("mlb", alias.league);
+    try std.testing.expectEqualStrings("2026-09-09", alias.date);
+    try std.testing.expectEqualStrings("min", alias.away);
+    try std.testing.expectEqualStrings("det", alias.home);
+    // Relative tokens ride verbatim like ?date= (serve resolves the zone).
+    for ([_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "/mlb/today/min-det", .want = "today" },
+        .{ .path = "/mlb/tomorrow/nyy-bos", .want = "tomorrow" },
+        .{ .path = "/mlb/yesterday/lad-sf", .want = "yesterday" },
+    }) |case| {
+        const route = parse(case.path);
+        try std.testing.expect(route == .date_alias);
+        try std.testing.expectEqualStrings(case.want, route.date_alias.date);
+    }
+    // Matchup case is preserved raw (matching is case-insensitive downstream).
+    const upper = parse("/mlb/2026-09-09/MIN-DET").date_alias;
+    try std.testing.expectEqualStrings("MIN", upper.away);
+    try std.testing.expectEqualStrings("DET", upper.home);
+    // Query strings ride along ignored (redirects carry no query).
+    try std.testing.expectEqualStrings("min", parse("/mlb/2026-09-09/min-det?color=0").date_alias.away);
+    // No /api/v1/ twins: JSON keeps ids.
+    try std.testing.expect(parse("/api/v1/mlb/2026-09-09/min-det") == .not_found);
+    try std.testing.expect(parse("/api/v1/mlb/today/min-det") == .not_found);
+    // Bad shapes stay not_found: no dash, two dashes, empty side, long
+    // side, non-alnum side, bad date, token casing, deeper paths.
+    try std.testing.expect(parse("/mlb/2026-09-09/mindet") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min--det") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/-det") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-detroit99") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-d.t") == .not_found);
+    try std.testing.expect(parse("/mlb/09-09/min-det") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-13-40/min-det") == .not_found);
+    try std.testing.expect(parse("/mlb/Today/min-det") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det/x") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/") == .not_found);
+    // Existing two-segment regions are untouched by the alias shapes.
+    try std.testing.expect(parse("/mlb/a/b") == .not_found);
+    try std.testing.expect(parse("/mlb/phi") == .team);
+    try std.testing.expect(parse("/mlb/401816828") == .game);
+}
+
+test "week alias parses season, week, and matchup, human only" {
+    const alias = parse("/nfl/2026/week1/ne-sea").week_alias;
+    try std.testing.expectEqualStrings("nfl", alias.league);
+    try std.testing.expectEqualStrings("2026", alias.season);
+    try std.testing.expect(alias.week == 1);
+    try std.testing.expectEqualStrings("ne", alias.away);
+    try std.testing.expectEqualStrings("sea", alias.home);
+    // Week range 1-99; league slug rides verbatim (sport gate is dispatch).
+    try std.testing.expect(parse("/nfl/2026/week18/kc-buf").week_alias.week == 18);
+    try std.testing.expect(parse("/nfl/2026/week99/kc-buf").week_alias.week == 99);
+    try std.testing.expectEqualStrings("ncaaf", parse("/ncaaf/2026/week2/uga-tx").week_alias.league);
+    try std.testing.expectEqualStrings("mlb", parse("/mlb/2026/week1/nyy-bos").week_alias.league);
+    // No /api/v1/ twins: JSON keeps ids.
+    try std.testing.expect(parse("/api/v1/nfl/2026/week1/ne-sea") == .not_found);
+    // Bad shapes stay not_found: week 0/100, bad prefix, short season,
+    // bad matchup, missing segments, deeper paths.
+    try std.testing.expect(parse("/nfl/2026/week0/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week100/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/wk1/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/weekx/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/26/week1/ne-sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/nesea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/ne--sea") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/ne-sea/x") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/ne-sea") == .not_found);
 }
 
 test "stream flag parses query values and Accept header" {
