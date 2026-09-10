@@ -9,6 +9,11 @@ pub const ScoreboardRoute = struct {
     /// ESPN week selector (football leases it; most sports ignore it).
     /// Strict positive int like width/height; null = date-driven board.
     week: ?u16 = null,
+    /// ESPN season-type selector (football only, like week): 1=preseason,
+    /// 2=regular, 3=postseason, 4=off-season. Strict 1-4; null = ESPN
+    /// default (current). Without it preseason and playoff weeks are
+    /// unreachable — ESPN defaults an untyped week to the regular season.
+    seasontype: ?u16 = null,
     color: ?bool,
     width: ?u16,
     height: ?u16,
@@ -372,6 +377,7 @@ pub fn parse(target: []const u8) Route {
         .league = slug,
         .date = day,
         .week = queryUint(queryValue(query, "week")),
+        .seasontype = parseSeasonType(queryValue(query, "seasontype")),
         .color = display.color,
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
@@ -658,6 +664,15 @@ fn queryUint(value: ?[]const u8) ?u16 {
     return @intCast(n);
 }
 
+/// ESPN season-type selector: strict 1-4 (1=preseason, 2=regular,
+/// 3=postseason, 4=off-season). Anything else is ignored (falls back to
+/// the ESPN default), like every other strict router param.
+fn parseSeasonType(value: ?[]const u8) ?u16 {
+    const n = queryUint(value) orelse return null;
+    if (n < 1 or n > 4) return null;
+    return n;
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     var index: usize = 0;
@@ -723,6 +738,26 @@ test "week param parses strict like width and height" {
     // Composes with date and display params.
     const composed = parse("/nfl?date=2026-09-06&week=2&width=80").scoreboard;
     try std.testing.expect(composed.week.? == 2);
+    try std.testing.expect(composed.width.? == 80);
+    try std.testing.expectEqualStrings("2026-09-06", composed.date.?);
+}
+
+test "seasontype param parses strict 1-4" {
+    try std.testing.expect(parse("/mlb").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/nfl?seasontype=1").scoreboard.seasontype.? == 1);
+    try std.testing.expect(parse("/nfl?seasontype=2").scoreboard.seasontype.? == 2);
+    try std.testing.expect(parse("/nfl?seasontype=3").scoreboard.seasontype.? == 3);
+    try std.testing.expect(parse("/nfl?seasontype=4").scoreboard.seasontype.? == 4);
+    try std.testing.expect(parse("/nfl?seasontype=0").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/nfl?seasontype=5").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/nfl?seasontype=99").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/mlb?seasontype=abc").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/mlb?seasontype=2x").scoreboard.seasontype == null);
+    try std.testing.expect(parse("/mlb?seasontype=").scoreboard.seasontype == null);
+    // Composes with week, date, and display params.
+    const composed = parse("/nfl?date=2026-09-06&week=1&seasontype=3&width=80").scoreboard;
+    try std.testing.expect(composed.week.? == 1);
+    try std.testing.expect(composed.seasontype.? == 3);
     try std.testing.expect(composed.width.? == 80);
     try std.testing.expectEqualStrings("2026-09-06", composed.date.?);
 }

@@ -306,15 +306,15 @@ fn serveBoard(
     };
 
     // Single normalized board fetch; every format renders from this board.
-    // ?week= threads into fetchWeek directly (never cached: the board key
-    // is (slug, day), and a week selector must not poison date entries).
-    const board = adapter.fetchWeek(alloc, league, day, route.week) catch {
+    // ?week=/seasontype threads into fetchWeek directly (never cached: the
+    // board key is (slug, day), and a selector must not poison date entries).
+    const board = adapter.fetchWeek(alloc, league, day, route.week, route.seasontype) catch {
         workers.log("upstream ESPN fetch failed for {s} {s}", .{ slug, day });
         // Manual stale-on-upstream-error: same 300s bucket, so age < 300s.
-        // Week boards skip the stale path (nothing cached under the key).
+        // Selector boards skip the stale path (nothing cached under the key).
         // Both TTL variants are probed (live first): the cached render's
         // liveness is only known to its key.
-        if (route.week == null) {
+        if (route.week == null and route.seasontype == null) {
             if (cache.match(.{ .url = stale_live })) |stale| {
                 var resp = stale.clone();
                 resp.setHeader("cache-control", edge.client_cache_control);

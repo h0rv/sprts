@@ -27,18 +27,28 @@ pub const EspnAdapter = struct {
     }
 
     /// `week` threads into the ESPN `week=` query param (football honors
-    /// it; most sports ignore it). Null is the default date-driven board
-    /// and preserves the historical call shape. A null `day` omits the
-    /// `dates=` param entirely (ESPN resolves the week alone; sending dates
-    /// alongside a week empties the slate) — the week-alias lookup path.
-    /// Non-null days coerce from `[]const u8`, so existing callers are
-    /// untouched.
+    /// it; most sports ignore it) and `season_type` into `seasontype=`
+    /// (1=preseason, 2=regular, 3=postseason; null is the ESPN default).
+    /// Without a season type there is no way to reach preseason or playoff
+    /// weeks. Null week is the default date-driven board and preserves the
+    /// historical call shape. A null `day` omits the `dates=` param entirely
+    /// (ESPN resolves the week alone; sending dates alongside a week
+    /// empties the slate) — the week-alias lookup path. Non-null days
+    /// coerce from `[]const u8`, so existing callers are untouched.
     pub fn fetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) !core.domain.Scoreboard {
-        return self.fetchWeek(arena, league, day, null);
+        return self.fetchWeek(arena, league, day, null, null);
     }
 
-    pub fn fetchWeek(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16) !core.domain.Scoreboard {
-        const body = try self.fetchWeekBody(arena, league, day, week);
+    /// Football boards resolve weeks, not dates (verified live 2026-09-10:
+    /// `?dates=` alone returns an empty slate even mid-season, and `?dates=`
+    /// alongside `?week=` empties it too — while `?week=` alone returns the
+    /// full 16-game slate). So for football with an explicit week the dates
+    /// param is dropped; every other shape keeps its historical URL. Date-
+    /// driven football days (week null) still send `dates=` — day-granular
+    /// by feed design (game days list that day's games), which the date-
+    /// alias lookup depends on for past seasons.
+    pub fn fetchWeek(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16, season_type: ?u16) !core.domain.Scoreboard {
+        const body = try self.fetchWeekBody(arena, league, day, week, season_type);
         // Null day only arrives via fetchWeekBoard below (week-alias
         // lookup), which labels explicitly; the fallback keeps board.date
         // well-formed for any future dateless caller.
@@ -53,7 +63,7 @@ pub const EspnAdapter = struct {
     /// Normalization day is `{season}-01-01`: unused downstream (only the
     /// game id is used), a well-formed placeholder keeping board.date valid.
     pub fn fetchWeekBoard(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, season: []const u8, week: u16) !WeekBoard {
-        const body = try self.fetchWeekBody(arena, league, null, week);
+        const body = try self.fetchWeekBody(arena, league, null, week, null);
         const day = try std.fmt.allocPrint(arena, "{s}-01-01", .{season});
         return .{
             .board = try parseAndNormalize(arena, league, day, body),
@@ -61,11 +71,16 @@ pub const EspnAdapter = struct {
         };
     }
 
-    fn fetchWeekBody(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16) ![]const u8 {
+    fn fetchWeekBody(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: ?[]const u8, week: ?u16, season_type: ?u16) ![]const u8 {
         const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
-        const compact_day = if (day) |d| try core.date.compact(arena, d) else null;
+        // Football + explicit week: drop dates (see fetchWeek). Other
+        // sports keep dates+week: ESPN ignores week there, so the pairing
+        // is harmless and preserves historical URLs.
+        const drop_dates = week != null and std.mem.eql(u8, endpoint.sport, "football");
+        const compact_day = if (drop_dates) null else if (day) |d| try core.date.compact(arena, d) else null;
         const week_int: ?i64 = if (week) |w| @intCast(w) else null;
-        const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, week_int, null, null);
+        const season_int: ?i64 = if (season_type) |t| @intCast(t) else null;
+        const url = try espn.buildScoreboardUrl(arena, self.base_url, endpoint.sport, endpoint.league, compact_day, week_int, season_int, null);
         var status: std.http.Status = undefined;
         var body: []const u8 = undefined;
         if (self.transport) |transport| {
@@ -506,14 +521,63 @@ test "fetchWeek threads week into the scoreboard URL, null preserves behavior" {
         .transport = fake.asTransport(),
         .clock = fakeClock,
     };
-    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", 2);
+    // Football + week drops dates: dates alongside a week empties the
+    // slate (verified live), the week alone resolves the full slate.
+    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", 2, null);
     try std.testing.expectEqualStrings(
-        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906&week=2",
+        "https://example.test/base/sports/football/nfl/scoreboard?week=2",
         fake.seen_url.?,
     );
-    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", null);
+    _ = try adapter.fetchWeek(arena, core.leagues.find("nfl").?, "2026-09-06", null, null);
     try std.testing.expectEqualStrings(
         "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906",
+        fake.seen_url.?,
+    );
+    // Non-football keeps dates+week (ESPN ignores week there; the pairing
+    // is harmless and preserves historical URLs).
+    _ = try adapter.fetchWeek(arena, core.leagues.find("mlb").?, "2026-09-06", 2, null);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/baseball/mlb/scoreboard?dates=20260906&week=2",
+        fake.seen_url.?,
+    );
+}
+
+test "fetchWeek threads seasontype into the scoreboard URL" {
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = EspnAdapter{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake.asTransport(),
+        .clock = fakeClock,
+    };
+    const nfl = core.leagues.find("nfl").?;
+    // Playoff week: week alone (dates dropped) plus seasontype=3.
+    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", 1, 3);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1&seasontype=3",
+        fake.seen_url.?,
+    );
+    // Preseason: seasontype=1 rides the same way.
+    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", 1, 1);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1&seasontype=1",
+        fake.seen_url.?,
+    );
+    // Null season type preserves the bare week shape.
+    _ = try adapter.fetchWeek(arena, nfl, null, 1, null);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1",
+        fake.seen_url.?,
+    );
+    // Season type without a week still threads through (date-driven).
+    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", null, 3);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906&seasontype=3",
         fake.seen_url.?,
     );
 }
@@ -4186,14 +4250,16 @@ test "fetchWeek null day omits dates, non-null preserves behavior" {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const adapter = weekAliasAdapter(&fake, threaded.io());
     const nfl = core.leagues.find("nfl").?;
-    _ = try adapter.fetchWeek(arena, nfl, null, 1);
+    _ = try adapter.fetchWeek(arena, nfl, null, 1, null);
     try std.testing.expectEqualStrings(
         "https://example.test/base/sports/football/nfl/scoreboard?week=1",
         fake.seen_url.?,
     );
-    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", 2);
+    // Football + week drops dates (see fetchWeek): the old dates+week
+    // shape emptied the slate, the week alone resolves it.
+    _ = try adapter.fetchWeek(arena, nfl, "2026-09-06", 2, null);
     try std.testing.expectEqualStrings(
-        "https://example.test/base/sports/football/nfl/scoreboard?dates=20260906&week=2",
+        "https://example.test/base/sports/football/nfl/scoreboard?week=2",
         fake.seen_url.?,
     );
 }
@@ -4229,4 +4295,57 @@ test "season year tolerates string years and absence" {
     try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{}}")) == null);
     try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":null}}")) == null);
     try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":\"soon\"}}")) == null);
+}
+
+/// Postseason week shape (live `?seasontype=3&week=1` 2026-09-10: season
+/// type 3, TBD pairings, pre state): normalizes to scheduled games with
+/// their states mapped through, and the season year still parses.
+const playoff_week_fixture =
+    \\{"season":{"type":3,"year":2026},"week":{"number":1},"events":[{"id":"401872910","name":"TBD at TBD","date":"2027-01-16T05:00Z","status":{"type":{"state":"pre","shortDetail":"TBD"}},"competitions":[{"competitors":[{"homeAway":"away","score":"","team":{"id":"1","displayName":"TBD","abbreviation":"TBD"}},{"homeAway":"home","score":"","team":{"id":"2","displayName":"TBD","abbreviation":"TBD"}}]}]},{"id":"401872911","name":"TBD at TBD","date":"2027-01-16T05:00Z","status":{"type":{"state":"pre","shortDetail":"TBD"}},"competitions":[{"competitors":[{"homeAway":"away","score":"","team":{"id":"3","displayName":"TBD","abbreviation":"TBD"}},{"homeAway":"home","score":"","team":{"id":"4","displayName":"TBD","abbreviation":"TBD"}}]}]}]}
+;
+
+test "postseason week slate normalizes with states mapped" {
+    var fake = FakeTransportState{ .body = playoff_week_fixture };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = weekAliasAdapter(&fake, threaded.io());
+    const nfl = core.leagues.find("nfl").?;
+    const board = try adapter.fetchWeek(arena, nfl, "2026-09-06", 1, 3);
+    try std.testing.expectEqualStrings(
+        "https://example.test/base/sports/football/nfl/scoreboard?week=1&seasontype=3",
+        fake.seen_url.?,
+    );
+    try std.testing.expectEqual(@as(usize, 2), board.games.len);
+    for (board.games) |game| {
+        try std.testing.expectEqualStrings("pre", game.state);
+        try std.testing.expectEqualStrings("TBD", game.status);
+    }
+    try std.testing.expectEqualStrings("401872910", board.games[0].id);
+    try std.testing.expect((try parseSeasonYear(arena, playoff_week_fixture)).? == 2026);
+}
+
+// Offseason date shape (live `?dates=20260601` 2026-09-10: empty events,
+// null season/week): a clean empty board, NOT an error. An empty board
+// serves 200 `No games scheduled.` while a transport failure serves 502,
+// so no-games (offseason) stays distinguishable from outage by status.
+test "empty offseason slate is an empty board, outage stays an error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const nfl = core.leagues.find("nfl").?;
+    // Null season/week envelope, zero events: parses to zero games.
+    var calm = FakeTransportState{ .body = "{\"events\":[]}" };
+    const quiet = weekAliasAdapter(&calm, threaded.io());
+    const board = try quiet.fetch(arena, nfl, "2026-06-01");
+    try std.testing.expectEqual(@as(usize, 0), board.games.len);
+    try std.testing.expectEqualStrings("nfl", board.league);
+    try std.testing.expect((try parseSeasonYear(arena, "{\"events\":[]}")) == null);
+    // Same address, upstream failure: the outage error (serve layer 502),
+    // never an empty board.
+    var down = FakeTransportState{ .body = "{\"events\":[]}", .status = .bad_gateway };
+    const failing = weekAliasAdapter(&down, threaded.io());
+    try std.testing.expectError(error.UpstreamResponse, failing.fetch(arena, nfl, "2026-06-01"));
 }

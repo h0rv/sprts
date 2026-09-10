@@ -184,16 +184,16 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             // SSE is a text-only progressive render: JSON and HTML shape a
             // document, not a redraw loop. Header- or query-triggered stream
             // requests on those formats get the normal single response.
-            // A ?week= board also takes the single response: the shared
-            // stream poll key has no week component, so week boards never
-            // join the shared poll.
+            // A ?week=/seasontype board also takes the single response: the
+            // shared stream poll key has no week component, so selector
+            // boards never join the shared poll.
             const wants_sse = score_route.stream or server_app.router.wantsStream(target, accept);
-            if (wants_sse and format == .text and score_route.week == null) {
+            if (wants_sse and format == .text and score_route.week == null and score_route.seasontype == null) {
                 status = .ok;
                 // GET only: HEAD must not start an open-ended body. Fall back
                 // to the normal single response, consistent with non-stream.
                 if (request.head.method == .HEAD) {
-                    const board_once = adapter.fetchWeek(arena, league, day, score_route.week) catch |err| {
+                    const board_once = adapter.fetchWeek(arena, league, day, score_route.week, score_route.seasontype) catch |err| {
                         status = .bad_gateway;
                         std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
                         try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
@@ -206,12 +206,13 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default, zone);
                 return;
             }
-            // ?week= boards bypass the cache: the board key is (slug, day)
-            // and a week selector must never poison date-driven entries.
-            // Direct fetchWeek keeps the default null path cached as before.
-            if (score_route.week != null) {
+            // ?week=/seasontype boards bypass the cache: the board key is
+            // (slug, day) and a selector must never poison date-driven
+            // entries. Direct fetchWeek keeps the default null path cached
+            // as before.
+            if (score_route.week != null or score_route.seasontype != null) {
                 const week_start = std.Io.Clock.Timestamp.now(io, .awake);
-                const board = adapter.fetchWeek(arena, league, day, score_route.week) catch |err| {
+                const board = adapter.fetchWeek(arena, league, day, score_route.week, score_route.seasontype) catch |err| {
                     upstream_ms = elapsedMs(week_start, io);
                     status = .bad_gateway;
                     std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });

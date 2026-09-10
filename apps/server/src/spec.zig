@@ -10,6 +10,7 @@ const ScoreboardQuery = struct {
     date: ?[]const u8 = null,
     stream: ?[]const u8 = null,
     week: ?u16 = null,
+    seasontype: ?u16 = null,
 
     pub const jsonschema = .{
         .fields = .{
@@ -20,6 +21,7 @@ const ScoreboardQuery = struct {
             // stays next to the type and the endpoint description repeats
             // the football-only rule, mirroring the GamePath pattern below.
             .week = .{ .description = "ESPN week selector; strict positive integer, honored only for football leagues, otherwise ignored" },
+            .seasontype = .{ .description = "ESPN season-type selector 1-4 (1=preseason, 2=regular, 3=postseason, 4=off-season); strict, honored only for football leagues, otherwise ignored" },
         },
     };
 };
@@ -98,6 +100,8 @@ pub const ApiSpec = z.Spec(.{
             "clear-screen escape \\x1b[2J\\x1b[H for in-place redraw, with : ping keepalive comments. " ++
             "Example: curl -N /nba?stream=sse. Text-only; JSON and HTML always return a single response. " ++
             "Pass ?week=N (strict positive integer; ESPN honors it only for football leagues, otherwise ignored). " ++
+            "Pass ?seasontype=T with ?week=N for the season type (1=preseason, 2=regular, 3=postseason; strict 1-4, football only): " ++
+            "preseason and playoff weeks are unreachable without it, ESPN defaults an untyped week to the regular season. " ++
             "JSON Scoreboard: game starts_at is UTC ISO-8601 while text/HTML headings name the request " ++
             "zone (default ET); source names the upstream host (normally site.api.espn.com).",
         .path = ScoreboardPath,
@@ -200,7 +204,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "JSON API\n" ++
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
             "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
-            "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only. (getScoreboard)\n" ++
+            "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only, seasontype=T football-only with week. (getScoreboard)\n" ++
             "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
             "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
@@ -226,6 +230,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "FLAGS text and HTML only, JSON ignores display flags\n" ++
             "  ?date=YYYY-MM-DD scoreboard day, default today in ET (today/tomorrow/yesterday also work)\n" ++
             "  ?week=N football-only week selector, ignored elsewhere\n" ++
+            "  ?seasontype=T football-only season type with ?week=N (1=preseason, 2=regular, 3=postseason), ignored elsewhere\n" ++
             "  ?color=0 color off, ?color=1 color on\n" ++
             "  ?width=N ?height=N terminal size cap\n" ++
             "  ?0 one-line per game, text-only\n" ++
@@ -306,7 +311,7 @@ test "llms.txt is plain agent surface with every operation" {
     for ([_][]const u8{ "listLeagues", "getAll", "getScoreboard", "getGame", "getTeam", "getStandings", "listTeams" }) |id| {
         try std.testing.expect(std.mem.indexOf(u8, doc, id) != null);
     }
-    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "?art=off", "digits", "mlb", "nfl", "Base URL", "listTeams", "network", "/api/v1/league/teams" }) |token| {
+    for ([_][]const u8{ "curl localhost:8080/mlb", "?format=html", "/api/v1/", "/openapi.json", "/docs", "?color=0", "?width", "?height", "?0", "?date=", "?week", "?seasontype", "?art=off", "digits", "mlb", "nfl", "Base URL", "listTeams", "network", "/api/v1/league/teams" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, doc, token) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, doc, "\x1b") == null);
@@ -382,13 +387,15 @@ test "served openapi.json parses and covers every JSON route" {
         try std.testing.expect(responses.get("404") == null);
         try std.testing.expect(responses.get("502") == null);
     }
-    // Scoreboard carries the optional integer `week` query param (strict
-    // positive u16 in the router; ESPN honors it only for football).
+    // Scoreboard carries the optional integer `week` and `seasontype`
+    // query params (strict u16 in the router; ESPN honors them only for
+    // football).
     {
         const get = paths.get("/api/v1/{league}").?.object.get("get").?.object;
         const params = get.get("parameters").?.array;
         var saw_date = false;
         var saw_week = false;
+        var saw_seasontype = false;
         for (params.items) |item| {
             const name = item.object.get("name").?.string;
             const location = item.object.get("in").?.string;
@@ -401,11 +408,20 @@ test "served openapi.json parses and covers every JSON route" {
                 const schema = item.object.get("schema").?.object;
                 try std.testing.expectEqualStrings("integer", schema.get("type").?.string);
             }
+            if (std.mem.eql(u8, name, "seasontype")) {
+                saw_seasontype = true;
+                try std.testing.expectEqualStrings("query", location);
+                try std.testing.expect(!item.object.get("required").?.bool);
+                const schema = item.object.get("schema").?.object;
+                try std.testing.expectEqualStrings("integer", schema.get("type").?.string);
+            }
         }
         try std.testing.expect(saw_date);
         try std.testing.expect(saw_week);
+        try std.testing.expect(saw_seasontype);
     }
-    // The digest is date-driven only: `week` must not appear on getAll.
+    // The digest is date-driven only: `week` and `seasontype` must not
+    // appear on getAll.
     {
         const get = paths.get("/api/v1/all").?.object.get("get").?.object;
         const params = get.get("parameters").?.array;
@@ -413,6 +429,7 @@ test "served openapi.json parses and covers every JSON route" {
         for (params.items) |item| {
             const name = item.object.get("name").?.string;
             try std.testing.expect(!std.mem.eql(u8, name, "week"));
+            try std.testing.expect(!std.mem.eql(u8, name, "seasontype"));
             if (std.mem.eql(u8, name, "date")) saw_date = true;
         }
         try std.testing.expect(saw_date);
