@@ -4230,3 +4230,54 @@ test "season year tolerates string years and absence" {
     try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":null}}")) == null);
     try std.testing.expect((try parseSeasonYear(arena, "{\"season\":{\"year\":\"soon\"}}")) == null);
 }
+
+test "past-date game alias parses and resolves to the canonical game" {
+    // End-to-end shape of the serve path (`main.serveConnection` date_alias
+    // arm, `worker.serveDateAlias`): the pretty URL parses, the past day
+    // passes through verbatim, and the matchup lookup lands on the board
+    // fetched for that day. The router import stays function-local: the
+    // production edge is serve-only, and both serve modules' own tests do
+    // not execute under `zig build test`, so this pins the coupling here.
+    const router = @import("router.zig");
+    const route = router.parse("/mlb/2025-09-10/min-det");
+    try std.testing.expect(route == .date_alias);
+    const alias = route.date_alias;
+    try std.testing.expectEqualStrings("mlb", alias.league);
+    try std.testing.expectEqualStrings("2025-09-10", alias.date);
+    try std.testing.expectEqualStrings("min", alias.away);
+    try std.testing.expectEqualStrings("det", alias.home);
+    try std.testing.expect(alias.n == null);
+    // The past-day board the fetch returns: same duel shape as a today
+    // board, only the date is last season.
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401",
+                .name = "",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true, .home_away = "home" },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("2025-09-10", board.date);
+    const game = findGameByMatchupN(board, alias.away, alias.home, alias.n orelse 1).?;
+    try std.testing.expectEqualStrings("401", game.id);
+    // Redirect target the serve path builds from the hit.
+    const target = try std.fmt.allocPrint(std.testing.allocator, "/{s}/{s}", .{ alias.league, game.id });
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("/mlb/401", target);
+    // Swapped and uppercase spellings land on the same past game, while
+    // an unknown pair still misses (404, never a wrong redirect).
+    try std.testing.expectEqualStrings("401", findGameByMatchup(board, "det", "min").?.id);
+    try std.testing.expectEqualStrings("401", findGameByMatchup(board, "MIN", "DET").?.id);
+    try std.testing.expect(findGameByMatchup(board, "nyy", "bos") == null);
+}

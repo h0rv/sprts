@@ -288,7 +288,7 @@ test "text homes show the block sprts wordmark above the heading" {
     // Live home: banner above the dated heading, heading unchanged.
     var results: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
-    const live = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
+    const live = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(live);
     const banner_at = std.mem.indexOf(u8, live, "██").?;
     const heading_at = std.mem.indexOf(u8, live, "sprts  2026-09-06 ET").?;
@@ -297,7 +297,7 @@ test "text homes show the block sprts wordmark above the heading" {
     _ = try std.unicode.Utf8View.init(live);
 
     // Colored live home: banner stays plaintext, heading keeps dim.
-    const colored = try homeLive(std.testing.allocator, true, "example.test", &results, "2026-09-06", false);
+    const colored = try homeLive(std.testing.allocator, true, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(colored);
     const colored_head = std.mem.indexOf(u8, colored, "sprts  2026-09-06 ET").?;
     try std.testing.expect(colored_head > text_home_banner_small.len);
@@ -305,7 +305,7 @@ test "text homes show the block sprts wordmark above the heading" {
     try std.testing.expect(std.mem.indexOf(u8, colored[0..text_home_banner_small.len], "\x1b[") == null);
 
     // Quiet mode drops the banner with the rest of the header chrome.
-    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", true);
+    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", true, false);
     defer std.testing.allocator.free(quiet);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "█") == null);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "sprts") == null);
@@ -362,6 +362,11 @@ pub fn sanitizeHost(value: ?[]const u8) []const u8 {
 /// Live home page: leagues with live games first, then the rest of today
 /// as compact one-liners, then idle leagues as links. Leagues whose fetch
 /// failed render as plain links, so one ESPN outage never fails the page.
+/// `dated` selects the explicit-`?date` past view: leagues with an
+/// answered-but-empty board (off-day) are skipped entirely — no idle rows,
+/// no `ALL LEAGUES` block unless a fetch actually failed — while failed
+/// leagues (null board) keep their plain-link degraded rows. Dateless
+/// (today) rendering is unchanged.
 /// The heading names its zone (`sprts  2026-09-06 ET`); the date-nav line
 /// sits directly under it, above the sections (see `writeHomeNavLine`);
 /// section rows keep the shared `homeSections` layout untouched (the HTML
@@ -374,6 +379,7 @@ pub fn homeLiveWithZone(
     day: []const u8,
     quiet: bool,
     zone: tz.Zone,
+    dated: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -392,13 +398,13 @@ pub fn homeLiveWithZone(
     // scoreboard footer prints, so navigation never depends on chrome.
     try writeHomeNavLine(w, allocator, day);
     try table.writeSeparator(w, 50);
-    try homeSections(allocator, w, boards, color, false, day);
+    try homeSections(allocator, w, boards, color, false, day, dated);
     try w.writeByte('\n');
     if (!quiet) try homeFooter(w, host, color);
     return out.toOwnedSlice();
 }
 
-/// ET-default wrapper for `homeLiveWithZone`.
+/// ET-default wrapper for `homeLiveWithZone` (`dated=false`: today view).
 pub fn homeLive(
     allocator: std.mem.Allocator,
     color: bool,
@@ -406,8 +412,9 @@ pub fn homeLive(
     boards: []const provider.LeagueResult,
     day: []const u8,
     quiet: bool,
+    dated: bool,
 ) ![]u8 {
-    return homeLiveWithZone(allocator, color, host, boards, day, quiet, .et);
+    return homeLiveWithZone(allocator, color, host, boards, day, quiet, .et, dated);
 }
 
 /// Home one-line (`/?0`): every game today is ONE line, no box, no
@@ -657,6 +664,7 @@ fn homeSections(
     color: bool,
     comptime html: bool,
     day: []const u8,
+    dated: bool,
 ) !void {
     // Page-wide column widths so league, team, and score columns align
     // down the whole page: widest slug/abbreviation among leagues with
@@ -725,6 +733,11 @@ fn homeSections(
     for (boards) |result| {
         const board = result.board;
         if (board != null and board.?.games.len > 0) continue;
+        // Dated past view: an answered-but-empty board is an off-day —
+        // skip it entirely. A missing board is an upstream failure and
+        // keeps its degraded link row (with the ALL LEAGUES header only
+        // when such a row exists); today views list every idle league.
+        if (dated and board != null) continue;
         if (idle_first) {
             idle_first = false;
             if (separated) try w.writeByte('\n');
@@ -1608,13 +1621,15 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
 /// Game lines link to their league page; per-league links spell today
 /// out (`/{slug}?date={day}`), sharing the static home spelling. The
 /// footer nav mirrors `homeHtml`; the date-nav line up top mirrors the
-/// live text home's (`writeHomeNavLine`, same visible text).
+/// live text home's (`writeHomeNavLine`, same visible text). `dated`
+/// skips off-day leagues exactly like the text home (see `homeLive`).
 pub fn homeHtmlLive(
     allocator: std.mem.Allocator,
     host: []const u8,
     boards: []const provider.LeagueResult,
     day: []const u8,
     quiet: bool,
+    dated: bool,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -1632,7 +1647,7 @@ pub fn homeHtmlLive(
     {
         var sec: std.Io.Writer.Allocating = .init(allocator);
         defer sec.deinit();
-        try homeSections(allocator, &sec.writer, boards, false, true, day);
+        try homeSections(allocator, &sec.writer, boards, false, true, day, dated);
         const rendered = try sec.toOwnedSlice();
         defer allocator.free(rendered);
         try writeH1FirstLine(w, rendered);
@@ -2303,7 +2318,7 @@ test "web accessibility: names, focus, art, targets, live, headings, links" {
     try std.testing.expect(std.mem.indexOf(u8, page_style, ".live{color:var(--live);font-weight:bold}") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "prefers-contrast") != null);
     const mlb_live = [_]provider.LeagueResult{.{ .league = core.leagues.find("mlb").?, .board = board }};
-    const live_home_page = try homeHtmlLive(std.testing.allocator, "example.test", &mlb_live, "2026-09-06", false);
+    const live_home_page = try homeHtmlLive(std.testing.allocator, "example.test", &mlb_live, "2026-09-06", false, false);
     defer std.testing.allocator.free(live_home_page);
     try std.testing.expect(std.mem.indexOf(u8, live_home_page, "<span class=\"live\">") != null);
 
@@ -2333,7 +2348,7 @@ test "web accessibility: names, focus, art, targets, live, headings, links" {
     try std.testing.expect(std.mem.indexOf(u8, static_home, skip_link) != null);
     var idle: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| idle[i] = .{ .league = league };
-    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false);
+    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false, false);
     defer std.testing.allocator.free(live_home);
     try std.testing.expect(std.mem.indexOf(u8, live_home, "<h1 id=\"content\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, live_home, skip_link) != null);
@@ -2523,7 +2538,7 @@ test "theme head block is identical on every page type" {
     defer std.testing.allocator.free(static_home);
     var idle: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| idle[i] = .{ .league = league };
-    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false);
+    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false, false);
     defer std.testing.allocator.free(live_home);
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
@@ -2541,7 +2556,7 @@ test "theme head block is identical on every page type" {
     }
     // Quiet live home keeps the head script (persistence) even though it
     // drops the footer nav chrome.
-    const quiet = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", true);
+    const quiet = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", true, false);
     defer std.testing.allocator.free(quiet);
     try std.testing.expect(std.mem.indexOf(u8, quiet, theme_script) != null);
 }
@@ -2658,7 +2673,7 @@ fn displayWidth(s: []const u8) usize {
 test "home table rows align with the frame" {
     var results: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
-    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(output);
     try expectAlignedTable(output);
     try expectNoBrokenLines(output, 52);
@@ -2709,7 +2724,7 @@ test "home groups live games, then today, then idle leagues" {
         .{ .league = core.leagues.find("nba").?, .board = today_board },
         .{ .league = core.leagues.find("nfl").? },
     };
-    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false);
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(output);
     const live_at = std.mem.indexOf(u8, output, "LIVE NOW").?;
     const nba_at = std.mem.indexOf(u8, output, "NBA").?;
@@ -2786,7 +2801,7 @@ test "home groups live games, then today, then idle leagues" {
     // cannot "break" on narrow screens.
     try expectNoBrokenLines(output, 52);
 
-    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/1\">") != null);
     // Granular team spans inside the game link: each side links its team.
@@ -3158,11 +3173,11 @@ test "scoreHtml title and heading name the zone" {
 test "home text heading and one-lines name the zone" {
     var results: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
-    const live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, .et);
+    const live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-06", false, .et, false);
     defer std.testing.allocator.free(live);
     try std.testing.expect(std.mem.indexOf(u8, live, "sprts  2026-09-06 ET") != null);
 
-    const utc_live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-07", false, .utc);
+    const utc_live = try homeLiveWithZone(std.testing.allocator, false, "example.test", &results, "2026-09-07", false, .utc, false);
     defer std.testing.allocator.free(utc_live);
     try std.testing.expect(std.mem.indexOf(u8, utc_live, "sprts  2026-09-07 UTC") != null);
 
@@ -3181,7 +3196,7 @@ test "live home opens with prev/next date nav under the heading" {
     var results: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
     // Month boundary: Sep 1 navigates to Aug 31 and Sep 2.
-    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", false);
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", false, false);
     defer std.testing.allocator.free(output);
     const nav = "/all?date=2026-08-31    /all?date=2026-09-02";
     const nav_at = std.mem.indexOf(u8, output, nav).?;
@@ -3201,7 +3216,7 @@ test "live home opens with prev/next date nav under the heading" {
     try std.testing.expect(countRules(output) == 0);
 
     // Quiet mode drops the heading but keeps the nav on top.
-    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", true);
+    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", true, false);
     defer std.testing.allocator.free(quiet);
     try std.testing.expect(std.mem.indexOf(u8, quiet, nav) != null);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "sprts") == null);
@@ -3210,7 +3225,7 @@ test "live home opens with prev/next date nav under the heading" {
 test "live HTML home nav links mirror the text nav" {
     var results: [core.leagues.all.len]provider.LeagueResult = undefined;
     for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
-    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-01", false);
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-01", false, false);
     defer std.testing.allocator.free(page);
     // Same visible text as the text nav, each half its own well-formed link.
     const linked = "<a href=\"/all?date=2026-08-31\">/all?date=2026-08-31</a>" ++
@@ -3292,7 +3307,7 @@ test "live home idle leagues link today with the date" {
         .{ .league = core.leagues.find("nfl").? },
     };
     const day = "2026-09-06";
-    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, day, false);
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, day, false, false);
     defer std.testing.allocator.free(page);
     // Same spelling as the static dated home: today spelled out.
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl?date=2026-09-06\">") != null);
@@ -3305,7 +3320,7 @@ test "live home idle leagues link today with the date" {
     try std.testing.expect(std.mem.indexOf(u8, bare, "?date=") == null);
     // Hostile day text stays escaped in the shared spelling, both homes.
     const hostile = "2026-09-06&<>\"'";
-    const evil_live = try homeHtmlLive(std.testing.allocator, "example.test", &results, hostile, true);
+    const evil_live = try homeHtmlLive(std.testing.allocator, "example.test", &results, hostile, true, false);
     defer std.testing.allocator.free(evil_live);
     try std.testing.expect(std.mem.indexOf(u8, evil_live, "/nfl?date=2026-09-06&amp;&lt;&gt;&quot;&#39;") != null);
     try std.testing.expect(std.mem.indexOf(u8, evil_live, hostile) == null);
@@ -3361,7 +3376,7 @@ test "home html game lines use sibling anchors, never nested" {
         .{ .league = core.leagues.find("nba").?, .board = today_board },
         .{ .league = core.leagues.find("nfl").? },
     };
-    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     // Every game/team href from the nested layout is still present.
@@ -3456,7 +3471,7 @@ test "logo stack is byte-identical across page types" {
     defer std.testing.allocator.free(static);
     var results: [1]provider.LeagueResult = .{.{ .league = core.leagues.find("mlb").? }};
     results[0].board = board;
-    const live = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
+    const live = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false, false);
     defer std.testing.allocator.free(live);
     const pages = [_][]const u8{ score, static, live };
     var stacks: [3][]const u8 = undefined;
@@ -3712,14 +3727,171 @@ test "home and one-line views render no team marks" {
     };
     const mlb = core.leagues.find("mlb").?;
     const results = [_]provider.LeagueResult{.{ .league = mlb, .board = board }};
-    const live = try homeLiveWithZone(arena, false, "example.test", &results, "2026-09-06", false, .et);
+    const live = try homeLiveWithZone(arena, false, "example.test", &results, "2026-09-06", false, .et, false);
     defer arena.free(live);
     try std.testing.expect(!containsBraille(live));
-    const live_html = try homeHtmlLive(arena, "example.test", &results, "2026-09-06", false);
+    const live_html = try homeHtmlLive(arena, "example.test", &results, "2026-09-06", false, false);
     defer arena.free(live_html);
     try std.testing.expect(!containsBraille(live_html));
     const one_line = try homeOneLineWithZone(arena, &results, false, .et);
     defer arena.free(one_line);
     try std.testing.expect(!containsBraille(one_line));
     _ = try std.unicode.Utf8View.init(live);
+}
+
+test "dated home skips idle leagues, keeps failed-league links" {
+    // Past-day home: MLB happened, NFL answered empty (off-day), NBA
+    // failed to answer (outage). The dated view reads like the home
+    // summary — only leagues/games that happened — while the outage keeps
+    // its plain-link degraded row (never a silent drop).
+    const arena = std.testing.allocator;
+    const mlb_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "77-70", .home_away = "away" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "89-58", .home_away = "home" },
+                },
+            },
+        },
+    };
+    const nfl_board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{},
+    };
+    const results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+        .{ .league = core.leagues.find("nfl").?, .board = nfl_board },
+        .{ .league = core.leagues.find("nba").? },
+    };
+    const dated = try homeLive(arena, false, "example.test", &results, "2025-09-10", false, true);
+    defer arena.free(dated);
+    // The game that happened renders with its section header and line.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "MLB  09-10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "mlb AWY   2 @ HME   5") != null);
+    // Off-day league leaves no row: its link would point at an empty
+    // dated board, so nothing references it at all.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "nfl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NFL") == null);
+    // Failed league keeps its degraded link under ALL LEAGUES.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "ALL LEAGUES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "nba           NBA") != null);
+    _ = try std.unicode.Utf8View.init(dated);
+    // Today view of the same results is unchanged: the off-day league
+    // still lists as an idle link next to the failed one.
+    const today = try homeLive(arena, false, "example.test", &results, "2025-09-10", false, false);
+    defer arena.free(today);
+    try std.testing.expect(std.mem.indexOf(u8, today, "nfl           NFL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, today, "nba           NBA") != null);
+    // A clean dated day (nothing failed) drops the ALL LEAGUES block
+    // entirely instead of printing an empty frame.
+    const clean_results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+        .{ .league = core.leagues.find("nfl").?, .board = nfl_board },
+    };
+    const clean = try homeLive(arena, false, "example.test", &clean_results, "2025-09-10", false, true);
+    defer arena.free(clean);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "ALL LEAGUES") == null);
+    try std.testing.expect(std.mem.indexOf(u8, clean, "MLB  09-10") != null);
+}
+
+test "dated home matches today render when every league played" {
+    // Byte-parity lock: with no empty and no failed boards the dated flag
+    // selects nothing, so a past home renders exactly like today — same
+    // sections, same colors, same links (text + HTML).
+    const arena = std.testing.allocator;
+    const mlb_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "3", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+    };
+    const dated = try homeLive(arena, true, "example.test", &results, "2025-09-10", false, true);
+    defer arena.free(dated);
+    const today = try homeLive(arena, true, "example.test", &results, "2025-09-10", false, false);
+    defer arena.free(today);
+    try std.testing.expectEqualStrings(today, dated);
+    // Live color survives the past view (status red): nothing about the
+    // request date mutes the palette.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "\x1b[1;31m") != null);
+    const dated_html = try homeHtmlLive(arena, "example.test", &results, "2025-09-10", false, true);
+    defer arena.free(dated_html);
+    const today_html = try homeHtmlLive(arena, "example.test", &results, "2025-09-10", false, false);
+    defer arena.free(today_html);
+    try std.testing.expectEqualStrings(today_html, dated_html);
+    try std.testing.expect(std.mem.indexOf(u8, dated_html, "<a href=\"/mlb/1\">") != null);
+    _ = try std.unicode.Utf8View.init(dated);
+    _ = try std.unicode.Utf8View.init(dated_html);
+}
+
+test "past scoreboard keeps records, winner colors, marks, and links" {
+    // Content contract for past dates: a final board from last season
+    // renders the full today treatment — records, winner tick + green,
+    // team marks, game/team links — because no renderer consults the
+    // request date, only the board in hand.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                },
+            },
+        },
+    };
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const colored = try text(arena, board, true, null, null);
+    defer arena.free(colored);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "(83-61)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "(74-70)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[32m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colored, "✓") != null);
+    try std.testing.expect(containsBraille(colored));
+    try std.testing.expect(std.mem.indexOf(u8, colored, "MLB  2025-09-10 ET") != null);
+    _ = try std.unicode.Utf8View.init(colored);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/9\" id=\"game-9\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">PHI</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
 }

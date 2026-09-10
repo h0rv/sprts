@@ -58,7 +58,12 @@ pub const DigestJson = struct {
 /// render a one-line `unavailable` section; output is always valid UTF-8
 /// (it only concatenates `render.text` output and ASCII pointers) and
 /// strips all color when `color` is false (same flag as `render.text`).
-/// The heading names its zone (`sprts all  2026-09-06 ET`).
+/// The heading names its zone (`sprts all  2026-09-06 ET`). `dated`
+/// selects the explicit-`?date` past view: answered-but-empty boards
+/// (off-day) are skipped entirely — no empty sections, no `No games
+/// scheduled` noise — while missing boards (upstream failure) keep their
+/// `unavailable` degraded markers and the JSON `degraded` list (see
+/// `DigestJson`) still tells outage apart from off-day.
 pub fn textWithZoneArt(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
@@ -69,6 +74,7 @@ pub fn textWithZoneArt(
     quiet: bool,
     zone: tz.Zone,
     art: bool,
+    dated: bool,
 ) ![]u8 {
     const per_league = height orelse default_games_per_league;
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -86,6 +92,10 @@ pub fn textWithZoneArt(
             try w.print("/{s}?date={s}: unavailable\n", .{ section.league.slug, day });
             continue;
         };
+        // Dated past view: an answered-but-empty board is an off-day —
+        // skip the section entirely (see `dated`). A missing board above
+        // is an upstream failure and keeps its degraded marker.
+        if (dated and board.games.len == 0) continue;
         const capped = @min(per_league, board.games.len);
         const slice: core.domain.Scoreboard = .{
             .league = board.league,
@@ -105,7 +115,8 @@ pub fn textWithZoneArt(
     return out.toOwnedSlice();
 }
 
-/// Wrapper with art on: existing callers keep rendering exactly as before.
+/// Wrapper with art on (`dated=false`: today view): existing callers keep
+/// rendering exactly as before.
 pub fn textWithZone(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
@@ -115,11 +126,12 @@ pub fn textWithZone(
     height: ?u16,
     quiet: bool,
     zone: tz.Zone,
+    dated: bool,
 ) ![]u8 {
-    return textWithZoneArt(allocator, sections, day, color, width, height, quiet, zone, true);
+    return textWithZoneArt(allocator, sections, day, color, width, height, quiet, zone, true, dated);
 }
 
-/// ET-default wrapper for `textWithZone`.
+/// ET-default wrapper for `textWithZone` (`dated=false`: today view).
 pub fn text(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
@@ -128,8 +140,9 @@ pub fn text(
     width: ?u16,
     height: ?u16,
     quiet: bool,
+    dated: bool,
 ) ![]u8 {
-    return textWithZone(allocator, sections, day, color, width, height, quiet, .et);
+    return textWithZone(allocator, sections, day, color, width, height, quiet, .et, dated);
 }
 
 /// JSON digest: one `domain.Scoreboard` per league in `core.leagues.all`
@@ -185,9 +198,11 @@ fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) 
 }
 
 /// HTML digest: the text digest (uncolored) in a `<pre>` block with nav.
-/// Same single-source layout principle as `render.scoreHtml`.
-pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, art: bool) ![]u8 {
-    const body = try textWithZoneArt(allocator, sections, day, false, width, height, true, zone, art);
+/// Same single-source layout principle as `render.scoreHtml`. `dated`
+/// skips off-day sections exactly like the text digest (see
+/// `textWithZoneArt`).
+pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, art: bool, dated: bool) ![]u8 {
+    const body = try textWithZoneArt(allocator, sections, day, false, width, height, true, zone, art, dated);
     defer allocator.free(body);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -206,14 +221,15 @@ pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSec
     return out.toOwnedSlice();
 }
 
-/// Wrapper with art on: existing callers keep rendering exactly as before.
-pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone) ![]u8 {
-    return htmlWithZoneArt(allocator, sections, day, width, height, quiet, zone, true);
+/// Wrapper with art on (`dated=false`: today view): existing callers keep
+/// rendering exactly as before.
+pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, dated: bool) ![]u8 {
+    return htmlWithZoneArt(allocator, sections, day, width, height, quiet, zone, true, dated);
 }
 
-/// ET-default wrapper for `htmlWithZone`.
-pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool) ![]u8 {
-    return htmlWithZone(allocator, sections, day, width, height, quiet, .et);
+/// ET-default wrapper for `htmlWithZone` (`dated=false`: today view).
+pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, dated: bool) ![]u8 {
+    return htmlWithZone(allocator, sections, day, width, height, quiet, .et, dated);
 }
 
 fn stripAnsi(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -262,7 +278,7 @@ test "digest text renders multi-section with cap pointer" {
         .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
         .{ .league = core.leagues.find("nfl").?, .board = null },
     };
-    const output = try text(arena, &sections, "2026-09-06", false, null, 3, false);
+    const output = try text(arena, &sections, "2026-09-06", false, null, 3, false, false);
     // Capped at 3 of 7: pointer carries the remaining count + league route.
     try std.testing.expect(std.mem.indexOf(u8, output, "+4 more -> /mlb?date=2026-09-06") != null);
     // Failed league degrades to an unavailable marker, digest survives.
@@ -294,7 +310,7 @@ test "digest text default cap is five per league" {
         .games = games,
     };
     const sections = [_]DigestSection{.{ .league = core.leagues.find("mlb").?, .board = board }};
-    const output = try text(arena, &sections, "2026-09-06", false, null, null, true);
+    const output = try text(arena, &sections, "2026-09-06", false, null, null, true, false);
     try std.testing.expect(std.mem.indexOf(u8, output, "+3 more -> /mlb?date=2026-09-06") != null);
     _ = try std.unicode.Utf8View.init(output);
 }
@@ -369,7 +385,7 @@ test "digest html links and never carries ANSI" {
     const html_sections = [_]DigestSection{
         .{ .league = core.leagues.find("mlb").?, .board = null },
     };
-    const page = try html(html_arena, &html_sections, "2026-09-06", null, null, false);
+    const page = try html(html_arena, &html_sections, "2026-09-06", null, null, false, false);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
@@ -402,9 +418,9 @@ test "digest color strip round-trips" {
         },
     };
     const sections = [_]DigestSection{.{ .league = core.leagues.find("mlb").?, .board = board }};
-    const colored = try text(arena, &sections, "2026-09-06", true, null, null, true);
+    const colored = try text(arena, &sections, "2026-09-06", true, null, null, true, false);
     try std.testing.expect(std.mem.indexOf(u8, colored, "\x1b[") != null);
-    const plain = try text(arena, &sections, "2026-09-06", false, null, null, true);
+    const plain = try text(arena, &sections, "2026-09-06", false, null, null, true, false);
     try std.testing.expect(std.mem.indexOf(u8, plain, "\x1b[") == null);
     const stripped = try stripAnsi(arena, colored);
     try std.testing.expectEqualStrings(plain, stripped);
@@ -446,10 +462,10 @@ test "digest art off strips section marks, keeps sections and pointers" {
         .{ .league = core.leagues.find("mlb").?, .board = board },
         .{ .league = core.leagues.find("nfl").?, .board = null },
     };
-    const on = try textWithZone(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et);
+    const on = try textWithZone(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et, false);
     defer std.testing.allocator.free(on);
     try std.testing.expect(containsBraille(on));
-    const off = try textWithZoneArt(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et, false);
+    const off = try textWithZoneArt(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et, false, false);
     defer std.testing.allocator.free(off);
     try std.testing.expect(!containsBraille(off));
     _ = try std.unicode.Utf8View.init(off);
@@ -458,11 +474,115 @@ test "digest art off strips section marks, keeps sections and pointers" {
         try std.testing.expect(std.mem.indexOf(u8, off, token) != null);
     }
     // HTML derives from the same art-off body: no marks, no escapes.
-    const page = try htmlWithZoneArt(std.testing.allocator, &sections, "2026-09-06", null, null, false, .et, false);
+    const page = try htmlWithZoneArt(std.testing.allocator, &sections, "2026-09-06", null, null, false, .et, false, false);
     defer std.testing.allocator.free(page);
     try std.testing.expect(!containsBraille(page));
     try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "PHI") != null);
     _ = try std.unicode.Utf8View.init(page);
+}
+
+test "dated digest skips off-day leagues, keeps outage markers" {
+    // Mixed past-day digest: MLB played, NFL answered empty (off-day),
+    // NBA failed to answer (outage). The dated view reads like the home
+    // summary — only leagues/games that happened — while the outage stays
+    // visible as a degraded marker (the `degraded` concept: null board).
+    const arena = std.testing.allocator;
+    const mlb_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "77-70" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "89-58" },
+                },
+            },
+        },
+    };
+    const nfl_board: core.domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{},
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+        .{ .league = core.leagues.find("nfl").?, .board = nfl_board },
+        .{ .league = core.leagues.find("nba").? },
+    };
+    const dated = try text(arena, &sections, "2025-09-10", false, null, null, false, true);
+    defer arena.free(dated);
+    // The game that happened renders whole: status, records, pointers.
+    for ([_][]const u8{ "MLB", "Final", "AWY", "HME", "(77-70)", "(89-58)", "more: /<league>?date=<day>" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, dated, token) != null);
+    }
+    // Off-day league vanishes entirely: no section, no noise line.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NFL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "No games scheduled") == null);
+    // Failed league keeps its degraded marker (not a silent drop).
+    try std.testing.expect(std.mem.indexOf(u8, dated, "/nba?date=2025-09-10: unavailable") != null);
+    _ = try std.unicode.Utf8View.init(dated);
+    // Today view of the same sections is unchanged: the off-day league
+    // still renders its (noisy but long-standing) empty section.
+    const today = try text(arena, &sections, "2025-09-10", false, null, null, false, false);
+    defer arena.free(today);
+    try std.testing.expect(std.mem.indexOf(u8, today, "NFL  2025-09-10 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, today, "No games scheduled.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, today, "/nba?date=2025-09-10: unavailable") != null);
+}
+
+test "dated digest matches today render when every league played" {
+    // Byte-parity lock: with no empty and no failed sections the dated
+    // flag selects nothing, so a past view renders exactly like today —
+    // same sections, same colors, same marks, same links (text + HTML).
+    const arena = std.testing.allocator;
+    const mlb_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                },
+            },
+        },
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+    };
+    const dated_text = try text(arena, &sections, "2025-09-10", true, null, null, false, true);
+    defer arena.free(dated_text);
+    const today_text = try text(arena, &sections, "2025-09-10", true, null, null, false, false);
+    defer arena.free(today_text);
+    try std.testing.expectEqualStrings(today_text, dated_text);
+    // Colors and marks survive the past view (winner green, braille art).
+    try std.testing.expect(std.mem.indexOf(u8, dated_text, "\x1b[") != null);
+    try std.testing.expect(containsBraille(dated_text));
+    const dated_html = try html(arena, &sections, "2025-09-10", null, null, false, true);
+    defer arena.free(dated_html);
+    const today_html = try html(arena, &sections, "2025-09-10", null, null, false, false);
+    defer arena.free(today_html);
+    try std.testing.expectEqualStrings(today_html, dated_html);
+    try std.testing.expect(std.mem.indexOf(u8, dated_html, "PHI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated_html, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(dated_text);
+    _ = try std.unicode.Utf8View.init(dated_html);
 }
