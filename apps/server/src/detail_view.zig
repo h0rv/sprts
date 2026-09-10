@@ -1311,25 +1311,6 @@ fn expectRowInBoth(text: []const u8, seen: []const u8, row: []const u8, cols: us
     try std.testing.expect(containsLine(seen, visible));
 }
 
-/// Visible text of a detail page: the `<pre>` block with tags stripped
-/// and entities unescaped, line for line.
-fn visiblePre(arena: std.mem.Allocator, page: []const u8) ![]u8 {
-    const pre_open = std.mem.indexOf(u8, page, "<pre") orelse return error.TestUnexpectedResult;
-    const pre_gt = std.mem.indexOfScalarPos(u8, page, pre_open, '>') orelse return error.TestUnexpectedResult;
-    const pre_close = std.mem.indexOf(u8, page, "</pre>") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(pre_gt < pre_close);
-    var visible: std.Io.Writer.Allocating = .init(arena);
-    errdefer visible.deinit();
-    var raw = std.mem.splitScalar(u8, page[pre_gt + 1 .. pre_close], '\n');
-    while (raw.next()) |line| {
-        const clean = try vd.stripHtmlVisible(arena, line);
-        defer arena.free(clean);
-        try visible.writer.writeAll(clean);
-        try visible.writer.writeByte('\n');
-    }
-    return visible.toOwnedSlice();
-}
-
 test "hostile detail sections read identically in text and HTML" {
     const arena = std.testing.allocator;
     const game = hostileDetail();
@@ -1344,7 +1325,7 @@ test "hostile detail sections read identically in text and HTML" {
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b") == null);
     // Visible HTML: the `<pre>` block with tags stripped and entities
     // unescaped, line for line.
-    const seen = try visiblePre(arena, page);
+    const seen = try vd.expectVisibleParity(arena, page);
     defer arena.free(seen);
     // Every shared-composer row lands verbatim in both surfaces.
     const psec = try vd.participantSection(arena, game.participants, cols);
@@ -1380,7 +1361,7 @@ test "hostile detail sections read identically in text and HTML" {
     const page2 = try detailHtml(arena, plain, null, null);
     defer arena.free(page2);
     _ = try std.unicode.Utf8View.init(text2);
-    const seen2 = try visiblePre(arena, page2);
+    const seen2 = try vd.expectVisibleParity(arena, page2);
     defer arena.free(seen2);
     const leaders = try vd.leadersSection(arena, game.leaders, game.participants, cols);
     defer vd.freeLeadersSection(arena, leaders);
@@ -1781,7 +1762,7 @@ fn expectDetailParity(game: detail.GameDetail) !void {
     _ = try std.unicode.Utf8View.init(page);
     try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
-    const seen = try visiblePre(arena, page);
+    const seen = try vd.expectVisibleParity(arena, page);
     defer arena.free(seen);
     // Heading + status + TV: fitted on both sides.
     const zone_tag = try tz.zoneTag(arena, .et);
@@ -2095,7 +2076,7 @@ test "detail winner row keeps its record instead of an ellipsis" {
     try expectParticipantRowsIntact(body);
     const page = try detailHtml(arena, game, null, null);
     defer arena.free(page);
-    const seen = try visiblePre(arena, page);
+    const seen = try vd.expectVisibleParity(arena, page);
     defer arena.free(seen);
     try expectParticipantRowsIntact(seen);
     try std.testing.expect(std.mem.indexOf(u8, seen, "…") == null);
@@ -2132,7 +2113,7 @@ test "detail participant rows never truncate with space to spare, widths 40..200
         try std.testing.expect(std.mem.indexOf(u8, body, "…") == null);
         const page = try detailHtml(arena, game, width, null);
         defer arena.free(page);
-        const seen = try visiblePre(arena, page);
+        const seen = try vd.expectVisibleParity(arena, page);
         defer arena.free(seen);
         try expectParticipantRowsIntact(seen);
         try std.testing.expect(std.mem.indexOf(u8, seen, "…") == null);

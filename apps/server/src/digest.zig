@@ -640,18 +640,7 @@ test "digest hostile fixture keeps text and HTML visible text equal" {
     _ = try std.unicode.Utf8View.init(page);
     // Visible `<pre>` text (tags stripped, entities decoded) matches
     // the text body line for line.
-    const open = std.mem.indexOf(u8, page, "<pre>").? + "<pre>".len;
-    const close = std.mem.indexOf(u8, page, "</pre>").?;
-    const pre = page[open..close];
-    var pre_lines = std.mem.splitScalar(u8, pre, '\n');
-    var text_lines = std.mem.splitScalar(u8, body, '\n');
-    while (true) {
-        const h = pre_lines.next();
-        const t = text_lines.next();
-        try std.testing.expectEqual(h == null, t == null);
-        if (h == null) break;
-        const clean = try view.stripHtmlVisible(arena, h.?);
-        defer arena.free(clean);
-        try std.testing.expectEqualStrings(t.?, clean);
-    }
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
 }
