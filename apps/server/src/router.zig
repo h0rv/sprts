@@ -12,6 +12,9 @@ pub const ScoreboardRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    /// Team-mark art kill-switch: `?art=off` strips every braille logo
+    /// (tofu terminals); anything else (including absent) keeps art on.
+    art: bool = true,
     quiet: bool = false,
     oneline: bool = false,
     stream: bool = false,
@@ -23,6 +26,9 @@ pub const GameRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    /// Accepted for uniformity; the detail view renders no team marks,
+    /// so this changes nothing (see ScoreboardRoute.art).
+    art: bool = true,
     quiet: bool = false,
     oneline: bool = false,
 };
@@ -33,6 +39,9 @@ pub const TeamRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    /// Team-mark art kill-switch (see ScoreboardRoute.art): strips the
+    /// logo block above the header in text and HTML.
+    art: bool = true,
     quiet: bool = false,
     oneline: bool = false,
 };
@@ -57,6 +66,9 @@ pub const StandingsRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    /// Accepted for uniformity; the standings table renders no team
+    /// marks, so this changes nothing (see ScoreboardRoute.art).
+    art: bool = true,
     quiet: bool = false,
     oneline: bool = false,
 };
@@ -80,6 +92,9 @@ pub const AllRoute = struct {
     color: ?bool,
     width: ?u16,
     height: ?u16,
+    /// Team-mark art kill-switch (see ScoreboardRoute.art): the digest
+    /// concatenates scoreboard sections, so its marks strip the same way.
+    art: bool = true,
     quiet: bool = false,
     oneline: bool = false,
 };
@@ -179,6 +194,7 @@ pub fn parse(target: []const u8) Route {
             .color = display.color,
             .width = queryUint(queryValue(query, "width")),
             .height = queryUint(queryValue(query, "height")),
+            .art = parseArt(queryValue(query, "art")),
             .quiet = display.quiet,
             .oneline = display.oneline,
         } };
@@ -186,6 +202,7 @@ pub fn parse(target: []const u8) Route {
             .color = display.color,
             .width = queryUint(queryValue(query, "width")),
             .height = queryUint(queryValue(query, "height")),
+            .art = parseArt(queryValue(query, "art")),
             .quiet = display.quiet,
             .oneline = display.oneline,
         };
@@ -195,6 +212,7 @@ pub fn parse(target: []const u8) Route {
             .color = sized.color,
             .width = sized.width,
             .height = sized.height,
+            .art = sized.art,
             .quiet = sized.quiet,
             .oneline = sized.oneline,
         } };
@@ -204,6 +222,7 @@ pub fn parse(target: []const u8) Route {
             .color = sized.color,
             .width = sized.width,
             .height = sized.height,
+            .art = sized.art,
             .quiet = sized.quiet,
             .oneline = sized.oneline,
         } };
@@ -216,6 +235,7 @@ pub fn parse(target: []const u8) Route {
         .color = display.color,
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
+        .art = parseArt(queryValue(query, "art")),
         .quiet = display.quiet,
         .oneline = display.oneline,
     } };
@@ -226,6 +246,7 @@ pub fn parse(target: []const u8) Route {
         .color = display.color,
         .width = queryUint(queryValue(query, "width")),
         .height = queryUint(queryValue(query, "height")),
+        .art = parseArt(queryValue(query, "art")),
         .quiet = display.quiet,
         .oneline = display.oneline,
         .stream = wantsStream(target, ""),
@@ -315,6 +336,15 @@ fn queryValue(query: []const u8, wanted: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, field[0..equals], wanted)) return field[equals + 1 ..];
     }
     return null;
+}
+
+/// Team-mark art kill-switch: `?art=off` (case-insensitive) strips every
+/// braille logo for tofu terminals; anything else (including absent)
+/// keeps art on. Layout is untouched: renderers skip the art rows
+/// entirely, so no holes or dangling blank rows remain.
+fn parseArt(value: ?[]const u8) bool {
+    const v = value orelse return true;
+    return !std.ascii.eqlIgnoreCase(v, "off");
 }
 
 fn parseColor(value: ?[]const u8) ?bool {
@@ -766,4 +796,38 @@ test "llms.txt parses exact with query ignored" {
     // Near misses are not the agent page.
     try std.testing.expect(parse("/llms.txt/") == .not_found);
     try std.testing.expect(parse("/llms") == .scoreboard);
+}
+
+test "art kill-switch parses off case-insensitively, anything else is on" {
+    // Default: art on everywhere it is accepted.
+    try std.testing.expect(parse("/mlb").scoreboard.art);
+    try std.testing.expect(parse("/mlb/401816828").game.art);
+    try std.testing.expect(parse("/mlb/phi").team.art);
+    try std.testing.expect(parse("/all").all.art);
+    try std.testing.expect(parse("/nfl/standings").standings.art);
+    // `off` in any casing strips art; anything else keeps it on.
+    try std.testing.expect(!parse("/mlb?art=off").scoreboard.art);
+    try std.testing.expect(!parse("/mlb?art=OFF").scoreboard.art);
+    try std.testing.expect(!parse("/mlb?art=Off").scoreboard.art);
+    try std.testing.expect(parse("/mlb?art=on").scoreboard.art);
+    try std.testing.expect(parse("/mlb?art=0").scoreboard.art);
+    try std.testing.expect(parse("/mlb?art=false").scoreboard.art);
+    try std.testing.expect(parse("/mlb?art=").scoreboard.art);
+    try std.testing.expect(parse("/mlb?art=of").scoreboard.art);
+    // Rides every art-carrying route shape, human and API alike.
+    try std.testing.expect(!parse("/mlb/401816828?art=off").game.art);
+    try std.testing.expect(!parse("/mlb/phi?art=OFF").team.art);
+    try std.testing.expect(!parse("/all?date=2026-09-06&art=off").all.art);
+    try std.testing.expect(!parse("/nfl/standings?art=off").standings.art);
+    try std.testing.expect(!parse("/api/v1/mlb?art=off").scoreboard.art);
+    try std.testing.expect(!parse("/api/v1/mlb/PHI?art=off").team.art);
+    // Composes with the other display params.
+    const composed = parse("/mlb?width=80&height=3&art=off&color=0").scoreboard;
+    try std.testing.expect(!composed.art);
+    try std.testing.expect(composed.width.? == 80);
+    try std.testing.expect(composed.height.? == 3);
+    try std.testing.expect(composed.color.? == false);
+    // Redirects and mark-free pages carry no art flag.
+    try std.testing.expect(@TypeOf(parse("/mlb/PHI/today").today) == TodayRoute);
+    try std.testing.expect(@TypeOf(parse("/").home) == HomeRoute);
 }

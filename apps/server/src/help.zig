@@ -159,6 +159,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  quiet=0|1 (no header/footer)  oneline=0|1 (?0, text only)  format=text|html
         \\  date=YYYY-MM-DD|today|tomorrow|yesterday (scoreboard, all)  week=N (football only)
         \\  stream=sse (scoreboard text only, curl -N)  tz=utc (default et)
+        \\  art=off strips team-mark art (tofu terminals); anything else art on
         \\
     );
     try section(w, "ALIASES (combined ?0pq or split ?0&q; unknown letters ignored)", color);
@@ -199,7 +200,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
     try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/standings /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
-    try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc | aliases T A q 0 (long wins; later alias wins)\n");
+    try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
 }
@@ -269,6 +270,7 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "week=N", .description = "Football week only, ignored elsewhere" },
             .{ .name = "stream=sse", .description = "Scoreboard text-only live feed" },
             .{ .name = "tz=utc", .description = "Day zone, default et" },
+            .{ .name = "art=off", .description = "Strip team-mark art for tofu terminals; anything else art on" },
             .{ .name = "precedence", .description = "Long flags win over aliases; later alias wins" },
         },
         .links = "Text rows print game:/team: links; HTML makes them clickable. Boards end with prev/next ?date= links.",
@@ -445,6 +447,7 @@ test "help text documents every route, flag, alias, install, and example" {
         "stream",
         "format",
         "tz=",
+        "art=off",
         "game:",
         "team:",
         "prev/next",
@@ -486,7 +489,7 @@ test "help quiet strips framing, oneline compacts, color toggles ANSI" {
     try std.testing.expectEqual(@as(usize, 4), count);
     // Compact page carries the same surface: digest, standings, agent
     // guide, week/tz flags, and the digits rule, not just the basics.
-    for ([_][]const u8{ "/all", "/{league}/{id}", "digits=game", "standings", "/llms.txt", "/docs", "week=N", "tz=utc", "text only" }) |token| {
+    for ([_][]const u8{ "/all", "/{league}/{id}", "digits=game", "standings", "/llms.txt", "/docs", "week=N", "tz=utc", "text only", "art=off" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, compact, token) != null);
     }
 }
@@ -536,7 +539,7 @@ test "help JSON parses with routes, flags, links, install, and examples" {
         try std.testing.expect(found);
     }
     const flag_names = root.get("flags").?.array.items;
-    for ([_][]const u8{ "week=N", "tz=utc", "oneline=0|1", "stream=sse" }) |want| {
+    for ([_][]const u8{ "week=N", "tz=utc", "oneline=0|1", "stream=sse", "art=off" }) |want| {
         var found = false;
         for (flag_names) |entry| {
             if (std.mem.eql(u8, entry.object.get("name").?.string, want)) {
@@ -569,4 +572,37 @@ test "help JSON parses with routes, flags, links, install, and examples" {
     }
     try std.testing.expect(saw_all);
     try std.testing.expect(saw_standings);
+}
+
+test "scoreboard one-line fallback renders no team marks" {
+    // Verified, not assumed: `?0` prints abbreviations only, so `?art=off`
+    // is meaningless there — proven by zero braille for mark-shipping
+    // teams (PHI/NYM) plus byte-identical color-off output.
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .home_away = "away" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const output = try scoreOneLine(std.testing.allocator, board, false, true);
+    defer std.testing.allocator.free(output);
+    var i: usize = 0;
+    while (i + 1 < output.len) : (i += 1) {
+        try std.testing.expect(!(output[i] == 0xE2 and output[i + 1] >= 0xA0 and output[i + 1] <= 0xA3));
+    }
+    try std.testing.expectEqualStrings("post Final PHI 5 @ NYM 3 ✓\n", output);
 }

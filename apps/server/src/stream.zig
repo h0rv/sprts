@@ -109,7 +109,7 @@ pub fn frame(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
 
 /// Subscriber-registry key: lowercase league slug, concrete day, and render
 /// params. Frames are cached per distinct render, so subscribers that render
-/// identically share one ESPN poll; a different color/width/height is a
+/// identically share one ESPN poll; a different color/width/height/art is a
 /// different resource with its own poll timer.
 pub fn subKey(
     allocator: std.mem.Allocator,
@@ -118,6 +118,7 @@ pub fn subKey(
     color: bool,
     width: ?u16,
     height: ?u16,
+    art: bool,
 ) ![]u8 {
     const lower = try allocator.dupe(u8, slug);
     defer allocator.free(lower);
@@ -133,10 +134,14 @@ pub fn subKey(
         try w.writeAll("-|");
     }
     if (height) |value| {
-        try w.print("{d}", .{value});
+        try w.print("{d}|", .{value});
     } else {
-        try w.writeAll("-");
+        try w.writeAll("-|");
     }
+    // Art changes the rendered body (art rows present or not), so it
+    // namespaces the key like every other render param: an art-off
+    // subscriber must never share an art-on poll's frames.
+    try w.writeAll(if (art) "a1" else "a0");
     return out.toOwnedSlice();
 }
 
@@ -460,22 +465,28 @@ test "keepalive is an SSE comment frame" {
 
 test "subscriber key separates leagues, days, and renders" {
     const arena = std.testing.allocator;
-    const a = try subKey(arena, "MLB", "2026-09-06", true, null, null);
+    const a = try subKey(arena, "MLB", "2026-09-06", true, null, null, true);
     defer arena.free(a);
-    try std.testing.expectEqualStrings("mlb|2026-09-06|1|-|-", a);
+    try std.testing.expectEqualStrings("mlb|2026-09-06|1|-|-|a1", a);
 
-    const b = try subKey(arena, "mlb", "2026-09-06", true, null, null);
+    const b = try subKey(arena, "mlb", "2026-09-06", true, null, null, true);
     defer arena.free(b);
     try std.testing.expectEqualStrings(a, b);
 
-    const other_day = try subKey(arena, "mlb", "2026-09-07", true, null, null);
+    const other_day = try subKey(arena, "mlb", "2026-09-07", true, null, null, true);
     defer arena.free(other_day);
     try std.testing.expect(!std.mem.eql(u8, a, other_day));
 
-    const other_render = try subKey(arena, "mlb", "2026-09-06", false, 80, 10);
+    const other_render = try subKey(arena, "mlb", "2026-09-06", false, 80, 10, true);
     defer arena.free(other_render);
-    try std.testing.expectEqualStrings("mlb|2026-09-06|0|80|10", other_render);
+    try std.testing.expectEqualStrings("mlb|2026-09-06|0|80|10|a1", other_render);
     try std.testing.expect(!std.mem.eql(u8, a, other_render));
+
+    // Art off renders a different body, so it keys apart too.
+    const no_art = try subKey(arena, "mlb", "2026-09-06", true, null, null, false);
+    defer arena.free(no_art);
+    try std.testing.expectEqualStrings("mlb|2026-09-06|1|-|-|a0", no_art);
+    try std.testing.expect(!std.mem.eql(u8, a, no_art));
 }
 
 test "subscriber counts track attach and detach per key" {

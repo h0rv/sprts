@@ -59,7 +59,7 @@ pub const DigestJson = struct {
 /// (it only concatenates `render.text` output and ASCII pointers) and
 /// strips all color when `color` is false (same flag as `render.text`).
 /// The heading names its zone (`sprts all  2026-09-06 ET`).
-pub fn textWithZone(
+pub fn textWithZoneArt(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
     day: []const u8,
@@ -68,6 +68,7 @@ pub fn textWithZone(
     height: ?u16,
     quiet: bool,
     zone: tz.Zone,
+    art: bool,
 ) ![]u8 {
     const per_league = height orelse default_games_per_league;
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -93,7 +94,7 @@ pub fn textWithZone(
             .source = board.source,
             .games = board.games[0..capped],
         };
-        const body = try render.textWithZone(allocator, slice, color, width, null, zone);
+        const body = try render.textWithZoneArt(allocator, slice, color, width, null, zone, art);
         defer allocator.free(body);
         try w.writeAll(body);
         if (capped < board.games.len) {
@@ -102,6 +103,20 @@ pub fn textWithZone(
     }
     if (!quiet) try w.writeAll("more: /<league>?date=<day>\n");
     return out.toOwnedSlice();
+}
+
+/// Wrapper with art on: existing callers keep rendering exactly as before.
+pub fn textWithZone(
+    allocator: std.mem.Allocator,
+    sections: []const DigestSection,
+    day: []const u8,
+    color: bool,
+    width: ?u16,
+    height: ?u16,
+    quiet: bool,
+    zone: tz.Zone,
+) ![]u8 {
+    return textWithZoneArt(allocator, sections, day, color, width, height, quiet, zone, true);
 }
 
 /// ET-default wrapper for `textWithZone`.
@@ -171,8 +186,8 @@ fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) 
 
 /// HTML digest: the text digest (uncolored) in a `<pre>` block with nav.
 /// Same single-source layout principle as `render.scoreHtml`.
-pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone) ![]u8 {
-    const body = try textWithZone(allocator, sections, day, false, width, height, true, zone);
+pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, art: bool) ![]u8 {
+    const body = try textWithZoneArt(allocator, sections, day, false, width, height, true, zone, art);
     defer allocator.free(body);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -190,6 +205,11 @@ pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSectio
     try render.closePageWithNav(w);
     _ = quiet;
     return out.toOwnedSlice();
+}
+
+/// Wrapper with art on: existing callers keep rendering exactly as before.
+pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone) ![]u8 {
+    return htmlWithZoneArt(allocator, sections, day, width, height, quiet, zone, true);
 }
 
 /// ET-default wrapper for `htmlWithZone`.
@@ -388,4 +408,60 @@ test "digest color strip round-trips" {
     const stripped = try stripAnsi(arena, colored);
     try std.testing.expectEqualStrings(plain, stripped);
     _ = try std.unicode.Utf8View.init(plain);
+}
+
+fn containsBraille(s: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < s.len) : (i += 1) {
+        if (s[i] == 0xE2 and s[i + 1] >= 0xA0 and s[i + 1] <= 0xA3) return true;
+    }
+    return false;
+}
+
+test "digest art off strips section marks, keeps sections and pointers" {
+    // The digest concatenates scoreboard sections, so its marks strip
+    // through the same flag (PHI vs NYM ships real marks: precondition).
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = board },
+        .{ .league = core.leagues.find("nfl").?, .board = null },
+    };
+    const on = try textWithZone(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et);
+    defer std.testing.allocator.free(on);
+    try std.testing.expect(containsBraille(on));
+    const off = try textWithZoneArt(std.testing.allocator, &sections, "2026-09-06", false, null, null, false, .et, false);
+    defer std.testing.allocator.free(off);
+    try std.testing.expect(!containsBraille(off));
+    _ = try std.unicode.Utf8View.init(off);
+    // Sections, cap pointers, and outage markers survive the strip.
+    for ([_][]const u8{ "sprts all", "Final", "PHI", "NYM", "/nfl?date=2026-09-06: unavailable", "more: /<league>?date=<day>" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, off, token) != null);
+    }
+    // HTML derives from the same art-off body: no marks, no escapes.
+    const page = try htmlWithZoneArt(std.testing.allocator, &sections, "2026-09-06", null, null, false, .et, false);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(!containsBraille(page));
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "PHI") != null);
+    _ = try std.unicode.Utf8View.init(page);
 }

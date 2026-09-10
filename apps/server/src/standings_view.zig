@@ -313,3 +313,33 @@ test "router standings route is JSON under /api/v1" {
     try std.testing.expect(!router.isJsonTarget("/mlb/standings"));
 }
 
+test "standings renders no team marks in text or HTML" {
+    // Verified, not assumed: the standings table never emits braille
+    // logos (no art site exists here), so the standings route's `art`
+    // flag is accepted-and-ignored — proven by zero braille even with
+    // a mark-shipping abbreviation (PHI) on the rows.
+    const mlb: standings.LeagueStandings = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .season = "2026",
+        .groups = &.{
+            .{ .name = "AL East", .entries = &.{
+                .{ .team_id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies", .wins = "80", .losses = "63" },
+            } },
+        },
+    };
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const output = try text(std.testing.allocator, mlb, false, null, null);
+    defer std.testing.allocator.free(output);
+    var i: usize = 0;
+    while (i + 1 < output.len) : (i += 1) {
+        try std.testing.expect(!(output[i] == 0xE2 and output[i + 1] >= 0xA0 and output[i + 1] <= 0xA3));
+    }
+    const page = try html(std.testing.allocator, mlb, null, null);
+    defer std.testing.allocator.free(page);
+    var j: usize = 0;
+    while (j + 1 < page.len) : (j += 1) {
+        try std.testing.expect(!(page[j] == 0xE2 and page[j + 1] >= 0xA0 and page[j + 1] <= 0xA3));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+}

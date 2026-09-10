@@ -75,7 +75,12 @@ pub fn json(allocator: std.mem.Allocator, board: domain.Scoreboard) ![]u8 {
 /// Pipe-less by design like the detail and team pages: heading, games
 /// separated by rules, blank air before the footer nav. Columns align
 /// left; rows are ragged, never padded.
-pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+/// Team-mark art kill-switch (`?art=off`): when `art` is false every
+/// braille logo row is skipped outright — no holes, no dangling blank
+/// art rows — while scores, names, and rules align exactly as with art
+/// on minus the art rows. Text stays the single source of layout: the
+/// HTML renderer derives from this body, so visible text matches.
+pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone, art: bool) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     const shown: usize = @min(height orelse board.games.len, board.games.len);
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -103,7 +108,7 @@ pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, colo
             if (color and participant.winner) try w.writeAll("\x1b[0m");
             try w.writeByte('\n');
         }
-        try writeGameMarks(w, allocator, board.league, &game, cols, color);
+        if (art) try writeGameMarks(w, allocator, board.league, &game, cols, color);
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
@@ -135,6 +140,17 @@ pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, colo
         next,
     });
     return out.toOwnedSlice();
+}
+
+/// Zone-aware wrapper with art on: existing callers (and the digest
+/// sections they compose) keep rendering exactly as before.
+pub fn textWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+    return textWithZoneArt(allocator, board, color, width, height, zone, true);
+}
+
+/// ET-default wrapper honoring the art flag.
+pub fn textArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, art: bool) ![]u8 {
+    return textWithZoneArt(allocator, board, color, width, height, .et, art);
 }
 
 /// One scoreboard participant row, column-aligned like the old table
@@ -876,17 +892,18 @@ fn boardHasColorArt(board: domain.Scoreboard, shown: usize) bool {
 /// stays the single source of layout.
 /// The title and the table heading both name the zone
 /// (`MLB scores 2026-09-06 ET`); the date nav stays date-only.
-pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+pub fn scoreHtmlWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone, art: bool) ![]u8 {
     const shown_pre: usize = @min(height orelse board.games.len, board.games.len);
-    const body = try textWithZone(allocator, board, false, width, height, zone);
+    const body = try textWithZoneArt(allocator, board, false, width, height, zone, art);
     defer allocator.free(body);
     // Fast path: no shown participant has a color mark, so the linkifier
     // never reads the color twin (only art rows consult it). Reuse the
-    // mono body instead of rendering the full table twice.
+    // mono body instead of rendering the full table twice. With art off
+    // there are no art rows at all, so the twin is skipped the same way.
     var color_owned: ?[]u8 = null;
     defer if (color_owned) |b| allocator.free(b);
-    if (boardHasColorArt(board, shown_pre)) {
-        color_owned = try textWithZone(allocator, board, true, width, height, zone);
+    if (art and boardHasColorArt(board, shown_pre)) {
+        color_owned = try textWithZoneArt(allocator, board, true, width, height, zone, art);
     }
     const color_body = color_owned orelse body;
     const previous = try dates.shift(allocator, board.date, -1);
@@ -917,6 +934,17 @@ pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard,
 /// ET-default wrapper for `scoreHtmlWithZone`.
 pub fn scoreHtml(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16) ![]u8 {
     return scoreHtmlWithZone(allocator, board, width, height, .et);
+}
+
+/// Zone-aware wrapper with art on: existing callers keep rendering
+/// exactly as before.
+pub fn scoreHtmlWithZone(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, zone: tz.Zone) ![]u8 {
+    return scoreHtmlWithZoneArt(allocator, board, width, height, zone, true);
+}
+
+/// ET-default wrapper honoring the art flag.
+pub fn scoreHtmlArt(allocator: std.mem.Allocator, board: domain.Scoreboard, width: ?u16, height: ?u16, art: bool) ![]u8 {
+    return scoreHtmlWithZoneArt(allocator, board, width, height, .et, art);
 }
 
 /// Post-pass linkifier for `scoreHtml`: re-emits the plain-text table
@@ -2642,3 +2670,258 @@ test "tmp debug narrow" {
 
 
 
+
+/// Art-off layout contract: `off` must equal `on` minus the art rows —
+/// braille lines drop, and a blank line directly following a dropped line
+/// drops too (interior mark blanks in the stacked path, blank pair rows
+/// in the side-by-side card). Every kept line stays within `cols` cells.
+fn expectArtOffLayout(off: []const u8, on: []const u8, cols: usize) !void {
+    try std.testing.expect(!containsBraille(off));
+    _ = try std.unicode.Utf8View.init(off);
+    var want: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer want.deinit();
+    var dropped_prev = false;
+    var on_lines = std.mem.splitScalar(u8, on, '\n');
+    while (on_lines.next()) |line| {
+        // Rebuild the body byte-exactly: each split segment regains its
+        // terminator except the trailing empty from the final newline.
+        const terminator = on_lines.peek() != null;
+        if (containsBraille(line)) {
+            dropped_prev = true;
+            continue;
+        }
+        if (line.len == 0 and dropped_prev) continue;
+        dropped_prev = false;
+        try want.writer.writeAll(line);
+        if (terminator) try want.writer.writeByte('\n');
+    }
+    const want_slice = try want.toOwnedSlice();
+    defer std.testing.allocator.free(want_slice);
+    try std.testing.expectEqualStrings(want_slice, off);
+    var off_lines = std.mem.splitScalar(u8, off, '\n');
+    while (off_lines.next()) |line| {
+        if (line.len == 0) continue;
+        // SGR wraps the fitted bytes only and is never part of the
+        // width: measure visible cells with escapes skipped.
+        const plain = try stripSgr(std.testing.allocator, line);
+        defer std.testing.allocator.free(plain);
+        try std.testing.expect(table.textCells(plain) <= cols);
+    }
+}
+
+/// Copy `s` minus SGR `ESC[...m` runs (visible cells only, for width
+/// checks on colored lines). Plain bytes pass through untouched.
+fn stripSgr(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var k: usize = 0;
+    while (k < s.len) {
+        if (s[k] == 0x1b and k + 1 < s.len and s[k + 1] == '[') {
+            var m = k + 2;
+            while (m < s.len and s[m] != 'm') : (m += 1) {}
+            k = if (m < s.len) m + 1 else s.len;
+            continue;
+        }
+        try out.writer.writeByte(s[k]);
+        k += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+fn artDuelBoard() domain.Scoreboard {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+}
+
+test "art off strips every mark, keeps layout minus the art rows" {
+    const arena = std.testing.allocator;
+    // Both sides ship marks, so art-on carries braille (the precondition:
+    // without it this test would pass vacuously).
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    try std.testing.expect(core.art.teamArt("mlb", "NYM", .xs) != null);
+    const board = artDuelBoard();
+    for ([_]?u16{ null, 80, 120 }) |width| {
+        const cols: usize = @min(@max(width orelse 52, 52), 200);
+        const on = try text(arena, board, false, width, null);
+        defer arena.free(on);
+        try std.testing.expect(containsBraille(on));
+        const off = try textArt(arena, board, false, width, null, false);
+        defer arena.free(off);
+        try expectArtOffLayout(off, on, cols);
+        // Scores, names, and pointers survive verbatim.
+        for ([_][]const u8{ "Final", "PHI", "NYM", "5 ✓", "game: /mlb/9" }) |token| {
+            try std.testing.expect(std.mem.indexOf(u8, off, token) != null);
+        }
+        // Colored art-off: marks skip (not just uncolor), still no braille.
+        const on_color = try textWithZoneArt(arena, board, true, width, null, .et, true);
+        defer arena.free(on_color);
+        const off_color = try textWithZoneArt(arena, board, true, width, null, .et, false);
+        defer arena.free(off_color);
+        try expectArtOffLayout(off_color, on_color, cols);
+    }
+    // Art on is the default: the wrapper renders byte-identically.
+    const wrapped = try textWithZone(arena, board, false, null, null, .et);
+    defer arena.free(wrapped);
+    const explicit = try textWithZoneArt(arena, board, false, null, null, .et, true);
+    defer arena.free(explicit);
+    try std.testing.expectEqualStrings(wrapped, explicit);
+}
+
+test "art off drops stacked marks and their interior blanks too" {
+    const arena = std.testing.allocator;
+    // One participant takes the stacked (not side-by-side) path, where
+    // interior mark blanks survive as empty lines (MLS ATX xs carries
+    // one). Art-off must drop those blanks with the mark, not orphan them.
+    try std.testing.expect(core.art.teamArt("mls", "ATX", .xs) != null);
+    const board: domain.Scoreboard = .{
+        .league = "mls",
+        .league_name = "MLS",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "7",
+                .name = "ATX at HOU",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Austin FC", .abbreviation = "ATX", .score = "1", .winner = true },
+                },
+            },
+        },
+    };
+    const on = try text(arena, board, false, null, null);
+    defer arena.free(on);
+    try std.testing.expect(containsBraille(on));
+    const off = try textArt(arena, board, false, null, null, false);
+    defer arena.free(off);
+    try expectArtOffLayout(off, on, 52);
+    try std.testing.expect(std.mem.indexOf(u8, off, "Austin FC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "game: /mls/7") != null);
+}
+
+/// Visible-text twin of `expectVisiblePreText` for the art flag: the
+/// art-off page's `<pre>` text must equal the art-off text body, so the
+/// linkifier adds invisible tags only, never layout.
+fn expectVisiblePreTextArt(page: []const u8, board: domain.Scoreboard, width: ?u16, height: ?u16, art: bool) !void {
+    const open = std.mem.indexOf(u8, page, "<pre>").?;
+    const close = std.mem.indexOf(u8, page, "</pre>").?;
+    const pre = page[open + "<pre>".len .. close];
+    var visible: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer visible.deinit();
+    var i: usize = 0;
+    while (i < pre.len) {
+        if (pre[i] == '<') {
+            const end = std.mem.indexOfScalarPos(u8, pre, i, '>') orelse return error.TestUnexpectedResult;
+            i = end + 1;
+            continue;
+        }
+        if (pre[i] == '&') {
+            const semi = std.mem.indexOfScalarPos(u8, pre, i, ';') orelse return error.TestUnexpectedResult;
+            const entity = pre[i .. semi + 1];
+            if (std.mem.eql(u8, entity, "&amp;")) {
+                try visible.writer.writeByte('&');
+            } else if (std.mem.eql(u8, entity, "&lt;")) {
+                try visible.writer.writeByte('<');
+            } else if (std.mem.eql(u8, entity, "&gt;")) {
+                try visible.writer.writeByte('>');
+            } else if (std.mem.eql(u8, entity, "&quot;")) {
+                try visible.writer.writeByte('"');
+            } else if (std.mem.eql(u8, entity, "&#39;")) {
+                try visible.writer.writeByte('\'');
+            } else return error.TestUnexpectedResult;
+            i = semi + 1;
+            continue;
+        }
+        try visible.writer.writeByte(pre[i]);
+        i += 1;
+    }
+    const visible_slice = try visible.toOwnedSlice();
+    defer std.testing.allocator.free(visible_slice);
+    const want = try textWithZoneArt(std.testing.allocator, board, false, width, height, .et, art);
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, visible_slice);
+}
+
+test "art-off HTML carries no marks, no logo spans, same visible text" {
+    const arena = std.testing.allocator;
+    const board = artDuelBoard();
+    const page = try scoreHtmlArt(arena, board, null, null, false);
+    defer arena.free(page);
+    try std.testing.expect(!containsBraille(page));
+    // No logo spans: art rows re-render as rgb spans when on, so their
+    // absence proves every mark row is gone (not merely unlinked).
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    // Links survive: the game anchor and both team links still navigate.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/9\" id=\"game-9\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">PHI</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
+    try expectVisiblePreTextArt(page, board, null, null, false);
+    _ = try std.unicode.Utf8View.init(page);
+    // Art on keeps its spans (precondition: this board really has color
+    // marks, so the rgb( absence above is meaningful, not vacuous).
+    const on_page = try scoreHtml(arena, board, null, null);
+    defer arena.free(on_page);
+    if (core.art.teamArtColor("mlb", "PHI", .xs) != null) {
+        try std.testing.expect(std.mem.indexOf(u8, on_page, "rgb(") != null);
+    }
+}
+
+test "home and one-line views render no team marks" {
+    // Verified, not assumed: the home page (live, one-line) and the
+    // scoreboard one-line fallback print abbreviations only, so `?art=off`
+    // is meaningless there — but they must prove it by rendering zero
+    // braille even for teams that ship marks (PHI/NYM do).
+    const arena = std.testing.allocator;
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .home_away = "away" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const mlb = core.leagues.find("mlb").?;
+    const results = [_]provider.LeagueResult{.{ .league = mlb, .board = board }};
+    const live = try homeLiveWithZone(arena, false, "example.test", &results, "2026-09-06", false, .et);
+    defer arena.free(live);
+    try std.testing.expect(!containsBraille(live));
+    const live_html = try homeHtmlLive(arena, "example.test", &results, "2026-09-06", false);
+    defer arena.free(live_html);
+    try std.testing.expect(!containsBraille(live_html));
+    const one_line = try homeOneLineWithZone(arena, &results, false, .et);
+    defer arena.free(one_line);
+    try std.testing.expect(!containsBraille(one_line));
+    _ = try std.unicode.Utf8View.init(live);
+}
