@@ -432,7 +432,6 @@ pub fn homeOneLine(
 /// `homeSections`, the HTML linkifier) own links, spans, and section
 /// breathing and call those for composition, so text and HTML share
 /// every row string.
-
 fn gameIsLive(game: domain.Game) bool {
     return std.mem.eql(u8, game.state, "in");
 }
@@ -2272,6 +2271,41 @@ test "scoreHtml narrow width keeps links and layout" {
     try std.testing.expect(std.mem.indexOf(u8, page, "+1 more") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try expectVisiblePreText(page, board, 40, 2);
+}
+
+test "empty abbreviations emit no team link, text and HTML" {
+    // Name-only athletes (tennis): no abbreviation, so no team page to
+    // point at. The text pointer keeps the game link alone; the HTML
+    // linkifier keeps the game anchor alone. Never a bare `/atp/` href.
+    const board: domain.Scoreboard = .{
+        .league = "atp",
+        .league_name = "ATP",
+        .date = "2026-09-10",
+        .source = "test",
+        .games = &.{.{
+            .id = "182772",
+            .name = "US Open",
+            .starts_at = "2026-09-10T00:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{
+                .{ .id = "3310", .name = "Botic Van De Zandschulp", .abbreviation = "", .score = "0", .winner = false },
+                .{ .id = "2375", .name = "Alexander Zverev", .abbreviation = "", .score = "3", .winner = true },
+            },
+        }},
+    };
+    const body = try text(std.testing.allocator, board, false, null, null);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "game: /atp/182772") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "team:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "team: /atp/") == null);
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/atp/182772\" id=\"game-182772\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "href=\"/atp/\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    _ = try std.unicode.Utf8View.init(page);
 }
 
 test "page style is plaintext: no buttons, pre always scrolls" {

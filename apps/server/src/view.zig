@@ -1008,15 +1008,18 @@ pub fn scoreboardHeading(
     return std.fmt.allocPrint(allocator, "{s}  {s} {s}", .{ league_name, date, zone_tag });
 }
 
-/// Plain-text pointer under each scoreboard game: the first
-/// participant's abbreviation (empty when the game has none). The HTML
-/// renderer turns the status row into a real link instead.
+/// Plain-text pointer under each scoreboard game: the game link always,
+/// plus the first participant's team link only when the game has a
+/// non-empty abbreviation. Name-only athletes (empty abbreviation, e.g.
+/// tennis) emit the game pointer alone — never a bare `/league/` href.
+/// The HTML renderer turns the status row into a real link instead.
 pub fn scoreGameLink(
     allocator: std.mem.Allocator,
     league: []const u8,
     game_id: []const u8,
     first_abbr: []const u8,
 ) ![]u8 {
+    if (first_abbr.len == 0) return std.fmt.allocPrint(allocator, "game: /{s}/{s}", .{ league, game_id });
     return std.fmt.allocPrint(allocator, "game: /{s}/{s}   team: /{s}/{s}", .{ league, game_id, league, first_abbr });
 }
 
@@ -1303,7 +1306,7 @@ test "scoreboard composers hold width and hostile input" {
     try std.testing.expectEqualStrings("game: /mlb/9   team: /mlb/PHI", link);
     const bare = try scoreGameLink(arena, "mlb", "9", "");
     defer arena.free(bare);
-    try std.testing.expectEqualStrings("game: /mlb/9   team: /mlb/", bare);
+    try std.testing.expectEqualStrings("game: /mlb/9", bare);
     try std.testing.expectEqualStrings("1;31", statusAnsi("in") orelse "");
     try std.testing.expectEqualStrings("33", statusAnsi("pre") orelse "");
     try std.testing.expect(statusAnsi("post") == null);
