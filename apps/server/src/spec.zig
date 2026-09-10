@@ -231,6 +231,11 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  ?0 one-line per game, text-only\n" ++
             "  ?art=off strips team-mark art for tofu terminals, anything else art on\n" ++
             "\n" ++
+            "TOUR read-only browser terminal (vendored xterm.js + SSE, no keyboard control)\n" ++
+            "  /{league}/tour live terminal tour, e.g. localhost:8080/mlb/tour\n" ++
+            "  /tour all-leagues terminal tour, e.g. localhost:8080/tour\n" ++
+            "  same frames as ?stream=sse, width follows the terminal, resize refetches\n" ++
+            "\n" ++
             "JSON DIGEST OUTAGES\n" ++
             "  /api/v1/all never 404s or 502s: a failed league is a zero-game board plus its slug in degraded.\n" ++
             "  Zero games with the slug absent from degraded is an off-day; present means outage, retry later.\n" ++

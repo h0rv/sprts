@@ -113,6 +113,24 @@ pub const TeamsRoute = struct {
     league: []const u8,
 };
 
+/// Read-only terminal tour (`/{league}/tour`, plus the all-leagues
+/// `/tour`): the live TUI in a browser via vendored xterm.js fed by the
+/// text SSE stream. Null league is the digest tour (`/all` feed). No date
+/// or size to carry: the page sizes itself from the terminal and
+/// refetches `?stream=sse` on resize. Human-only, always HTML (no JSON
+/// twin — the `/api/v1/` spellings serve the same page). A team
+/// literally abbreviated "tour" is unreachable, like "standings" and
+/// "teams" before it; the serve layer 404s unknown league slugs.
+pub const TourRoute = struct {
+    league: ?[]const u8,
+};
+
+/// Vendored xterm.js assets for the tour page (`/tour-assets/...`):
+/// exact filenames only, anything else stays not_found.
+pub const TourAssetRoute = struct {
+    name: []const u8,
+};
+
 pub const HomeRoute = struct {
     date: ?[]const u8,
     color: ?bool,
@@ -152,6 +170,8 @@ pub const Route = union(enum) {
     date_alias: DateAliasRoute,
     week_alias: WeekAliasRoute,
     standings: StandingsRoute,
+    tour: TourRoute,
+    tour_asset: TourAssetRoute,
     help: HelpRoute,
     openapi,
     docs,
@@ -190,6 +210,8 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/docs")) return .docs;
     if (std.mem.eql(u8, path, "/favicon.svg")) return .favicon;
+    if (std.mem.eql(u8, path, "/tour-assets/xterm.min.js")) return .{ .tour_asset = .{ .name = "xterm.min.js" } };
+    if (std.mem.eql(u8, path, "/tour-assets/xterm.css")) return .{ .tour_asset = .{ .name = "xterm.css" } };
     if (std.mem.eql(u8, path, "/llms.txt")) return .llms;
     if (std.mem.eql(u8, path, "/api/v1/leagues") or std.mem.eql(u8, path, "/api/v1")) return .leagues;
 
@@ -229,7 +251,7 @@ pub fn parse(target: []const u8) Route {
             const seg3 = segment[slash2 + 1 ..];
             const api = std.mem.startsWith(u8, path, api_prefix);
             if (seg2.len > 0 and std.mem.eql(u8, seg3, "today") and
-                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2))
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
             {
                 return .{ .today = .{
                     .league = league,
@@ -296,6 +318,12 @@ pub fn parse(target: []const u8) Route {
         if (isTeamsSegment(segment)) return .{ .teams = .{
             .league = league,
         } };
+        // Terminal tour: caught before the game/team split so the
+        // literal never falls into the team view (no team is abbreviated
+        // "tour", and game ids are digits-only, so the match is exact).
+        if (isTourSegment(segment)) return .{ .tour = .{
+            .league = league,
+        } };
         const sized = .{
             .color = display.color,
             .width = queryUint(queryValue(query, "width")),
@@ -337,6 +365,9 @@ pub fn parse(target: []const u8) Route {
         .quiet = display.quiet,
         .oneline = display.oneline,
     } };
+    // Digest terminal tour: the all-leagues player. Trivial next to the
+    // per-league arm above (one more literal, league null).
+    if (isTourSegment(slug)) return .{ .tour = .{ .league = null } };
     return .{ .scoreboard = .{
         .league = slug,
         .date = day,
@@ -443,6 +474,13 @@ fn isStandingsSegment(segment: []const u8) bool {
 /// Second segment of `/{league}/teams` (and the `/api/v1/` twin).
 fn isTeamsSegment(segment: []const u8) bool {
     return std.ascii.eqlIgnoreCase(segment, "teams");
+}
+
+/// `tour` literal for `/{league}/tour` and the bare `/tour` digest tour
+/// (and the `/api/v1/` twins, which serve the same page — the tour has
+/// no JSON twin). Case-insensitive like standings/teams/help.
+fn isTourSegment(segment: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(segment, "tour");
 }
 
 /// Second segment of `/{league}/:help` or `/{league}/help`.
@@ -1239,4 +1277,53 @@ test "one trailing slash strips pre-parse, root and double slash stay" {
     try std.testing.expect(parse("/mlb//") == .not_found);
     try std.testing.expect(parse("/api/v1/leagues//") == .not_found);
     try std.testing.expect(parse("/mlb/standings/x/") == .not_found);
+}
+
+test "tour routes parse for one league and the digest" {
+    // Per-league player carries the slug verbatim (serve layer 404s
+    // unknown leagues via the league lookup, standings precedent).
+    const league_tour = parse("/mlb/tour").tour;
+    try std.testing.expectEqualStrings("mlb", league_tour.league.?);
+    try std.testing.expectEqualStrings("quidditch", parse("/quidditch/tour").tour.league.?);
+    // Bare /tour is the all-leagues player (null league, `/all` feed).
+    try std.testing.expect(parse("/tour").tour.league == null);
+    // Case-insensitive like standings/teams/help; query ignored; one
+    // trailing slash strips pre-parse like every other route.
+    try std.testing.expect(parse("/mlb/TOUR") == .tour);
+    try std.testing.expect(parse("/TOUR").tour.league == null);
+    try std.testing.expect(parse("/mlb/tour?width=80") == .tour);
+    try std.testing.expect(parse("/mlb/tour/") == .tour);
+    try std.testing.expect(parse("/tour/").tour.league == null);
+    // No JSON twin: the /api/v1/ spellings serve the same HTML page.
+    try std.testing.expect(parse("/api/v1/mlb/tour") == .tour);
+    try std.testing.expect(parse("/api/v1/tour").tour.league == null);
+    // Never a game or a team: digits rule and abbrevs don't reach here.
+    try std.testing.expect(parse("/mlb/tour") != .team);
+    try std.testing.expect(parse("/mlb/tour") != .game);
+    // Deeper paths stay not_found; `tour` never rides the today shortcut
+    // as a team abbrev.
+    try std.testing.expect(parse("/mlb/tour/x") == .not_found);
+    try std.testing.expect(parse("/mlb/tour/today") == .not_found);
+    // Human addresses, so never JSON by address.
+    try std.testing.expect(!isJsonTarget("/mlb/tour"));
+    try std.testing.expect(!isJsonTarget("/tour"));
+}
+
+test "tour assets are exact vendored filenames only" {
+    try std.testing.expect(parse("/tour-assets/xterm.min.js") == .tour_asset);
+    try std.testing.expect(parse("/tour-assets/xterm.css") == .tour_asset);
+    try std.testing.expectEqualStrings("xterm.min.js", parse("/tour-assets/xterm.min.js").tour_asset.name);
+    // Query strings ride along ignored (cache-busting `?v=` still serves).
+    try std.testing.expect(parse("/tour-assets/xterm.min.js?v=1") == .tour_asset);
+    try std.testing.expect(parse("/tour-assets/xterm.css/") == .tour_asset);
+    // Anything else is not an asset: unknown names fall into the team
+    // view like any other second segment (serve layer 404s them).
+    try std.testing.expect(parse("/tour-assets/other.js") == .team);
+    try std.testing.expect(parse("/tour-assets/xterm.js") == .team);
+    // Bare /tour-assets (slash or not) is a (unknown) league slug like
+    // /teams was: the serve layer answers 404 via the league lookup.
+    try std.testing.expect(parse("/tour-assets/") == .scoreboard);
+    // Bare /tour-assets is a (unknown) league slug like /teams was:
+    // the serve layer answers 404 via the league lookup.
+    try std.testing.expect(parse("/tour-assets") == .scoreboard);
 }

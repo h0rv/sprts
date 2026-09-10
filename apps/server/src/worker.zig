@@ -52,6 +52,7 @@ const edge = @import("edge_cache.zig");
 const digest = @import("digest.zig");
 const stream = @import("stream.zig");
 const tz = @import("tz.zig");
+const tour = @import("tour.zig");
 
 const default_base_url = "https://site.api.espn.com/apis/site/v2";
 
@@ -230,6 +231,8 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .date_alias => |route| return serveDateAlias(env, alloc, route, format, zone),
         .week_alias => |route| return serveWeekAlias(env, alloc, route, format),
         .standings => |route| return serveStandings(env, alloc, route, format, zone),
+        .tour => |route| return serveTour(alloc, route, format),
+        .tour_asset => |route| return serveTourAsset(route),
         .teams => |route| return serveTeams(env, alloc, route, format),
     }
 }
@@ -1013,6 +1016,33 @@ fn serveTeams(
     for_stale.setHeader("x-sprts-cache", "stale");
     cache.put(.{ .url = stale_key }, &for_stale);
     return resp;
+}
+
+/// Read-only terminal tour (`/{league}/tour`, `/tour`): same-origin HTML
+/// page loading vendored xterm.js, fed by the text SSE stream. Ignores
+/// content negotiation (curl gets the page too); unknown leagues 404
+/// like the scoreboard. Static render, never written to the edge cache.
+fn serveTour(
+    alloc: std.mem.Allocator,
+    route: router.TourRoute,
+    format: router.Format,
+) !workers.Response {
+    if (route.league) |slug| {
+        const league = core.leagues.find(slug) orelse {
+            return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+        };
+        return staticResponse(try tour.tourHtml(alloc, league.slug), tour.html_content_type, null);
+    }
+    return staticResponse(try tour.tourHtml(alloc, null), tour.html_content_type, null);
+}
+
+/// Vendored xterm.js bytes for the tour page (favicon pattern: own
+/// content type, never the edge cache).
+fn serveTourAsset(route: router.TourAssetRoute) workers.Response {
+    const is_js = std.mem.eql(u8, route.name, "xterm.min.js");
+    const body = if (is_js) tour.xterm_js else tour.xterm_css;
+    const content_type = if (is_js) tour.js_content_type else tour.css_content_type;
+    return staticResponse(body, content_type, null);
 }
 
 fn errorResponse(

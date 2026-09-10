@@ -147,6 +147,8 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  /{league}/{abbr}/today        today's game, redirects to it
         \\  /{league}/standings            current table, no date
         \\  /{league}/teams                 team list as JSON (no text twin: picker payload)
+        \\  /{league}/tour                  live terminal tour in the browser (xterm.js + SSE, read-only)
+        \\  /tour                           all-leagues terminal tour (same player, /all feed)
         \\  /api/v1/leagues                leagues as JSON
         \\  /api/v1/{league}[/{id|abbr}]   same shapes as JSON
         \\  /api/v1/all, .../standings, .../teams  digest, table, and team list as JSON
@@ -206,7 +208,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
-    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /{league}/teams(JSON only) /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
+    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /{league}/teams(JSON only) /{league}/tour /tour /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
     try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
@@ -259,6 +261,8 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, 302 to the game (-N = doubleheader game N; curl -L)" },
             .{ .name = "/{league}/standings", .description = "Current table, no date" },
             .{ .name = "/{league}/teams", .description = "Team list: id, abbrev, name per team. JSON-only (no text twin: picker payload); the human path serves the same JSON body" },
+            .{ .name = "/{league}/tour", .description = "Live terminal tour in the browser: vendored xterm.js fed by the SSE stream, read-only (no keyboard control)" },
+            .{ .name = "/tour", .description = "All-leagues terminal tour, same player on the /all feed" },
             .{ .name = "/api/v1/leagues", .description = "Leagues as JSON" },
             .{ .name = "/api/v1/{league}[/{id|abbr}]", .description = "Same shapes as JSON" },
             .{ .name = "/api/v1/all, .../standings, .../teams", .description = "Digest, table, and team list as JSON" },

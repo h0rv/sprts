@@ -11,6 +11,7 @@ pub const standings_view = @import("standings_view.zig");
 pub const native_cache = @import("native_cache.zig");
 pub const stream = @import("stream.zig");
 pub const digest = @import("digest.zig");
+pub const tour = @import("tour.zig");
 
 test {
     _ = provider;
@@ -26,4 +27,5 @@ test {
     _ = native_cache;
     _ = stream;
     _ = digest;
+    _ = tour;
 }

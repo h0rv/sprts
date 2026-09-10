@@ -526,6 +526,38 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             const extra = cacheHeaders(cache_state);
             try respond(request, body, format, .ok, &extra);
         },
+        .tour => |tour_route| {
+            // Read-only terminal tour: same-origin HTML page loading
+            // vendored xterm.js, fed by the text SSE stream. Ignores
+            // content negotiation (curl gets the page too); unknown
+            // leagues 404 like the scoreboard.
+            if (tour_route.league) |slug| {
+                const league = core.leagues.find(slug) orelse {
+                    status = .not_found;
+                    try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                    return;
+                };
+                status = .ok;
+                try respond(request, try server_app.tour.tourHtml(arena, league.slug), .html, .ok, commonHeaders());
+            } else {
+                status = .ok;
+                try respond(request, try server_app.tour.tourHtml(arena, null), .html, .ok, commonHeaders());
+            }
+        },
+        .tour_asset => |asset| {
+            // Vendored xterm.js bytes with their own content type (not a
+            // Format: respond() only maps text/html/json) — favicon
+            // pattern, long-cache immutable vendor bytes.
+            status = .ok;
+            const is_js = std.mem.eql(u8, asset.name, "xterm.min.js");
+            const body = if (is_js) server_app.tour.xterm_js else server_app.tour.xterm_css;
+            const content_type = if (is_js) server_app.tour.js_content_type else server_app.tour.css_content_type;
+            var asset_headers: [3]std.http.Header = undefined;
+            asset_headers[0] = .{ .name = "content-type", .value = content_type };
+            asset_headers[1] = .{ .name = "cache-control", .value = "public, max-age=86400" };
+            asset_headers[2] = .{ .name = "x-content-type-options", .value = "nosniff" };
+            try request.respond(body, .{ .status = status, .extra_headers = asset_headers[0..] });
+        },
         .teams => |teams_route| {
             // JSON-only endpoint (no text/HTML twin): the team list is a
             // picker payload for JSON clients, and no text table exists
@@ -603,6 +635,8 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .date_alias => |r| std.fmt.allocPrint(arena, "date-alias/{s}/{s}", .{ r.league, r.date }),
         .week_alias => |r| std.fmt.allocPrint(arena, "week-alias/{s}/{s}", .{ r.league, r.season }),
         .standings => |r| std.fmt.allocPrint(arena, "standings/{s}", .{r.league}),
+        .tour => |r| if (r.league) |slug| try std.fmt.allocPrint(arena, "tour/{s}", .{slug}) else arena.dupe(u8, "tour"),
+        .tour_asset => |r| std.fmt.allocPrint(arena, "tour-asset/{s}", .{r.name}),
         .teams => |r| std.fmt.allocPrint(arena, "teams/{s}", .{r.league}),
     };
 }
