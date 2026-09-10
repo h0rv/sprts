@@ -65,9 +65,10 @@ inside game/standings); `b` pops back.
   not a terminal.
 - In the TUI, live boards and live games auto-refresh from the server SSE
   stream (`/{league}?stream=sse`, Accept: `text/event-stream`) while auto is
-  on; anything else polls on refresh. Toggle with `a` (on by default),
-  refresh cadence is 15s. A failed or empty SSE read falls back to plain
-  polling. The one-shot modes never use SSE — they fetch the JSON API once.
+  on; settled boards back off to 60s and standings tick on a slow cadence.
+  Toggle with `a` (on by default), live cadence is 15s. A failed or empty
+  SSE read falls back to plain polling. The one-shot modes never use
+  SSE — they fetch the JSON API once.
 
 ## Config / env
 
