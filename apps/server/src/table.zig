@@ -1020,24 +1020,29 @@ fn hasBraille(line: []const u8) bool {
     return false;
 }
 
-test "hardened battery: interior blank mark rows survive the card" { // MLS ATX xs carries interior empty rows (disconnected logo). The old
-    // inline copy dropped every empty split line, compressing the logo;
-    // the shared path preserves them as blank cells.
+test "hardened battery: interior blank mark rows survive the card" { // Pair choice (2026-09): the MLS ATX/HOU xs marks this test pinned were
+    // legitimately regenerated with NO interior blanks (4 solid rows each),
+    // so they can no longer prove blank preservation. Of all checked-in xs
+    // marks, only the ALCN marks (ncaaf/ncaam/ncaaw) carry an interior blank
+    // line, so this test pairs NCAAF ALCN (blank inside) with NCAAF ALA
+    // (solid). The old inline copy dropped every empty split line,
+    // compressing the logo; the shared path preserves them as blank cells.
+    const league = "ncaaf";
     const board: domain.Scoreboard = .{
-        .league = "mls",
-        .league_name = "MLS",
+        .league = league,
+        .league_name = "NCAAF",
         .date = "2026-09-06",
         .source = "test",
         .games = &.{
             .{
                 .id = "1",
-                .name = "ATX at HOU",
+                .name = "ALCN at ALA",
                 .starts_at = "2026-09-06T17:00Z",
                 .state = "post",
                 .status = "Final",
                 .participants = &.{
-                    .{ .id = "1", .name = "Austin FC", .abbreviation = "ATX", .score = "1", .winner = true },
-                    .{ .id = "2", .name = "Houston Dynamo", .abbreviation = "HOU", .score = "0", .winner = false },
+                    .{ .id = "1", .name = "Alcorn State Braves", .abbreviation = "ALCN", .score = "1", .winner = true },
+                    .{ .id = "2", .name = "Alabama Crimson Tide", .abbreviation = "ALA", .score = "0", .winner = false },
                 },
             },
         },
@@ -1049,65 +1054,82 @@ test "hardened battery: interior blank mark rows survive the card" { // MLS ATX 
     // still hold with color off.
     _ = try std.unicode.Utf8View.init(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
-    // Raw ATX xs rows (minus the file's trailing newline) each surface as
-    // one card row: interior blanks included. ATX and HOU both carry 5
-    // rows, so the 5-line card contains every row of each mark; counting
-    // per-mark matches (blank card rows match both marks' blanks, and
-    // padded short rows are substrings of the card line) proves no row
-    // was dropped rather than asserting an exact line identity.
-    const atx = core.art.teamArt("mls", "ATX", .xs).?;
-    const hou = core.art.teamArt("mls", "HOU", .xs).?;
-    var atx_rows: usize = 0;
-    var split = std.mem.splitScalar(u8, atx, '\n');
-    while (split.next()) |line| {
-        if (split.index == null and line.len == 0) break; // trailing newline
-        atx_rows += 1;
+    // Raw mark rows the way writeGameMarks splits them: every line is a
+    // row, only the file's trailing newline is skipped. Counts are derived
+    // from the data at test time, never hardcoded, so a future
+    // regeneration keeps passing unless the geometry itself changes — and
+    // then it fails HERE with the fresh numbers visible, instead of
+    // tripping over stale literals.
+    const left_mark = core.art.teamArt(league, "ALCN", .xs).?;
+    const right_mark = core.art.teamArt(league, "ALA", .xs).?;
+    var left_rows: std.ArrayList([]const u8) = .empty;
+    defer left_rows.deinit(std.testing.allocator);
+    var lsplit = std.mem.splitScalar(u8, left_mark, '\n');
+    while (lsplit.next()) |line| {
+        if (lsplit.index == null and line.len == 0) break; // trailing newline
+        try left_rows.append(std.testing.allocator, line);
     }
-    var hou_rows: usize = 0;
-    var hsplit = std.mem.splitScalar(u8, hou, '\n');
-    while (hsplit.next()) |line| {
-        if (hsplit.index == null and line.len == 0) break;
-        hou_rows += 1;
+    var right_rows: std.ArrayList([]const u8) = .empty;
+    defer right_rows.deinit(std.testing.allocator);
+    var rsplit = std.mem.splitScalar(u8, right_mark, '\n');
+    while (rsplit.next()) |line| {
+        if (rsplit.index == null and line.len == 0) break;
+        try right_rows.append(std.testing.allocator, line);
     }
-    try std.testing.expectEqual(@as(usize, 5), atx_rows);
-    try std.testing.expectEqual(@as(usize, 5), hou_rows);
-    // Card height is the taller mark: ATX and HOU both carry 5 rows, so
-    // the card has 5 art rows. Row index 2 is blank in BOTH marks (shared
-    // gap), so braille rows = 4 and all-blank art rows = 1: the blank must
-    // still be present as a padded frame row, proving interior blanks are
-    // preserved rather than dropped (the old inline copy dropped them,
-    // compressing the logo vertically).
-    var card_rows: usize = 0;
+    // The test proves something only while the left mark actually has an
+    // interior blank: fail loudly if a future regeneration removes it, so
+    // the next reader knows to pick a new pair rather than silently
+    // asserting nothing.
+    var interior_blanks: usize = 0;
+    for (left_rows.items, 0..) |line, i| {
+        if (line.len == 0 and i > 0 and i + 1 < left_rows.items.len) interior_blanks += 1;
+    }
+    try std.testing.expect(interior_blanks > 0);
+    var left_width: usize = 0;
+    for (left_rows.items) |line| left_width = @max(left_width, countCells(line));
+    var right_width: usize = 0;
+    for (right_rows.items) |line| right_width = @max(right_width, countCells(line));
+    // renderBoard(52) gives inner 50, 48 usable: the pair plus the 2-cell
+    // gap must fit, or writeGameMarks stacks the marks and the per-index
+    // assertions below do not apply.
+    try std.testing.expect(left_width + 2 + right_width <= 48);
+    // Card height is the taller mark: every row of each mark surfaces as
+    // one card row. Collect them in order (braille anywhere on the line:
+    // a side-by-side row with one blank side still carries the other's).
+    var card: std.ArrayList([]const u8) = .empty;
+    defer card.deinit(std.testing.allocator);
     var out_lines = std.mem.splitScalar(u8, output, '\n');
     while (out_lines.next()) |line| {
-        if (hasBraille(line)) card_rows += 1;
+        if (hasBraille(line)) try card.append(std.testing.allocator, line);
     }
-    try std.testing.expectEqual(@as(usize, 4), card_rows);
-    // The shared-blank row renders as an empty line interior to the card
-    // (between art rows): borderless output has no padded frame row, so
-    // the blank survives as breathing room instead of a bordered cell.
-    // The old inline copy dropped it, compressing the logo vertically.
-    // Meaningful check: an empty line with braille on BOTH sides.
-    var prev_was_art = false;
-    var prev_was_blank_after_art = false;
-    var blank_inside = false;
-    out_lines = std.mem.splitScalar(u8, output, '\n');
-    while (out_lines.next()) |line| {
-        if (line.len == 0) {
-            if (prev_was_art) prev_was_blank_after_art = true;
-            prev_was_art = false;
-            continue;
+    try std.testing.expectEqual(@max(left_rows.items.len, right_rows.items.len), card.items.len);
+    for (0..card.items.len) |r| {
+        // Each side's row r renders inside card row r (left field, gap,
+        // right field), so a solid mark row is a byte substring of its own
+        // card row: every row sits at its own index, including the rows
+        // around a blank, rather than shifting up into a dropped blank
+        // (the old inline copy dropped blanks, compressing the logo).
+        if (r < left_rows.items.len and left_rows.items[r].len > 0)
+            try std.testing.expect(std.mem.indexOf(u8, card.items[r], left_rows.items[r]) != null);
+        if (r < right_rows.items.len and right_rows.items[r].len > 0)
+            try std.testing.expect(std.mem.indexOf(u8, card.items[r], right_rows.items[r]) != null);
+        // An interior blank renders as blank cells, not as a dropped row:
+        // the first left_width CELLS of its card row are all spaces. Walk
+        // cells, not bytes — braille is 3 bytes per cell, so a byte prefix
+        // would lie. Under the old dropping behavior this slot holds the
+        // next solid row (braille first) and the walk fails.
+        if (r < left_rows.items.len and left_rows.items[r].len == 0 and r > 0 and r + 1 < left_rows.items.len) {
+            var cells: usize = 0;
+            var bi: usize = 0;
+            while (bi < card.items[r].len and cells < left_width) {
+                const d = decode(card.items[r], bi);
+                try std.testing.expect(d.cp == ' ');
+                cells += cellWidth(d.cp);
+                bi += d.len;
+            }
+            try std.testing.expectEqual(left_width, cells);
         }
-        if (!hasBraille(line)) {
-            prev_was_art = false;
-            prev_was_blank_after_art = false;
-            continue;
-        }
-        if (prev_was_blank_after_art) blank_inside = true;
-        prev_was_art = true;
-        prev_was_blank_after_art = false;
     }
-    try std.testing.expect(blank_inside);
 }
 
 // (hasBraille above; the old inline scan documented the E2 ranges here.)
@@ -1152,7 +1174,6 @@ test "art html band-passes extremes to page ink" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(got);
 }
-
 
 test "degenerate widths cannot wrap or hang" {
     // inner < 2 used to wrap `inner - 2` to ~2^64 (giant write / OOM).
