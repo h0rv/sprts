@@ -363,7 +363,9 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         .date_alias => |alias| {
             // Human game alias, date form: resolve the day (relative tokens
             // ride the request zone via tz.resolveDay, like the scoreboard),
-            // fetch that board fresh, and redirect to the canonical game id.
+            // fetch that board fresh, and redirect to the canonical game id
+            // (alias.n orelse 1 selects among doubleheader same-pair games).
+            // A miss 404s: plain on all-duel days, duel-only hint past them.
             // Fresh-only, no-store, no query carried over (today-arm parity).
             const league = core.leagues.find(alias.league) orelse {
                 status = .not_found;
@@ -377,9 +379,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
                 return;
             };
-            const game = server_app.provider.findGameByMatchup(board, alias.away, alias.home) orelse {
+            const game = server_app.provider.findGameByMatchupN(board, alias.away, alias.home, alias.n orelse 1) orelse {
                 status = .not_found;
-                try respondError(arena, request, "game not found", format, .not_found);
+                const browse = try std.fmt.allocPrint(arena, "/{s}?date={s}", .{ league.slug, day });
+                defer arena.free(browse);
+                try respondError(arena, request, try server_app.provider.aliasMissMessage(arena, board, browse), format, .not_found);
                 return;
             };
             const dest = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id });
@@ -427,9 +431,11 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "game not found", format, .not_found);
                 return;
             }
-            const game = server_app.provider.findGameByMatchup(week_board.board, alias.away, alias.home) orelse {
+            const game = server_app.provider.findGameByMatchupN(week_board.board, alias.away, alias.home, alias.n orelse 1) orelse {
                 status = .not_found;
-                try respondError(arena, request, "game not found", format, .not_found);
+                const browse = try std.fmt.allocPrint(arena, "/{s}?week={d}", .{ league.slug, alias.week });
+                defer arena.free(browse);
+                try respondError(arena, request, try server_app.provider.aliasMissMessage(arena, week_board.board, browse), format, .not_found);
                 return;
             };
             const dest = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id });

@@ -3319,22 +3319,63 @@ fn parseSeasonYear(arena: std.mem.Allocator, body: []const u8) !?u16 {
     };
 }
 
-/// Matchup lookup for the human game aliases: the first game whose two
+/// Matchup lookup for the human game aliases: the Nth game whose two
 /// participants carry non-empty abbreviations matching `away`/`home`,
-/// case-insensitive. Exact away/home order wins first, then the swapped
-/// order; the first board entry wins either way — doubleheaders share the
-/// pair, so the earliest listing is the redirect (documented here, not
-/// disambiguated). Needs two-abbr duels: games without exactly two
-/// participants, or with an empty abbreviation (tennis-style athlete rows),
-/// never match.
-pub fn findGameByMatchup(board: core.domain.Scoreboard, away: []const u8, home: []const u8) ?*const core.domain.Game {
+/// case-insensitive (N = 1 selects the first — the historical
+/// `findGameByMatchup` behavior). Exact away/home order wins first, then
+/// the swapped order; board order wins within each pass, so N counts down
+/// the concatenated [exact..., swapped...] list — doubleheaders share the
+/// pair, and `/{league}/{date}/{away}-{home}-2` is the second listing.
+/// N of 0, or past the last same-pair game, misses (the caller 404s).
+/// Needs two-abbr duels: games without exactly two participants, or with
+/// an empty abbreviation (tennis-style athlete rows, and every bout, race
+/// field, and tournament field), never match — see `boardHasNonDuels`.
+pub fn findGameByMatchupN(board: core.domain.Scoreboard, away: []const u8, home: []const u8, n: u16) ?*const core.domain.Game {
+    if (n == 0) return null;
+    var seen: usize = 0;
     for (board.games) |*game| {
-        if (isDuel(game, away, home)) return game;
+        if (!isDuel(game, away, home)) continue;
+        seen += 1;
+        if (seen == n) return game;
     }
     for (board.games) |*game| {
-        if (isDuel(game, home, away)) return game;
+        if (!isDuel(game, home, away)) continue;
+        seen += 1;
+        if (seen == n) return game;
     }
     return null;
+}
+
+/// First-wins matchup lookup (the bare `/{league}/{date}/{away}-{home}`
+/// form): N = 1 of `findGameByMatchupN`.
+pub fn findGameByMatchup(board: core.domain.Scoreboard, away: []const u8, home: []const u8) ?*const core.domain.Game {
+    return findGameByMatchupN(board, away, home, 1);
+}
+
+/// True when the board carries at least one event no abbr pair can ever
+/// match: anything but a two-participant game with both abbreviations set
+/// (fight cards, race sessions, tournament fields, athlete duels). The
+/// alias miss message uses this to tell a duel-only dead end apart from a
+/// typo'd pair on an all-duel day.
+pub fn boardHasNonDuels(board: core.domain.Scoreboard) bool {
+    for (board.games) |*game| {
+        if (game.participants.len != 2) return true;
+        if (game.participants[0].abbreviation.len == 0) return true;
+        if (game.participants[1].abbreviation.len == 0) return true;
+    }
+    return false;
+}
+
+/// 404 body for a human game alias that matched nothing. Plain
+/// "game not found" on all-duel days (likely a typo'd pair); when the
+/// board also carries cards, races, or tournaments — events without
+/// abbreviations, so no abbr pair can ever match them — the message says
+/// the aliases are duel-only and points at the day board for the event id.
+/// `browse` is the caller's board address (`/{slug}?date={day}` for the
+/// date form, `/{slug}?week={N}` for the week form).
+pub fn aliasMissMessage(arena: std.mem.Allocator, board: core.domain.Scoreboard, browse: []const u8) ![]u8 {
+    if (!boardHasNonDuels(board)) return arena.dupe(u8, "game not found");
+    return std.fmt.allocPrint(arena, "game not found; aliases match two team abbreviations only — cards, races, and tournaments have none, browse {s} for the event id", .{browse});
 }
 
 fn isDuel(game: *const core.domain.Game, first: []const u8, second: []const u8) bool {
@@ -3490,6 +3531,183 @@ test "findGameByMatchup first wins on doubleheaders" {
     };
     try std.testing.expectEqualStrings("first", findGameByMatchup(board, "min", "det").?.id);
     try std.testing.expectEqualStrings("first", findGameByMatchup(board, "det", "min").?.id);
+}
+
+test "findGameByMatchupN disambiguates doubleheaders, out-of-range misses" {
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "first",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "second",
+                .name = "",
+                .starts_at = "2026-09-09T20:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    // Absent suffix is 1 (the bare lookup delegates): first listing wins.
+    try std.testing.expectEqualStrings("first", findGameByMatchupN(board, "min", "det", 1).?.id);
+    try std.testing.expectEqualStrings("first", findGameByMatchup(board, "min", "det").?.id);
+    // -2 selects the second game; -3 on a 2-game day misses (caller 404s).
+    try std.testing.expectEqualStrings("second", findGameByMatchupN(board, "min", "det", 2).?.id);
+    try std.testing.expect(findGameByMatchupN(board, "min", "det", 3) == null);
+    // Swapped order rides the same numbering (exact pass first).
+    try std.testing.expectEqualStrings("first", findGameByMatchupN(board, "det", "min", 1).?.id);
+    try std.testing.expectEqualStrings("second", findGameByMatchupN(board, "det", "min", 2).?.id);
+    try std.testing.expect(findGameByMatchupN(board, "det", "min", 3) == null);
+    // N of 0 misses; unknown pairs miss at every N.
+    try std.testing.expect(findGameByMatchupN(board, "min", "det", 0) == null);
+    try std.testing.expect(findGameByMatchupN(board, "nyy", "bos", 1) == null);
+    try std.testing.expect(findGameByMatchupN(board, "nyy", "bos", 2) == null);
+}
+
+test "findGameByMatchupN counts exact before swapped" {
+    // Mixed listing order: the swapped-order game boards first, but the
+    // exact pass still wins N = 1, and N = 2 falls to the swapped pass.
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "listed-first",
+                .name = "",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "5", .winner = true },
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "2", .winner = false },
+                },
+            },
+            .{
+                .id = "listed-second",
+                .name = "",
+                .starts_at = "2026-09-09T20:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "a", .name = "Minnesota Twins", .abbreviation = "MIN", .score = "", .winner = false },
+                    .{ .id = "h", .name = "Detroit Tigers", .abbreviation = "DET", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings("listed-second", findGameByMatchupN(board, "min", "det", 1).?.id);
+    try std.testing.expectEqualStrings("listed-first", findGameByMatchupN(board, "min", "det", 2).?.id);
+    try std.testing.expect(findGameByMatchupN(board, "min", "det", 3) == null);
+}
+
+test "boardHasNonDuels separates cards and fields from duel days" {
+    // All-duel day: every game is two abbr'd participants.
+    try std.testing.expect(!boardHasNonDuels(matchupBoard()));
+    // Empty board is all-duel (plain miss, no hint).
+    const empty: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{},
+    };
+    try std.testing.expect(!boardHasNonDuels(empty));
+    // Fight card: one 2-athlete bout with empty abbreviations.
+    const card: core.domain.Scoreboard = .{
+        .league = "ufc",
+        .league_name = "UFC",
+        .date = "2026-09-05",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401913130",
+                .name = "UFC Fight Night: Hooker vs. Parnasse",
+                .starts_at = "2026-09-05T22:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Sofia Montenegro", .abbreviation = "", .score = "", .winner = true },
+                    .{ .id = "b", .name = "Delphine Benouaich", .abbreviation = "", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expect(boardHasNonDuels(card));
+    try std.testing.expect(findGameByMatchupN(card, "sof", "del", 1) == null);
+    // Race field: twenty athletes, no abbreviations.
+    const field: core.domain.Scoreboard = .{
+        .league = "f1",
+        .league_name = "F1",
+        .date = "2025-09-07",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401737814",
+                .name = "Pirelli Italian Grand Prix",
+                .starts_at = "2025-09-07T13:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "#1", .winner = true },
+                    .{ .id = "b", .name = "Lando Norris", .abbreviation = "", .score = "#2", .winner = false },
+                    .{ .id = "c", .name = "Oscar Piastri", .abbreviation = "", .score = "#3", .winner = false },
+                },
+            },
+        },
+    };
+    try std.testing.expect(boardHasNonDuels(field));
+    try std.testing.expect(findGameByMatchupN(field, "ver", "nor", 1) == null);
+}
+
+test "aliasMissMessage hints the board only past duels" {
+    const arena = std.testing.allocator;
+    // All-duel day: the historical plain miss, unchanged.
+    const plain = try aliasMissMessage(arena, matchupBoard(), "/mlb?date=2026-09-09");
+    defer arena.free(plain);
+    try std.testing.expectEqualStrings("game not found", plain);
+    // Fight-card day: duel-only note plus the browse address.
+    const card: core.domain.Scoreboard = .{
+        .league = "ufc",
+        .league_name = "UFC",
+        .date = "2026-09-05",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "401913130",
+                .name = "UFC Fight Night: Hooker vs. Parnasse",
+                .starts_at = "2026-09-05T22:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Sofia Montenegro", .abbreviation = "", .score = "", .winner = true },
+                    .{ .id = "b", .name = "Delphine Benouaich", .abbreviation = "", .score = "", .winner = false },
+                },
+            },
+        },
+    };
+    const hinted = try aliasMissMessage(arena, card, "/ufc?date=2026-09-05");
+    defer arena.free(hinted);
+    try std.testing.expect(std.mem.indexOf(u8, hinted, "game not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hinted, "two team abbreviations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hinted, "/ufc?date=2026-09-05") != null);
 }
 
 const week_alias_fixture =

@@ -62,22 +62,31 @@ pub const TodayRoute = struct {
 /// (lowercase abbrevs, e.g. `/mlb/2026-09-09/min-det`; the relative tokens
 /// `today|tomorrow|yesterday` ride too). Redirects to the canonical
 /// `/{league}/{id}` — never renders, no `/api/v1/` twin (JSON keeps ids).
+/// A doubleheader (same pair twice one day) takes an optional `-N` suffix
+/// (`/{league}/{date}/{away}-{home}-2`): 1-based among same-pair games in
+/// board order, 1 = first; absent is 1 (current behavior). Out-of-range N
+/// misses at lookup (404); malformed suffixes stay not_found here.
 pub const DateAliasRoute = struct {
     league: []const u8,
     date: []const u8,
     away: []const u8,
     home: []const u8,
+    /// Doubleheader game number, 1-based (null = absent = first).
+    n: ?u16 = null,
 };
 
 /// Human game alias, week form (football only — the serve layer gates on
 /// the league sport): `/{league}/{YYYY}/week{N}/{away}-{home}`, e.g.
 /// `/nfl/2026/week1/ne-sea`. Redirects like the date form, no twin.
+/// Same optional `-N` doubleheader suffix as the date form.
 pub const WeekAliasRoute = struct {
     league: []const u8,
     season: []const u8,
     week: u16,
     away: []const u8,
     home: []const u8,
+    /// Doubleheader game number, 1-based (null = absent = first).
+    n: ?u16 = null,
 };
 
 /// Standings tab (`/{league}/standings`, plaintextsports parity with the
@@ -205,8 +214,8 @@ pub fn parse(target: []const u8) Route {
                 } };
             }
             // Human game aliases (human URLs only — no /api/v1/ twins,
-            // JSON keeps ids): date form `/{league}/{date}/{away}-{home}`
-            // and football week form `/{league}/{YYYY}/week{N}/{matchup}`.
+            // JSON keeps ids): date form `/{league}/{date}/{away}-{home}[-N]`
+            // and football week form `/{league}/{YYYY}/week{N}/{matchup}[-N]`.
             // Anything else stays not_found.
             if (!api) {
                 if (isAliasDate(seg2)) {
@@ -216,6 +225,7 @@ pub fn parse(target: []const u8) Route {
                             .date = seg2,
                             .away = matchup.away,
                             .home = matchup.home,
+                            .n = matchup.n,
                         } };
                     }
                 } else if (isSeason(seg2)) {
@@ -230,6 +240,7 @@ pub fn parse(target: []const u8) Route {
                                     .week = week,
                                     .away = matchup.away,
                                     .home = matchup.home,
+                                    .n = matchup.n,
                                 } };
                             }
                         }
@@ -342,14 +353,39 @@ fn parseWeekSegment(s: []const u8) ?u16 {
     return n;
 }
 
-/// `{away}-{home}` duel: exactly one `-`, both sides 1-8 ASCII alnum.
-fn parseMatchup(s: []const u8) ?struct { away: []const u8, home: []const u8 } {
+/// `{away}-{home}` duel, plus the optional doubleheader suffix
+/// `{away}-{home}-{N}` (N = 1-99, strict positive like week/width/height).
+/// Abbrevs are dashless 1-8 ASCII alnum, so the split is unambiguous: two
+/// parts is the plain duel, three parts with an all-digit tail is the Nth
+/// same-pair game. Anything else (no dash, empty side, long/non-alnum
+/// side, bad N like `-0`/`-100`/`-x`, four parts) stays not_found.
+fn parseMatchup(s: []const u8) ?struct { away: []const u8, home: []const u8, n: ?u16 } {
     const dash = std.mem.indexOfScalar(u8, s, '-') orelse return null;
-    if (std.mem.indexOfScalar(u8, s[dash + 1 ..], '-') != null) return null;
     const away = s[0..dash];
-    const home = s[dash + 1 ..];
-    if (!isAliasAbbr(away) or !isAliasAbbr(home)) return null;
-    return .{ .away = away, .home = home };
+    const rest = s[dash + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '-')) |dash2| {
+        const home = rest[0..dash2];
+        const tail = rest[dash2 + 1 ..];
+        if (std.mem.indexOfScalar(u8, tail, '-') != null) return null;
+        if (!isAliasAbbr(away) or !isAliasAbbr(home)) return null;
+        const n = parseGameNumber(tail) orelse return null;
+        return .{ .away = away, .home = home, .n = n };
+    }
+    if (!isAliasAbbr(away) or !isAliasAbbr(rest)) return null;
+    return .{ .away = away, .home = rest, .n = null };
+}
+
+/// Doubleheader game number: all digits, fits u16, 1-99 (week parity).
+/// Anything else is not a suffix (the matchup stays not_found).
+fn parseGameNumber(s: []const u8) ?u16 {
+    if (s.len == 0 or s.len > 2) return null;
+    var n: u16 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    if (n < 1 or n > 99) return null;
+    return n;
 }
 
 fn isAliasAbbr(s: []const u8) bool {
@@ -834,6 +870,41 @@ test "week alias parses season, week, and matchup, human only" {
     try std.testing.expect(parse("/nfl/2026/week1") == .not_found);
     try std.testing.expect(parse("/nfl/2026/week1/ne-sea/x") == .not_found);
     try std.testing.expect(parse("/nfl/2026/ne-sea") == .not_found);
+}
+
+test "alias game-number suffix parses on both forms, human only" {
+    // Date form: -2 selects the second same-pair game, absent stays null
+    // (= first, current behavior).
+    const dated = parse("/mlb/2026-09-09/min-det-2").date_alias;
+    try std.testing.expectEqualStrings("min", dated.away);
+    try std.testing.expectEqualStrings("det", dated.home);
+    try std.testing.expect(dated.n.? == 2);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det").date_alias.n == null);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-1").date_alias.n.? == 1);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-99").date_alias.n.? == 99);
+    // Rides the relative tokens like the plain duel.
+    try std.testing.expect(parse("/mlb/today/min-det-2").date_alias.n.? == 2);
+    // Week form carries the same suffix.
+    const week = parse("/nfl/2026/week1/ne-sea-2").week_alias;
+    try std.testing.expect(week.week == 1);
+    try std.testing.expectEqualStrings("ne", week.away);
+    try std.testing.expect(week.n.? == 2);
+    try std.testing.expect(parse("/nfl/2026/week1/ne-sea").week_alias.n == null);
+    // No /api/v1/ twins for the suffixed shapes either.
+    try std.testing.expect(parse("/api/v1/mlb/2026-09-09/min-det-2") == .not_found);
+    try std.testing.expect(parse("/api/v1/nfl/2026/week1/ne-sea-2") == .not_found);
+    // Bad suffixes stay not_found: N of 0/100, non-digit tails, empty
+    // tails, extra dashes, and bad abbrevs alongside a good suffix.
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-0") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-100") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-x") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-2x") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det-2-3") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/min--det-2") == .not_found);
+    try std.testing.expect(parse("/mlb/2026-09-09/-det-2") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/ne-sea-0") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/ne-sea-100") == .not_found);
 }
 
 test "stream flag parses query values and Accept header" {
