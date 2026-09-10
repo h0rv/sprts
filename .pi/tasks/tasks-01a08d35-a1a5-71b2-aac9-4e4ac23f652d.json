@@ -1,0 +1,38 @@
+{
+  "nextId": 4,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Create nflverse source module",
+      "description": "Create apps/server/src/nflverse.zig (Source vtable, CSV parse, snapshot store, policy, tests), export from root.zig",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789075744149,
+      "updatedAt": 1789076214716
+    },
+    {
+      "id": "2",
+      "subject": "Wire fallback into provider and serve path",
+      "description": "Wire fallback into provider.zig (fetchBoard, EspnSource, fetchAllCached today) and main.zig (env, snapshot lifetime, today threading) with integration tests",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789075746248,
+      "updatedAt": 1789076436919
+    },
+    {
+      "id": "3",
+      "subject": "Attribution, sidecar script, tests, commit",
+      "description": "Attribution in help.zig + spec.zig, tools/fetch-nflverse script, .gitignore data/, run tests, commit in worktree, report SHA",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789075751502,
+      "updatedAt": 1789076550824
+    }
+  ]
+}

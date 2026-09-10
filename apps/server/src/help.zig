@@ -190,6 +190,13 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         try w.writeAll(league.slug);
     }
     try w.writeAll("\n");
+    try section(w, "SOURCES", color);
+    try w.writeAll(
+        \\  live scores: ESPN scoreboard (site.api.espn.com)
+        \\  NFL offseason/history: nflverse games.csv snapshot (CC-BY-4.0, github.com/nflverse/nflverse-data), refreshed daily in-season, not live
+        \\  every board names its source; snapshot boards are never live and never carry betting odds
+        \\
+    );
     try section(w, "INSTALL", color);
     try w.writeAll("  install -m755 tools/sprts ~/.local/bin/sprts\n");
     try section(w, "EXAMPLES", color);
@@ -293,7 +300,7 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "art=off", .description = "Strip team-mark art for tofu terminals; anything else art on" },
             .{ .name = "precedence", .description = "Long flags win over aliases; later alias wins" },
         },
-        .links = "Text rows print human game:/team: links (/{league}/{date}/{slug}); HTML makes them clickable; numeric ids still resolve (legacy). Boards end with prev/next ?date= links.",
+        .links = "Text rows print human game:/team: links (/{league}/{date}/{slug}); HTML makes them clickable; numeric ids still resolve (legacy). Boards end with prev/next ?date= links. NFL history/offseason via nflverse games.csv (CC-BY-4.0, github.com/nflverse/nflverse-data): snapshot boards name their source.",
         .install = "install -m755 tools/sprts ~/.local/bin/sprts",
         .examples = &[_][]const u8{
             "curl localhost:8080/mlb",
@@ -487,6 +494,10 @@ test "help text documents every route, flag, alias, install, and example" {
         "curl localhost:8080/nfl/standings",
         "mlb",
         "Code: ",
+        "SOURCES",
+        "nflverse",
+        "CC-BY-4.0",
+        "never carry betting odds",
     }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, output, token) != null);
     }
@@ -590,9 +601,12 @@ test "help JSON parses with routes, flags, links, install, and examples" {
         }
         try std.testing.expect(found);
     }
-    // Game/team links and prev/next date nav ride the links field.
+    // Game/team links and prev/next date nav ride the links field, plus
+    // the nflverse attribution for snapshot-filled NFL boards.
     try std.testing.expect(std.mem.indexOf(u8, root.get("links").?.string, "game:") != null);
     try std.testing.expect(std.mem.indexOf(u8, root.get("links").?.string, "prev/next") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root.get("links").?.string, "nflverse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root.get("links").?.string, "CC-BY-4.0") != null);
     // Digest and standings examples stay in parity with the text page.
     var saw_all = false;
     var saw_standings = false;

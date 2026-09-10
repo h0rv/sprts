@@ -9,11 +9,17 @@ pub fn main(init: std.process.Init) !void {
     const port_text = init.environ_map.get("PORT") orelse init.environ_map.get("SPRTS_PORT") orelse "8080";
     const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidPort;
     const base_url = init.environ_map.get("SPRTS_ESPN_BASE_URL") orelse "https://site.api.espn.com/apis/site/v2";
+    // nflverse snapshot directory (`games.csv` + `timestamp.txt`, refreshed
+    // by tools/fetch-nflverse or any same-shape cron). Missing/unreadable
+    // degrades to ESPN-only; it never fails a request.
+    const nflverse_dir = init.environ_map.get("SPRTS_NFLVERSE_DIR") orelse "data/nflverse";
     const address = try std.Io.net.IpAddress.parse(host, port);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
     std.log.info("listening on http://{s}:{d}", .{ host, listener.socket.address.getPort() });
-    const adapter: server_app.provider.EspnAdapter = .{ .allocator = allocator, .io = io, .base_url = base_url };
+    var nv_source = server_app.nflverse.NflverseSource.init(allocator, io, nflverse_dir);
+    defer nv_source.deinit();
+    const adapter: server_app.provider.EspnAdapter = .{ .allocator = allocator, .io = io, .base_url = base_url, .nflverse = &nv_source };
     var cache = server_app.native_cache.NativeCache.init(allocator, io, server_app.native_cache.realClock);
     defer cache.deinit();
     var subscriber_counts = server_app.stream.Subscribers.init(allocator);
@@ -140,7 +146,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             // with the live/final TTL split, not 20 fresh upstream
             // fetches per hit. Outages degrade to links (null boards).
             const day = try server_app.tz.resolveDay(arena, home_route.date, now_s, zone);
-            const boards = try adapter.fetchAllCached(arena, cache, day, cache.now());
+            const today = try server_app.tz.resolveDay(arena, null, now_s, zone);
+            const boards = try adapter.fetchAllCached(arena, cache, day, today, cache.now());
             const color = home_route.color orelse color_default;
             const body = switch (format) {
                 .text => if (home_route.oneline)
@@ -181,6 +188,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             const slug = try core.cache.canonicalSlug(arena, league.slug);
             const day = try server_app.tz.resolveDay(arena, score_route.date, now_s, zone);
+            const today = try server_app.tz.resolveDay(arena, null, now_s, zone);
             // SSE is a text-only progressive render: JSON and HTML shape a
             // document, not a redraw loop. Header- or query-triggered stream
             // requests on those formats get the normal single response.
@@ -232,7 +240,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             // TTL variants resolve inside getOrFetchBoard: liveness is only
             // known post-fetch, so both the live (10s) and final (30s)
             // entries are probed before fetching.
-            var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
+            var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day, .today = today };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
             const cached = cache.getOrFetchBoard(arena, slug, day, cache.now(), &fetch_ctx, fetchBoardPayload) catch |err| {
                 upstream_ms = elapsedMs(start, io);
@@ -259,9 +267,10 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         .all => |all_route| {
             status = .ok;
             const day = try server_app.tz.resolveDay(arena, all_route.date, now_s, zone);
+            const today = try server_app.tz.resolveDay(arena, null, now_s, zone);
             // Shared fan-out with home: same per-league cache entries,
             // fetch-once-per-window across home/board/digest.
-            const results = try adapter.fetchAllCached(arena, cache, day, cache.now());
+            const results = try adapter.fetchAllCached(arena, cache, day, today, cache.now());
             var sections = try arena.alloc(server_app.digest.DigestSection, results.len);
             for (results, 0..) |result, i| sections[i] = .{ .league = result.league, .board = result.board };
             cache_state = "n/a";
@@ -741,7 +750,7 @@ fn elapsedMs(start: std.Io.Clock.Timestamp, io: std.Io) i64 {
 /// Upstream fetch adapters for the cache: each returns one normalized
 /// payload, which `getOrFetch` stores on success. Render flags are applied
 /// after the lookup, so they never enter the key.
-const BoardFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, day: []const u8 };
+const BoardFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, day: []const u8, today: []const u8 };
 const DetailFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, id: []const u8 };
 const TeamFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, abbr: []const u8 };
 const StandingsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League };
@@ -749,7 +758,7 @@ const TeamsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league:
 
 fn fetchBoardPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {
     const c: *BoardFetchCtx = @ptrCast(@alignCast(ctx));
-    return .{ .board = try c.adapter.fetch(arena, c.league, c.day) };
+    return .{ .board = try c.adapter.fetchBoard(arena, c.league, c.day, c.today) };
 }
 
 fn fetchDetailPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {

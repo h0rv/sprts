@@ -84,7 +84,8 @@ pub const ApiSpec = z.Spec(.{
             "board with its slug in the top-level degraded list (zero games plus absent-from-degraded " ++
             "means off-day; present means outage, retry later; see digest.DigestJson). " ++
             "Game starts_at is UTC ISO-8601; text/HTML headings name the request zone (default ET). " ++
-            "The source field names the upstream host (normally site.api.espn.com). " ++
+            "The source field names the upstream host (normally site.api.espn.com; " ++
+            "NFL offseason/history can fall back to an nflverse snapshot, which the source names). " ++
             "Date-driven only (?date=YYYY-MM-DD, defaults to today); week is NOT fanned out.",
         .query = AllQuery,
         .responses = .{
@@ -103,7 +104,8 @@ pub const ApiSpec = z.Spec(.{
             "Pass ?seasontype=T with ?week=N for the season type (1=preseason, 2=regular, 3=postseason; strict 1-4, football only): " ++
             "preseason and playoff weeks are unreachable without it, ESPN defaults an untyped week to the regular season. " ++
             "JSON Scoreboard: game starts_at is UTC ISO-8601 while text/HTML headings name the request " ++
-            "zone (default ET); source names the upstream host (normally site.api.espn.com).",
+            "zone (default ET); source names the upstream host (normally site.api.espn.com; " ++
+            "NFL offseason/history can fall back to an nflverse snapshot, which the source names).",
         .path = ScoreboardPath,
         .query = ScoreboardQuery,
         .responses = .{
@@ -256,6 +258,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  starts_at is UTC ISO-8601; text and HTML headings name the request zone, default ET.\n" ++
             "  no ?date= means today in the request zone (ET unless ?tz= overrides): that ET date can be yesterday where you are, so pin ?date=YYYY-MM-DD to compare days.\n" ++
             "  source is the upstream host, normally site.api.espn.com.\n" ++
+            "  NFL offseason/history can fall back to an nflverse snapshot (source names it).\n" ++
             "\n" ++
             "EXAMPLES\n" ++
             "  curl localhost:8080/mlb\n" ++

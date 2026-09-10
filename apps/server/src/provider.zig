@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("sprts_core");
 const espn = @import("espn_client");
+const nflverse = @import("nflverse.zig");
 const edge_cache = @import("edge_cache.zig");
 const native_cache = @import("native_cache.zig");
 
@@ -21,6 +22,11 @@ pub const EspnAdapter = struct {
     /// instead of hanging the connection). Injected `transport` fakes
     /// ignore it. Zero disables the watchdog.
     upstream_timeout_ms: u64 = 5000,
+    /// nflverse snapshot secondary for the NFL fallback (`fetchBoard`).
+    /// Null (the default, and every non-NFL league regardless) keeps the
+    /// adapter ESPN-only; the snapshot instance is shared across
+    /// connections (it carries its own mutex + store).
+    nflverse: ?*nflverse.NflverseSource = null,
 
     pub fn today(self: EspnAdapter, arena: std.mem.Allocator) ![]u8 {
         return core.date.todayFromEpoch(arena, self.clock(self.io));
@@ -38,6 +44,47 @@ pub const EspnAdapter = struct {
     pub fn fetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) !core.domain.Scoreboard {
         return self.fetchWeek(arena, league, day, null, null);
     }
+
+    /// ESPN primary with nflverse fallback (FALLBACK-NOT-MERGE; see
+    /// `nflverse.zig`): leagues with an `espn_only` preference, or any
+    /// league when no snapshot is attached, behave exactly like `fetch`.
+    /// Otherwise a transport error or a 200-with-0-events board off-today
+    /// serves the snapshot wholesale; authoritative 404s
+    /// (`core.isNotFound`) never fall back, and with no snapshot for the
+    /// day the original ESPN result/error stands. Snapshot boards are
+    /// never live, so the cache stores them under the final TTL variant
+    /// automatically; their `source` names nflverse. `today` is the
+    /// request-zone calendar day (ESPN stays authoritative for today).
+    /// Detail enrichment and the `?week=`/`?seasontype=` selector boards
+    /// (explicit ESPN addresses) plus the text SSE feed (live-oriented)
+    /// stay ESPN-only and bypass this.
+    pub fn fetchBoard(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8, today_day: []const u8) !core.domain.Scoreboard {
+        const snapshot = if (nflverse.preferenceFor(league.slug) == .espn_then_nflverse) self.nflverse else null;
+        if (snapshot == null) return self.fetch(arena, league, day);
+        const espn_board = self.fetch(arena, league, day) catch |err| {
+            if (core.isNotFound(err)) return err;
+            if (try snapshot.?.boardForDay(arena, league, day)) |fallback| return fallback;
+            return err;
+        };
+        return nflverse.pickBoard(espn_board, day, today_day, try snapshot.?.boardForDay(arena, league, day));
+    }
+
+    /// `nflverse.Source` over this adapter with a baked-in today: the
+    /// per-request primary behind the cache seams. The secondary rides
+    /// `self.nflverse`; the fallback policy lives in `fetchBoard`.
+    pub const EspnSource = struct {
+        adapter: *const EspnAdapter,
+        today_day: []const u8,
+
+        pub fn asSource(self: *EspnSource) nflverse.Source {
+            return .{ .ptr = self, .fetchBoardFn = dispatch };
+        }
+
+        fn dispatch(ptr: *anyopaque, arena: std.mem.Allocator, league: *const core.leagues.League, day: []const u8) anyerror!?core.domain.Scoreboard {
+            const self: *EspnSource = @ptrCast(@alignCast(ptr));
+            return @as(?core.domain.Scoreboard, try self.adapter.fetchBoard(arena, league, day, self.today_day));
+        }
+    };
 
     /// Football boards resolve weeks, not dates (verified live 2026-09-10:
     /// `?dates=` alone returns an empty slate even mid-season, and `?dates=`
@@ -130,13 +177,15 @@ pub const EspnAdapter = struct {
     /// clones, miss payloads), so callers must NOT `releaseAll` — `store`
     /// stays null. Sequential: the request arena is not thread-safe, and
     /// warm hits do no I/O, so threads buy nothing here (`fetchAll` keeps
-    /// them for the uncached worker path).
-    pub fn fetchAllCached(self: EspnAdapter, arena: std.mem.Allocator, cache: *native_cache.NativeCache, day: []const u8, at: i64) ![]LeagueResult {
+    /// them for the uncached worker path). `today` is the request-zone
+    /// calendar day feeding the NFL fallback (`fetchBoard`); with no
+    /// snapshot attached every league stays ESPN-only.
+    pub fn fetchAllCached(self: EspnAdapter, arena: std.mem.Allocator, cache: *native_cache.NativeCache, day: []const u8, today_day: []const u8, at: i64) ![]LeagueResult {
         const results = try arena.alloc(LeagueResult, core.leagues.all.len);
         for (&core.leagues.all, 0..) |*league, i| {
             results[i] = .{ .league = league };
             const slug = try core.cache.canonicalSlug(arena, league.slug);
-            var ctx = BoardCacheCtx{ .adapter = self, .league = league, .day = day };
+            var ctx = BoardCacheCtx{ .adapter = self, .league = league, .day = day, .today_day = today_day };
             if (cache.getOrFetchBoard(arena, slug, day, at, &ctx, fetchBoardCached)) |cached| {
                 results[i].board = cached.data.board;
             } else |_| {
@@ -172,12 +221,14 @@ fn fetchOne(args: *const FetchArgs) void {
 
 /// Upstream seam for `fetchAllCached`: one normalized board payload per
 /// league, stored by `getOrFetchBoard` under its content-derived TTL
-/// variant (live 10s / final 30s).
-const BoardCacheCtx = struct { adapter: EspnAdapter, league: *const core.leagues.League, day: []const u8 };
+/// variant (live 10s / final 30s). Runs the ESPN+nflverse fallback
+/// (`fetchBoard`), so fan-out and the single-board route share one
+/// policy; snapshot boards are never live and land on the final variant.
+const BoardCacheCtx = struct { adapter: EspnAdapter, league: *const core.leagues.League, day: []const u8, today_day: []const u8 };
 
 fn fetchBoardCached(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!native_cache.Data {
     const c: *BoardCacheCtx = @ptrCast(@alignCast(ctx));
-    return .{ .board = try c.adapter.fetch(arena, c.league, c.day) };
+    return .{ .board = try c.adapter.fetchBoard(arena, c.league, c.day, c.today_day) };
 }
 
 const Endpoint = struct { sport: []const u8, league: []const u8 };
@@ -857,6 +908,157 @@ test "fetchAll degrades to null boards instead of failing" {
     for (results) |result| try std.testing.expect(result.board == null);
 }
 
+// --- nflverse fallback (fixtures: inline CSV + inline ESPN JSON; no network) ---
+//
+// The snapshot below boards 2024-09-05 (final) and 2024-09-15 (unplayed);
+// every other day is a snapshot miss, exercising the no-fallback paths.
+
+const fallback_csv =
+    \\game_id,season,game_type,week,gameday,weekday,gametime,away_team,away_score,home_team,home_score,espn
+    \\2024_01_KC_BAL,2024,REG,1,2024-09-05,Thursday,20:20,KC,27,BAL,20,401671889
+    \\2024_02_KC_CIN,2024,REG,2,2024-09-15,Sunday,16:25,KC,,CIN,,401671901
+;
+
+const fallback_live_espn =
+    \\{"events":[{"id":"401671889","name":"Kansas City Chiefs at Baltimore Ravens","date":"2024-09-05T20:20Z","status":{"type":{"state":"in","shortDetail":"Q3 4:12"}},"competitions":[{"id":"401671889","date":"2024-09-05T20:20Z","status":{"type":{"state":"in","shortDetail":"Q3 4:12"}},"competitors":[{"homeAway":"away","score":"20","winner":false,"team":{"id":"12","displayName":"Kansas City Chiefs","abbreviation":"KC"}},{"homeAway":"home","score":"17","winner":false,"team":{"id":"33","displayName":"Baltimore Ravens","abbreviation":"BAL"}}]}]}]}
+;
+
+fn fallbackAdapter(fake_transport: espn.HttpTransport, snapshot: ?*nflverse.NflverseSource, threaded: *std.Io.Threaded) EspnAdapter {
+    return .{
+        .allocator = std.testing.allocator,
+        .io = threaded.io(),
+        .base_url = "https://example.test/base",
+        .transport = fake_transport,
+        .clock = fakeClock,
+        .nflverse = snapshot,
+    };
+}
+
+test "fetchBoard falls back to the snapshot on transport error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FailingTransport{};
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    // Off-today error: the snapshot fills the board wholesale with an
+    // honest source label and the ESPN join id.
+    const board = try adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05", "2024-09-06");
+    try std.testing.expectEqualStrings(nflverse.source_label, board.source);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("401671889", board.games[0].id);
+    try std.testing.expectEqualStrings("27", board.games[0].participants[0].score);
+    try std.testing.expect(nflverse.findByEspnId(board, "401671889") != null);
+}
+
+test "fetchBoard falls back on 200-with-0-events off-today" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    const board = try adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05", "2024-09-06");
+    try std.testing.expectEqualStrings(nflverse.source_label, board.source);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+}
+
+test "fetchBoard keeps ESPN for an empty board dated today" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    // Same empty ESPN slate, but dated today: ESPN stays authoritative
+    // (games may still go live) even though the snapshot has the day.
+    const board = try adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05", "2024-09-05");
+    try std.testing.expectEqualStrings("site.api.espn.com", board.source);
+    try std.testing.expectEqual(@as(usize, 0), board.games.len);
+}
+
+test "fetchBoard keeps ESPN when it has games: live wins over the snapshot" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = StaticTransport{ .body = fallback_live_espn };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    // Same ESPN id exists in both sources (join key proven by the id),
+    // but the live ESPN board wins wholesale: no per-game merge.
+    const board = try adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05", "2024-09-06");
+    try std.testing.expectEqualStrings("site.api.espn.com", board.source);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("401671889", board.games[0].id);
+    try std.testing.expectEqualStrings("in", board.games[0].state);
+    try std.testing.expectEqualStrings("20", board.games[0].participants[0].score);
+}
+
+test "fetchBoard error without a snapshot day propagates" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FailingTransport{};
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    // 2024-09-07 is in neither source: the 502 path (and the stale
+    // cache fallback above it) stays intact.
+    try std.testing.expectError(error.Boom, adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-07", "2024-09-06"));
+}
+
+test "non-NFL leagues never fall back, even when ESPN fails" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FailingTransport{};
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    try std.testing.expectError(error.Boom, adapter.fetchBoard(arena, core.leagues.find("mlb").?, "2024-09-05", "2024-09-06"));
+}
+
+test "snapshot-filled boards carry blank scores as blank" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    const board = try adapter.fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-15", "2024-09-06");
+    try std.testing.expectEqualStrings(nflverse.source_label, board.source);
+    try std.testing.expectEqualStrings("", board.games[0].participants[0].score);
+    try std.testing.expectEqualStrings("", board.games[0].participants[1].score);
+    // Never live, so the cache files these under the final TTL variant.
+    try std.testing.expect(!core.cache.isLiveBoard(board));
+}
+
+test "EspnSource vtable dispatches fetchBoard with baked-in today" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rows = try nflverse.parseSnapshot(arena, fallback_csv);
+    var snapshot = nflverse.NflverseSource.initMemory(rows);
+    var fake = FakeTransportState{ .body = "{\"events\":[]}" };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    var adapter = fallbackAdapter(fake.asTransport(), &snapshot, &threaded);
+    var primary = EspnAdapter.EspnSource{ .adapter = &adapter, .today_day = "2024-09-06" };
+    const board = (try primary.asSource().fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05")).?;
+    try std.testing.expectEqualStrings(nflverse.source_label, board.source);
+}
+
 /// Counting fake for `fetchAllCached` (never live ESPN): records every
 /// upstream URL it sees. The fan-out is sequential, so no locking. Serves
 /// a live slate for the MLB endpoint and empty slates elsewhere, so a
@@ -961,7 +1163,7 @@ test "fetchAllCached serves seeded entries with zero upstream fetches" {
     var fake = CountingTransport{ .live_body = "{\"events\":[]}" };
     const adapter = homeCacheTestAdapter(&fake, &threaded);
     // Near the end of the 30s final window: still zero upstream fetches.
-    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
+    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
     try std.testing.expectEqual(core.leagues.all.len, results.len);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expect(fake.last_url == null);
@@ -1002,13 +1204,13 @@ test "fetchAllCached refetches live boards on the 10s window while finals hold 3
 
     // Inside the 10s live window: everything cached, zero fetches, and the
     // seeded live game is what home would render.
-    const warm = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.live_fresh_ttl_s - 1);
+    const warm = try adapter.fetchAllCached(arena, &cache, home_cache_day, home_cache_day, t0 + edge_cache.live_fresh_ttl_s - 1);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqualStrings("in", findResult(warm, "mlb").board.?.games[0].state);
 
     // Past the live window but inside the final window: exactly one fetch,
     // and it is the live league's URL; every final board still hits.
-    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.live_fresh_ttl_s);
+    const results = try adapter.fetchAllCached(arena, &cache, home_cache_day, home_cache_day, t0 + edge_cache.live_fresh_ttl_s);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings(mlb_url, fake.last_url.?);
     // The refetch stays live (in-progress slate), so it rolls the 10s
@@ -1022,7 +1224,7 @@ test "fetchAllCached refetches live boards on the 10s window while finals hold 3
     // hits: one fetch again, same URL.
     fake.calls = 0;
     fake.last_url = null;
-    _ = try adapter.fetchAllCached(arena, &cache, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
+    _ = try adapter.fetchAllCached(arena, &cache, home_cache_day, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqualStrings(mlb_url, fake.last_url.?);
 }
