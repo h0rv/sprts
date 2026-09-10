@@ -3009,4 +3009,3 @@ test "home and one-line views render no team marks" {
     try std.testing.expect(!containsBraille(one_line));
     _ = try std.unicode.Utf8View.init(live);
 }
->>>>>>> pi-agent-b812d2d6-0fca-47f
