@@ -203,7 +203,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                     try respond(request, body, format, .ok, commonHeaders());
                     return;
                 }
-                try serveSse(allocator, arena, io, request, adapter, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default, zone);
+                try serveSse(allocator, arena, io, request, adapter, cache, subscriber_counts, subscriber_mutex, shared_poll, league, day, score_route, color_default, zone);
                 return;
             }
             // ?week=/seasontype boards bypass the cache: the board key is
@@ -773,7 +773,8 @@ fn cacheHeaders(cache_state: []const u8) [4]std.http.Header {
 }
 
 /// Serve one SSE connection for a (league, day, render) resource. The first
-/// frame goes out immediately from a normal ESPN fetch; afterwards polls are
+/// frame goes out from the cache when warm (exact-frame SharedCache hit, else
+/// the shared NativeCache board entries); otherwise a normal ESPN fetch.
 /// shared per resource: each 1s tick at most one subscriber fetches ESPN per
 /// interval (mutex-guarded SharedCache in stream.zig), and the rest fan out
 /// from the cached frame. Only a changed fingerprint pushes a new frame. The
@@ -789,6 +790,7 @@ fn serveSse(
     io: std.Io,
     request: *std.http.Server.Request,
     adapter: server_app.provider.EspnAdapter,
+    cache: *server_app.native_cache.NativeCache,
     subscriber_counts: *server_app.stream.Subscribers,
     subscriber_mutex: *std.Io.Mutex,
     shared_poll: *server_app.stream.SharedCache,
@@ -803,13 +805,40 @@ fn serveSse(
     const day_owned = try arena.dupe(u8, day);
     const key = try stream.subKey(arena, league.slug, day_owned, color, score_route.width, score_route.height, score_route.art);
 
-    // Fetch before opening the stream: an unavailable upstream still gets
-    // the normal single 502 instead of an empty SSE body.
-    const initial = adapter.fetch(arena, league, day_owned) catch |err| {
-        std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
-        try respondError(arena, request, "scores are temporarily unavailable", .text, .bad_gateway);
-        return;
+    // Resolve before opening the stream: an unavailable upstream still gets
+    // the normal single 502 instead of an empty SSE body. Two cache layers,
+    // cheapest first, mirroring the tick poll path (SharedCache claim/store
+    // around a direct fetch): an exact-frame hit serves zero-fetch, else the
+    // shared NativeCache board entries (same (slug, day) keys as the
+    // single-board/home//all routes) serve zero-upstream on hit, else a
+    // direct fetch whose render warms the shared entry below for later
+    // subscribers. The shared read holds the mutex only for the HashMap
+    // lookup (never across the upstream fetch); the board path uses the
+    // cache's own lock via getOrFetchBoard.
+    const now_s = adapter.clock(io);
+    const shared_hit: ?SseInitial = blk: {
+        subscriber_mutex.lockUncancelable(io);
+        defer subscriber_mutex.unlock(io);
+        break :blk sseSharedHit(arena, shared_poll, key, now_s) catch null;
     };
+    var last: u64 = undefined;
+    var initial_interval: u64 = undefined;
+    var initial_frame: []u8 = undefined;
+    if (shared_hit) |hit| {
+        initial_frame = hit.frame;
+        last = hit.fingerprint;
+        initial_interval = hit.interval;
+    } else {
+        const cache_now = cache.now();
+        const resolved = sseBoardInitial(arena, adapter, cache, league, day_owned, color, score_route.width, score_route.height, score_route.art, zone, now_s, cache_now) catch |err| {
+            std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+            try respondError(arena, request, "scores are temporarily unavailable", .text, .bad_gateway);
+            return;
+        };
+        initial_frame = resolved.frame;
+        last = resolved.fingerprint;
+        initial_interval = resolved.interval;
+    }
 
     var send_buffer: [16 * 1024]u8 = undefined;
     var body_writer = try request.respondStreaming(&send_buffer, .{
@@ -826,8 +855,6 @@ fn serveSse(
         },
     });
 
-    const initial_text = try server_app.render.textWithZoneArt(arena, initial, color, score_route.width, score_route.height, zone, score_route.art);
-    const initial_frame = try stream.frameWithMtime(arena, initial_text, adapter.clock(io));
     body_writer.writer.writeAll(initial_frame) catch return;
     // Two-stage flush: the inner writer buffers up to 16KB before emitting
     // a chunk (BodyWriter.flush only flushes the socket side), so drain it
@@ -850,13 +877,14 @@ fn serveSse(
         if (remaining == 0) shared_poll.remove(gpa, key);
     }
 
-    var last = stream.fingerprint(initial);
-    const initial_interval = stream.pollIntervalSec(initial);
+    // `last`/`initial_interval`/`initial_frame` already resolved above.
     {
         // Warm the shared cache so later subscribers share this poll. Only
         // store when no fresh entry exists, so a racing connect fetch can't
         // clobber a newer frame another subscriber just published.
-        const now_s = adapter.clock(io);
+        // (`now_s` is the connect-time clock read above: a shared-hit
+        // INITIAL skips the store via needsPoll, a board-path INITIAL
+        // publishes under the same timestamp its frame was rendered with.)
         subscriber_mutex.lockUncancelable(io);
         defer subscriber_mutex.unlock(io);
         if (shared_poll.needsPoll(key, now_s)) {
@@ -896,11 +924,11 @@ fn serveSse(
             defer poll_arena_state.deinit();
             const poll_arena = poll_arena_state.allocator();
 
-            const now_s = adapter.clock(io);
+            const tick_now = adapter.clock(io);
             const is_fetcher = blk: {
                 subscriber_mutex.lockUncancelable(io);
                 defer subscriber_mutex.unlock(io);
-                break :blk shared_poll.claim(gpa, key, now_s) catch false;
+                break :blk shared_poll.claim(gpa, key, tick_now) catch false;
             };
 
             if (is_fetcher) {
@@ -914,11 +942,11 @@ fn serveSse(
                 const current = stream.fingerprint(board);
                 const next_interval = stream.pollIntervalSec(board);
                 const body = server_app.render.textWithZoneArt(poll_arena, board, color, score_route.width, score_route.height, zone, score_route.art) catch continue;
-                const event = stream.frameWithMtime(poll_arena, body, now_s) catch continue;
+                const event = stream.frameWithMtime(poll_arena, body, tick_now) catch continue;
                 {
                     subscriber_mutex.lockUncancelable(io);
                     defer subscriber_mutex.unlock(io);
-                    shared_poll.store(gpa, key, now_s, current, next_interval, event) catch {};
+                    shared_poll.store(gpa, key, tick_now, current, next_interval, event) catch {};
                 }
                 if (!stream.changed(last, current)) continue;
                 last = current;
@@ -946,6 +974,64 @@ fn serveSse(
             }
         }
     }
+}
+
+/// Socket-free SSE INITIAL resolver, split so serveSse never holds the
+/// subscriber mutex across an upstream fetch. `sseSharedHit` is the exact
+/// tick-poll read (fresh SharedCache frame for this render key, zero fetch
+/// and zero render); `sseBoardInitial` is the board-level fallback through
+/// the shared NativeCache entries (zero upstream on hit, fetch-and-store on
+/// miss, stale served when upstream fails). Seams covered by the
+/// seeded-cache tests in the harness-run modules: `stream.initialHit` (this
+/// file delegates to it verbatim) and the `getOrFetchBoard` zero-fetch test
+/// in provider.zig.
+const SseInitial = struct {
+    frame: []u8,
+    fingerprint: u64,
+    interval: u64,
+};
+
+fn sseSharedHit(
+    arena: std.mem.Allocator,
+    shared: *const server_app.stream.SharedCache,
+    key: []const u8,
+    now_s: i64,
+) !?SseInitial {
+    // The tested `initialHit` rule verbatim: fresh + ready serves, anything
+    // else falls through to the board-level cache below.
+    const entry = shared.initialHit(key, now_s) orelse return null;
+    return .{
+        .frame = try arena.dupe(u8, entry.frame),
+        .fingerprint = entry.fingerprint,
+        .interval = entry.interval_s,
+    };
+}
+
+fn sseBoardInitial(
+    arena: std.mem.Allocator,
+    adapter: server_app.provider.EspnAdapter,
+    cache: *server_app.native_cache.NativeCache,
+    league: *const core.leagues.League,
+    day: []const u8,
+    color: bool,
+    width: ?u16,
+    height: ?u16,
+    art: bool,
+    zone: server_app.tz.Zone,
+    now_s: i64,
+    cache_now: i64,
+) !SseInitial {
+    const stream = server_app.stream;
+    const slug = try core.cache.canonicalSlug(arena, league.slug);
+    var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
+    const cached = try cache.getOrFetchBoard(arena, slug, day, cache_now, &fetch_ctx, fetchBoardPayload);
+    const board = cached.data.board;
+    const text = try server_app.render.textWithZoneArt(arena, board, color, width, height, zone, art);
+    return .{
+        .frame = try stream.frameWithMtime(arena, text, now_s),
+        .fingerprint = stream.fingerprint(board),
+        .interval = stream.pollIntervalSec(board),
+    };
 }
 
 fn respondError(arena: std.mem.Allocator, request: *std.http.Server.Request, message: []const u8, format: server_app.router.Format, status: std.http.Status) !void {

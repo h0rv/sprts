@@ -1018,6 +1018,37 @@ test "fetchAllCached refetches live boards on the 10s window while finals hold 3
     try std.testing.expectEqualStrings(mlb_url, fake.last_url.?);
 }
 
+test "sse initial serves a seeded board with zero upstream fetches" {
+    // The board-level half of the SSE INITIAL path (main.zig
+    // `sseBoardInitial`, used when no fresh SharedCache frame exists): seed
+    // the exact (slug, day) entry the single-board route stores, resolve
+    // through `getOrFetchBoard` with the same `BoardCacheCtx` seam, and
+    // assert the URL-recording fake saw nothing — zero upstream fetches.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    var cache = native_cache.NativeCache.init(std.testing.allocator, threaded.io(), fakeClock);
+    defer cache.deinit();
+    const t0: i64 = 1_000_000;
+    const mlb = core.leagues.find("mlb").?;
+    try cache.put(
+        .{ .board = .{ .slug = "mlb", .day = home_cache_day, .live = false } },
+        .{ .board = seedFinalBoard("mlb", "MLB", true) },
+        t0,
+    );
+    var fake = CountingTransport{ .live_body = "{\"events\":[]}" };
+    const adapter = homeCacheTestAdapter(&fake, &threaded);
+    const slug = try core.cache.canonicalSlug(arena, mlb.slug);
+    var ctx = BoardCacheCtx{ .adapter = adapter, .league = mlb, .day = home_cache_day };
+    // Near the end of the 30s final window: hit, no fetch, seeded content.
+    const cached = try cache.getOrFetchBoard(arena, slug, home_cache_day, t0 + edge_cache.fresh_ttl_s - 1, &ctx, fetchBoardCached);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expect(fake.last_url == null);
+    try std.testing.expectEqualStrings("seed-1", cached.data.board.games[0].id);
+    try std.testing.expectEqualStrings("post", cached.data.board.games[0].state);
+}
+
 // --- Game detail (wt-detail). Appended; existing scoreboard code above is untouched. ---
 //
 // fetchDetail mirrors the scoreboard path: fetch the per-event summary,

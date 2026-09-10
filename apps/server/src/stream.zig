@@ -337,6 +337,21 @@ pub const SharedCache = struct {
         return self.entries.get(key);
     }
 
+    /// INITIAL-frame decision for a new SSE subscriber: the cached entry iff
+    /// it can serve the first frame with zero fetch — present, fully
+    /// published (`ready`), and still fresh (`!needsPoll`, the exact tick
+    /// freshness rule, so INITIAL and poll never disagree on "fresh"). A
+    /// claimed-but-unstored placeholder is never servable (a connect racing
+    /// an in-flight fetch must trigger its own fetch, never an empty frame).
+    /// Returns the entry by value; the frame slice still points at
+    /// cache-owned memory, so dupe it before unlocking.
+    pub fn initialHit(self: *const SharedCache, key: []const u8, now_s: i64) ?Entry {
+        const entry = self.get(key) orelse return null;
+        if (!entry.ready) return null;
+        if (self.needsPoll(key, now_s)) return null;
+        return entry;
+    }
+
     /// Drop an entry, freeing its owned key and frame. Used when the last
     /// subscriber for a resource disconnects so idle keys don't accumulate.
     pub fn remove(self: *SharedCache, allocator: std.mem.Allocator, key: []const u8) void {
@@ -614,4 +629,41 @@ test "shared cache: store publishes frame for lagging subscribers" {
     cache.remove(allocator, key);
     try std.testing.expect(cache.get(key) == null);
     try std.testing.expect(cache.needsPoll(key, 1013));
+}
+
+test "shared cache: initial hit serves a seeded frame with zero fetch" {
+    // The INITIAL-frame contract serveSse runs for every new subscriber:
+    // a seeded, fresh entry serves the first frame with no upstream fetch
+    // (the production path never consults the transport on this branch —
+    // there is no fetch to count, so the asserts below pin servability).
+    const allocator = std.testing.allocator;
+    var cache = SharedCache.init(allocator);
+    defer cache.deinit(allocator);
+    const key = "mlb|2026-09-06|1|-|-|a1";
+
+    // No entry yet: a fresh connect must fetch.
+    try std.testing.expect(cache.initialHit(key, 1000) == null);
+
+    try cache.store(allocator, key, 1000, 0xABCD, 12, "data: hello\n\n");
+    // Still fresh at +5s: servable, byte-identical frame, no fetch.
+    const hit = cache.initialHit(key, 1005).?;
+    try std.testing.expectEqual(@as(u64, 0xABCD), hit.fingerprint);
+    try std.testing.expectEqual(@as(u64, 12), hit.interval_s);
+    try std.testing.expectEqualStrings("data: hello\n\n", hit.frame);
+    // Interval elapsed: stale, the connect must refetch like a poll tick.
+    try std.testing.expect(cache.initialHit(key, 1012) == null);
+}
+
+test "shared cache: initial hit never serves an unready placeholder" {
+    // A connect racing an in-flight fetch finds the claim placeholder
+    // (fetchership taken, frame not yet published). Serving it would push
+    // an empty frame; the connect must fetch instead.
+    const allocator = std.testing.allocator;
+    var cache = SharedCache.init(allocator);
+    defer cache.deinit(allocator);
+    const key = "mlb|2026-09-06|1|-|-|a1";
+
+    try std.testing.expect(try cache.claim(allocator, key, 2000));
+    try std.testing.expect(cache.get(key).?.ready == false);
+    try std.testing.expect(cache.initialHit(key, 2001) == null);
 }

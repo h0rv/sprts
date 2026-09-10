@@ -501,7 +501,16 @@ fn serveStream(
 
     // Fetch before opening the stream: an unavailable upstream still gets
     // the normal single 502 instead of an empty SSE body (mirrors the
-    // native serveSse; errors are never cached).
+    // native serveSse; errors are never cached). Perf follow-up, evaluated
+    // and kept direct: the worker isolate is stateless (no SharedCache
+    // across connections — each stream polls independently with direct
+    // fetches, so INITIAL already mirrors the poll path), and edge entries
+    // hold fully-rendered single-league bodies with no body-read seam on
+    // the Cache.match result to reframe as SSE — a probe would cost 2
+    // matches per stream to save at most 1 fetch on a warm edge while
+    // diverging from the poll. The cached INITIAL path lives natively in
+    // main.zig (SharedCache exact-frame hit, else shared NativeCache
+    // boards); worker streams stay one direct fetch.
     const initial = adapter.fetch(alloc, league, day) catch {
         workers.log("upstream ESPN fetch failed for {s} {s}", .{ league.slug, day });
         return errorResponse(alloc, "scores are temporarily unavailable", .text, .bad_gateway);
@@ -1187,7 +1196,22 @@ fn serveAll(
     // per-league match (it never saved anything — the digest composition
     // below re-renders regardless) and no warming puts (single-league
     // routes fetch on their own demand at 3 ops each). First hit costs
-    // ~20 fetches + 1 put; repeats cost one match. The variant tag must
+    // ~20 fetches + 1 put; repeats cost one match. Perf follow-up,
+    // evaluated and skipped: sharing /all's per-league fetches with the
+    // single-league edge entries in either direction risks the
+    // 50-subrequest/invocation budget and is semantically mismatched (the
+    // edge stores fully-rendered per-variant bodies; /all needs normalized
+    // boards to compose its own digest render, so renders are not reusable
+    // without a second normalized namespace). Counts, with 20 leagues:
+    // today a digest miss costs 1 match + 20 fetches + 1 put = 22 ops, a
+    // hit 1 op. Read-sharing (probe each league's live+final fresh keys,
+    // liveness unknown pre-fetch) costs 1 + 20*2 matches + up to 20
+    // fetches + 1 put = up to 62 ops cold — over budget. Single-probe
+    // reads fit (1 + 20 + 20 + 1 = 42) but serve the wrong TTL variant for
+    // live games. Write-sharing (warm one canonical single-league render
+    // per league) costs 1 + 20 + 20 + 1 = 42 fresh-only, 62 with stale —
+    // near/over budget for one variant slice while other variants still
+    // miss. So /all keeps its digest-level entry only. The variant tag must
     // include oneline: ?0 renders a different body than the full digest.
     // Art joins the tag too: digest sections carry scoreboard marks.
     const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone, route.art, false);
