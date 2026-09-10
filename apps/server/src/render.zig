@@ -103,6 +103,16 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
             try w.writeByte('\n');
         }
         if (art) try writeGameMarks(w, allocator, board.league, &game, cols, color);
+        // TV broadcaster the provider carried on the game row (first
+        // ESPN `broadcasts[].names` entry, geo-feed fallback): one `TV:`
+        // line per game, skipped when the provider supplies none. The
+        // HTML linkifier escapes it as plain text (see
+        // writeLinkedScoreboard's TV branch), so visible text matches.
+        if (game.network) |network| {
+            const tv_line = try std.fmt.allocPrint(allocator, "TV: {s}", .{network});
+            defer allocator.free(tv_line);
+            try table.writeLine(w, tv_line, cols, null, color);
+        }
         // Plain-text pointer to the game view; the HTML renderer turns
         // the status row into a real link instead (see scoreHtml).
         {
@@ -886,6 +896,11 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
     var part_pos: usize = 0;
     var pending_rule = false;
     var first_row = true;
+    // Name-only games (no participants) link exactly one content row
+    // (the name); every later row in the block — the `TV:` line, the
+    // plain-text game pointer — escapes as plain text. Participant games
+    // consume rows positionally via `part_pos` instead.
+    var name_linked = false;
     var lines = std.mem.splitScalar(u8, body, '\n');
     var color_lines = std.mem.splitScalar(u8, color_body, '\n');
     while (lines.next()) |line| {
@@ -932,6 +947,7 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
                 const game = &board.games[game_idx];
                 current = game_idx;
                 part_pos = 0;
+                name_linked = false;
                 game_idx += 1;
                 try writeGameStatusRow(w, allocator, board.league, game, line, true);
                 continue;
@@ -944,11 +960,32 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
         }
         if (current) |gi| {
             const game = &board.games[gi];
+            // TV broadcaster line (`TV: {network}`, emitted by
+            // `textWithZoneArt` after the art rows): plain escaped text,
+            // never a link. It always follows every participant row, so
+            // requiring the cursor (or the single name row) to be spent
+            // keeps a hostile `TV: ...` participant name linkable.
+            if (game.network != null and std.mem.startsWith(u8, line, "TV: ")) {
+                const spent = if (game.participants.len == 0) name_linked else part_pos >= game.participants.len;
+                if (spent) {
+                    try escapeInto(w, line);
+                    try w.writeByte('\n');
+                    continue;
+                }
+            }
             if (game.participants.len == 0) {
-                // Name-only game row: the name stands in for the game, so
-                // link it too but skip the anchor id — the status row
-                // above already owns `game-{id}`.
-                try writeGameStatusRow(w, allocator, board.league, game, line, false);
+                if (!name_linked) {
+                    // Name-only game row: the name stands in for the game,
+                    // so link it too but skip the anchor id — the status
+                    // row above already owns `game-{id}`.
+                    name_linked = true;
+                    try writeGameStatusRow(w, allocator, board.league, game, line, false);
+                    continue;
+                }
+                // Later rows in a name-only block (TV line, pointer)
+                // are plain text: the two links above already navigate.
+                try escapeInto(w, line);
+                try w.writeByte('\n');
                 continue;
             }
             if (isColorArtRow(line, game, part_pos)) {
@@ -3732,4 +3769,145 @@ test "scoreboard hostile fixture keeps text and HTML visible text equal" {
         try std.testing.expectEqualStrings(t.?, clean);
     }
     _ = try std.unicode.Utf8View.init(page);
+}
+
+// Per-sport scoreboard VIEW parity: every league family shows everything
+// its board rows support — records on team rows, the TV broadcaster line
+// when the provider supplies one — in text AND HTML with identical
+// visible text. Inline fixtures only, never live ESPN. Provider gaps
+// (data absent upstream) are reported in the commit message, not faked:
+// soccer rows often carry no records, tennis/racing/MMA/golf rows carry
+// athlete names with no abbreviations or records, and no sport carries
+// win probabilities on `domain.Game` yet.
+fn familyScoreboard() domain.Scoreboard {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .network = "ESPN & <Deportes>",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                },
+            },
+            .{
+                .id = "10",
+                .name = "Contender Series",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "9/8 - 7:00 PM EDT",
+                .network = "PPV",
+                .participants = &.{
+                    .{ .id = "x", .name = "Colton Loud", .abbreviation = "", .score = "", .winner = false },
+                    .{ .id = "y", .name = "Christian Natividad", .abbreviation = "", .score = "", .winner = false },
+                },
+            },
+            .{
+                .id = "11",
+                .name = "Rain-delayed <showcase> & friends",
+                .starts_at = "2026-09-06T19:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .network = "ESPN+",
+                .participants = &.{},
+            },
+        },
+    };
+}
+
+test "family scoreboard renders records and TV lines in text and HTML" {
+    const arena = std.testing.allocator;
+    const board = familyScoreboard();
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    // Team rows carry records; every game with a broadcaster gets a TV line.
+    for ([_][]const u8{ "Final", "(83-61)", "(74-70)", "TV: ESPN & <Deportes>", "TV: PPV", "TV: ESPN+", "Colton Loud", "Rain-delayed <showcase> & friends" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    try expectNoBrokenLines(body, 52);
+    // HTML escapes the hostile broadcaster; visible text matches byte for byte.
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "TV: ESPN &amp; &lt;Deportes&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "TV: ESPN & <Deportes>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<Deportes>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "family scoreboard without networks skips every TV line" {
+    const arena = std.testing.allocator;
+    var board = familyScoreboard();
+    var games = [_]domain.Game{ board.games[0], board.games[1], board.games[2] };
+    games[0].network = null;
+    games[1].network = null;
+    games[2].network = null;
+    board.games = &games;
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TV:") == null);
+    // Records still render: the TV skip drops one line, nothing else.
+    try std.testing.expect(std.mem.indexOf(u8, body, "(83-61)") != null);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try expectVisiblePreText(page, board, null, null);
+}
+
+test "family scoreboard per-league boards keep TV parity" {
+    // One duel per league family through the same text/HTML contract:
+    // football, basketball, hockey, soccer, tennis, racing, MMA, golf.
+    const arena = std.testing.allocator;
+    const families = [_]struct { slug: []const u8, name: []const u8, away: domain.Participant, home: domain.Participant, network: ?[]const u8 }{
+        .{ .slug = "nfl", .name = "NFL", .away = .{ .id = "a", .name = "Kansas City Chiefs", .abbreviation = "KC", .score = "27", .winner = true, .record = "11-3" }, .home = .{ .id = "h", .name = "Philadelphia Eagles", .abbreviation = "PHI", .score = "24", .winner = false, .record = "10-4" }, .network = "FOX" },
+        .{ .slug = "nba", .name = "NBA", .away = .{ .id = "a", .name = "Boston Celtics", .abbreviation = "BOS", .score = "112", .winner = true, .record = "45-20" }, .home = .{ .id = "h", .name = "Los Angeles Lakers", .abbreviation = "LAL", .score = "108", .winner = false, .record = "40-25" }, .network = "TNT" },
+        .{ .slug = "nhl", .name = "NHL", .away = .{ .id = "a", .name = "Boston Bruins", .abbreviation = "BOS", .score = "4", .winner = true, .record = "38-14-9" }, .home = .{ .id = "h", .name = "Buffalo Sabres", .abbreviation = "BUF", .score = "3", .winner = false, .record = "30-25-6" }, .network = "ESPN+" },
+        .{ .slug = "epl", .name = "Premier League", .away = .{ .id = "a", .name = "Arsenal", .abbreviation = "ARS", .score = "2", .winner = true }, .home = .{ .id = "h", .name = "Chelsea", .abbreviation = "CHE", .score = "1", .winner = false }, .network = "NBC" },
+        .{ .slug = "atp", .name = "ATP", .away = .{ .id = "a", .name = "Carlos Alcaraz", .abbreviation = "", .score = "2", .winner = true }, .home = .{ .id = "h", .name = "Jannik Sinner", .abbreviation = "", .score = "1", .winner = false }, .network = "ESPN2" },
+        .{ .slug = "f1", .name = "Formula 1", .away = .{ .id = "a", .name = "Max Verstappen", .abbreviation = "", .score = "1st", .winner = true }, .home = .{ .id = "h", .name = "Lando Norris", .abbreviation = "", .score = "2nd", .winner = false }, .network = "ESPN" },
+        .{ .slug = "ufc", .name = "UFC", .away = .{ .id = "a", .name = "Islam Makhachev", .abbreviation = "", .score = "W", .winner = true }, .home = .{ .id = "h", .name = "Arman Tsarukyan", .abbreviation = "", .score = "L", .winner = false }, .network = "PPV" },
+        .{ .slug = "pga", .name = "PGA Tour", .away = .{ .id = "a", .name = "Scottie Scheffler", .abbreviation = "", .score = "-12", .winner = true }, .home = .{ .id = "h", .name = "Rory McIlroy", .abbreviation = "", .score = "-10", .winner = false }, .network = "CBS" },
+    };
+    for (families) |family| {
+        const board: domain.Scoreboard = .{
+            .league = family.slug,
+            .league_name = family.name,
+            .date = "2026-09-06",
+            .source = "test",
+            .games = &.{
+                .{
+                    .id = "1",
+                    .name = "Away at Home",
+                    .starts_at = "2026-09-06T17:00Z",
+                    .state = "post",
+                    .status = "Final",
+                    .network = family.network,
+                    .participants = &.{ family.away, family.home },
+                },
+            },
+        };
+        const body = try text(arena, board, false, null, null);
+        defer arena.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, family.away.name) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, family.home.name) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "TV: ") != null);
+        if (family.away.record) |record| {
+            try std.testing.expect(std.mem.indexOf(u8, body, record) != null);
+        }
+        _ = try std.unicode.Utf8View.init(body);
+        const page = try scoreHtml(arena, board, null, null);
+        defer arena.free(page);
+        try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+        try expectVisiblePreText(page, board, null, null);
+    }
 }

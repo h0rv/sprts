@@ -50,6 +50,15 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
     const status = try tz.normalizeEastern(allocator, game.status);
     defer allocator.free(status);
     try table.writeLine(w, status, cols, statusColor(game.state), color);
+    // TV broadcaster the provider copied from the scoreboard row (same
+    // ESPN payload, no extra fetch): one `TV:` line under the status,
+    // skipped when the provider supplies none. The HTML path below
+    // emits the same string, so visible text stays identical.
+    if (game.network) |network| {
+        const tv_line = try std.fmt.allocPrint(allocator, "TV: {s}", .{network});
+        defer allocator.free(tv_line);
+        try table.writeLine(w, tv_line, cols, null, color);
+    }
     const psec = try vd.participantSection(allocator, game.participants, cols);
     defer vd.freeSection(allocator, psec);
     for (psec.rows, game.participants) |line, entry| {
@@ -218,6 +227,11 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     const status = try tz.normalizeEastern(allocator, game.status);
     defer allocator.free(status);
     try render.writeHtmlLine(w, allocator, status, cols, stateClass(game.state), status_href);
+    if (game.network) |network| {
+        const tv_line = try std.fmt.allocPrint(allocator, "TV: {s}", .{network});
+        defer allocator.free(tv_line);
+        try render.writeHtmlLine(w, allocator, tv_line, cols, null, null);
+    }
     const psec = try vd.participantSection(allocator, game.participants, cols);
     defer vd.freeSection(allocator, psec);
     for (psec.rows, game.participants) |line, entry| {
@@ -1386,4 +1400,628 @@ test "hostile detail sections read identically in text and HTML" {
     try std.testing.expect(std.mem.indexOf(u8, seen, "\x1b[31m") == null);
     try std.testing.expect(std.mem.indexOf(u8, seen, "&amp;") == null);
     try std.testing.expect(std.mem.indexOf(u8, seen, "&lt;") == null);
+}
+
+// Per-sport VIEW parity: every league family renders everything its data
+// supports. Each fixture below exercises the fields `core.detail` carries
+// for that sport (linescores/periods, records, leaders, lineups,
+// decisions, situations, venues, attendance, series, network) and asserts
+// each renders in text AND HTML with identical visible text. Inline
+// fixtures only, never live ESPN. Provider gaps (data absent upstream)
+// are reported in the commit message, not faked here: tennis/golf/racing
+// carry no linescores/records/leaders upstream, MMA carries no W/L/SV
+// decisions, non-baseball sports carry no batting lineups or ball-strike
+// situations, and no sport carries win probabilities in `core.*` yet.
+fn familyMlb() detail.GameDetail {
+    return .{
+        .id = "401816828",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Citizens Bank Park",
+        .attendance = 42793,
+        .series = "ATL leads 2-1 (game 3 of 4)",
+        .network = "ESPN & <Deportes>",
+        .participants = &.{
+            .{
+                .id = "15",
+                .name = "Atlanta Braves",
+                .abbreviation = "ATL",
+                .score = "5",
+                .winner = true,
+                .home_away = "away",
+                .lines = &.{ .{ .period = 1, .display = "0" }, .{ .period = 9, .display = "1" } },
+                .hits = "10",
+                .errors = "1",
+                .record = "85-58",
+                .probable = "Tyler Mahle",
+            },
+            .{
+                .id = "22",
+                .name = "Philadelphia Phillies",
+                .abbreviation = "PHI",
+                .score = "4",
+                .winner = false,
+                .home_away = "home",
+                .lines = &.{ .{ .period = 1, .display = "2" }, .{ .period = 9, .display = "0" } },
+                .hits = "7",
+                .errors = "0",
+                .record = "80-63",
+                .probable = "Aaron Nola",
+            },
+        },
+        .decisions = &.{
+            .{ .outcome = "W", .name = "Dylan Lee" },
+            .{ .outcome = "L", .name = "Jhoan Duran" },
+            .{ .outcome = "SV", .name = "Raisel Iglesias" },
+        },
+        .scoring_plays = &.{
+            .{ .period = "9th Inning", .text = "Riley tripled to center, Albies scored.", .away_score = "5", .home_score = "4" },
+        },
+        .leaders = &.{"ATL H-AB 10-35"},
+        .lineups = &.{
+            .{
+                .team = "ATL",
+                .total = "10-35",
+                .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3" }},
+            },
+        },
+        .team_stats = &.{"ATL At Bats 35"},
+    };
+}
+
+fn familyNfl() detail.GameDetail {
+    return .{
+        .id = "401772958",
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Lincoln Financial Field",
+        .attendance = 69596,
+        .network = "FOX",
+        .participants = &.{
+            .{
+                .id = "12",
+                .name = "Kansas City Chiefs",
+                .abbreviation = "KC",
+                .score = "27",
+                .winner = true,
+                .home_away = "away",
+                .lines = &.{
+                    .{ .period = 1, .display = "7" },
+                    .{ .period = 2, .display = "10" },
+                    .{ .period = 3, .display = "3" },
+                    .{ .period = 4, .display = "7" },
+                },
+                .record = "11-3",
+            },
+            .{
+                .id = "22",
+                .name = "Philadelphia Eagles",
+                .abbreviation = "PHI",
+                .score = "24",
+                .winner = false,
+                .home_away = "home",
+                .lines = &.{
+                    .{ .period = 1, .display = "3" },
+                    .{ .period = 2, .display = "7" },
+                    .{ .period = 3, .display = "7" },
+                    .{ .period = 4, .display = "7" },
+                },
+                .record = "10-4",
+            },
+        },
+        .scoring_plays = &.{
+            .{ .period = "Q4", .text = "Jalen Hurts 1 Yd run (Jake Elliott Kick)", .away_score = "27", .home_score = "24" },
+        },
+        .leaders = &.{"KC Passing 320 YDS", "Jalen Hurts 25/34, 280 YDS"},
+        .team_stats = &.{"KC Total Yards 410"},
+    };
+}
+
+fn familyNba() detail.GameDetail {
+    return .{
+        .id = "401584672",
+        .league = "nba",
+        .league_name = "NBA",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "TD Garden",
+        .attendance = 19156,
+        .network = "TNT",
+        .participants = &.{
+            .{
+                .id = "2",
+                .name = "Boston Celtics",
+                .abbreviation = "BOS",
+                .score = "112",
+                .winner = true,
+                .home_away = "away",
+                .lines = &.{
+                    .{ .period = 1, .display = "28" },
+                    .{ .period = 2, .display = "25" },
+                    .{ .period = 3, .display = "30" },
+                    .{ .period = 4, .display = "29" },
+                },
+                .record = "45-20",
+            },
+            .{
+                .id = "14",
+                .name = "Los Angeles Lakers",
+                .abbreviation = "LAL",
+                .score = "108",
+                .winner = false,
+                .home_away = "home",
+                .lines = &.{
+                    .{ .period = 1, .display = "27" },
+                    .{ .period = 2, .display = "26" },
+                    .{ .period = 3, .display = "28" },
+                    .{ .period = 4, .display = "27" },
+                },
+                .record = "40-25",
+            },
+        },
+        .scoring_plays = &.{
+            .{ .period = "Q4", .text = "Jayson Tatum 26-foot three point shot.", .away_score = "112", .home_score = "108" },
+        },
+        .leaders = &.{"BOS PTS 112", "Jayson Tatum 34 PTS"},
+    };
+}
+
+fn familyNhl() detail.GameDetail {
+    return .{
+        .id = "401789012",
+        .league = "nhl",
+        .league_name = "NHL",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final/OT",
+        .venue = "TD Garden",
+        .attendance = 17850,
+        .network = "ESPN+",
+        .participants = &.{
+            .{
+                .id = "6",
+                .name = "Boston Bruins",
+                .abbreviation = "BOS",
+                .score = "4",
+                .winner = true,
+                .home_away = "home",
+                .lines = &.{
+                    .{ .period = 1, .display = "1" },
+                    .{ .period = 2, .display = "2" },
+                    .{ .period = 3, .display = "0" },
+                    .{ .period = 4, .display = "1" },
+                },
+                .record = "38-14-9",
+            },
+            .{
+                .id = "7",
+                .name = "Buffalo Sabres",
+                .abbreviation = "BUF",
+                .score = "3",
+                .winner = false,
+                .home_away = "away",
+                .lines = &.{
+                    .{ .period = 1, .display = "1" },
+                    .{ .period = 2, .display = "1" },
+                    .{ .period = 3, .display = "1" },
+                    .{ .period = 4, .display = "0" },
+                },
+                .record = "30-25-6",
+            },
+        },
+        .scoring_plays = &.{
+            .{ .period = "OT", .text = "David Pastrnak wrist shot, assisted by Brad Marchand.", .away_score = "3", .home_score = "4" },
+        },
+        .leaders = &.{"BOS Shots 34", "David Pastrnak 2 G"},
+    };
+}
+
+fn familySoccer() detail.GameDetail {
+    return .{
+        .id = "784123",
+        .league = "epl",
+        .league_name = "Premier League",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Full Time",
+        .venue = "Emirates Stadium",
+        .attendance = 60704,
+        .network = "NBC",
+        .participants = &.{
+            .{
+                .id = "110",
+                .name = "Arsenal",
+                .abbreviation = "ARS",
+                .score = "2",
+                .winner = true,
+                .home_away = "home",
+                .record = "18-3-5",
+            },
+            .{
+                .id = "83",
+                .name = "Chelsea",
+                .abbreviation = "CHE",
+                .score = "1",
+                .winner = false,
+                .home_away = "away",
+                .record = "14-6-6",
+            },
+        },
+        .scoring_plays = &.{
+            .{ .period = "78'", .text = "Bukayo Saka right footed shot from the centre of the box.", .away_score = "1", .home_score = "2" },
+        },
+        .leaders = &.{"ARS Shots 14", "Bukayo Saka 1 G"},
+        .team_stats = &.{"ARS Possession 58"},
+    };
+}
+
+fn familyTennis() detail.GameDetail {
+    // Tennis carries athletes (no abbreviations), a venue, and a
+    // broadcaster; linescores/records/leaders are absent upstream, so
+    // the view renders the duel rows plus venue/network with no grid.
+    return .{
+        .id = "atp-9",
+        .league = "atp",
+        .league_name = "ATP",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Arthur Ashe Stadium",
+        .network = "ESPN2",
+        .participants = &.{
+            .{ .id = "p1", .name = "Carlos Alcaraz", .abbreviation = "", .score = "2", .winner = true },
+            .{ .id = "p2", .name = "Jannik Sinner", .abbreviation = "", .score = "1", .winner = false },
+        },
+    };
+}
+
+fn familyRacing() detail.GameDetail {
+    // F1 carries the starting-driver field as athlete rows plus the
+    // circuit venue; no linescores, records, or leaders upstream.
+    return .{
+        .id = "f1-12",
+        .league = "f1",
+        .league_name = "Formula 1",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Monza Circuit",
+        .attendance = 93900,
+        .network = "ESPN",
+        .participants = &.{
+            .{ .id = "d1", .name = "Max Verstappen", .abbreviation = "", .score = "1st", .winner = true },
+            .{ .id = "d2", .name = "Lando Norris", .abbreviation = "", .score = "2nd", .winner = false },
+        },
+    };
+}
+
+fn familyMma() detail.GameDetail {
+    // UFC carries the bout as athlete rows plus venue/broadcaster; no
+    // linescores, W/L/SV decisions, or batting lineups upstream.
+    return .{
+        .id = "ufc-7",
+        .league = "ufc",
+        .league_name = "UFC",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "T-Mobile Arena",
+        .attendance = 19600,
+        .network = "PPV",
+        .participants = &.{
+            .{ .id = "f1", .name = "Islam Makhachev", .abbreviation = "", .score = "W", .winner = true },
+            .{ .id = "f2", .name = "Arman Tsarukyan", .abbreviation = "", .score = "L", .winner = false },
+        },
+        .leaders = &.{"Fight of the Night: Main Event"},
+    };
+}
+
+fn familyGolf() detail.GameDetail {
+    // PGA carries the leaderboard as athlete rows plus the course venue;
+    // no linescores, records, or leaders upstream.
+    return .{
+        .id = "pga-4",
+        .league = "pga",
+        .league_name = "PGA Tour",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Augusta National Golf Club",
+        .network = "CBS",
+        .participants = &.{
+            .{ .id = "g1", .name = "Scottie Scheffler", .abbreviation = "", .score = "-12", .winner = true },
+            .{ .id = "g2", .name = "Rory McIlroy", .abbreviation = "", .score = "-10", .winner = false },
+        },
+    };
+}
+
+fn familyLiveBaseball() detail.GameDetail {
+    // Live chip: ball-strike situation plus last play wrap under the
+    // network line; decisions stay absent mid-game.
+    var game = familyMlb();
+    game.state = "in";
+    game.status = "Top 7th";
+    game.decisions = &.{};
+    game.situation = .{
+        .balls = 2,
+        .strikes = 1,
+        .outs = 1,
+        .runners = &.{"1st"},
+        .batter = "Ronald Acuna Jr.",
+        .pitcher = "Aaron Nola",
+        .last_play = "Ball 3 outside.",
+    };
+    return game;
+}
+
+/// Per-row parity for one family fixture, replaying the real emitters:
+/// rows the text page writes raw (participants, scoring plays, leaders,
+/// lineups, team stats) must land verbatim in text and fitted in HTML;
+/// rows the text page fits through `writeLine` (heading, status, TV,
+/// venue, grid, chip, decisions, headings, series) must match fitted on
+/// both sides. Follows the hostile-fixture contract above (`expectRowInBoth`);
+/// whole-page byte equality cannot hold where `table.fit` truncates on
+/// byte length for multibyte rows, so each surface is compared against
+/// what its own emitter produces from the same composed string.
+fn expectDetailParity(game: detail.GameDetail) !void {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    _ = try std.unicode.Utf8View.init(body);
+    _ = try std.unicode.Utf8View.init(page);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    const seen = try visiblePre(arena, page);
+    defer arena.free(seen);
+    // Heading + status + TV: fitted on both sides.
+    const zone_tag = try tz.zoneTag(arena, .et);
+    defer arena.free(zone_tag);
+    const heading = try std.fmt.allocPrint(arena, "{s}  {s} {s}", .{ game.league_name, game.date, zone_tag });
+    defer arena.free(heading);
+    try expectRowInBoth(body, seen, heading, cols, false);
+    const status = try tz.normalizeEastern(arena, game.status);
+    defer arena.free(status);
+    try expectRowInBoth(body, seen, status, cols, false);
+    if (game.network) |network| {
+        const tv_line = try std.fmt.allocPrint(arena, "TV: {s}", .{network});
+        defer arena.free(tv_line);
+        try expectRowInBoth(body, seen, tv_line, cols, false);
+    }
+    // Participants: raw in text, fitted in HTML.
+    const psec = try vd.participantSection(arena, game.participants, cols);
+    defer vd.freeSection(arena, psec);
+    for (psec.rows) |row| try expectRowInBoth(body, seen, row, cols, true);
+    // Venue / attendance: fitted.
+    if (game.venue) |venue| {
+        if (game.attendance) |crowd| {
+            if (crowd != 0) {
+                const line = try std.fmt.allocPrint(arena, "{s} ({d})", .{ venue, crowd });
+                defer arena.free(line);
+                try expectRowInBoth(body, seen, line, cols, false);
+            } else {
+                try expectRowInBoth(body, seen, venue, cols, false);
+            }
+        } else {
+            try expectRowInBoth(body, seen, venue, cols, false);
+        }
+    } else if (game.attendance) |crowd| {
+        if (crowd != 0) {
+            const line = try std.fmt.allocPrint(arena, "Attendance {d}", .{crowd});
+            defer arena.free(line);
+            try expectRowInBoth(body, seen, line, cols, false);
+        }
+    }
+    // Linescore grid: fitted.
+    if (vd.maxPeriod(game) > 0) {
+        const grid = try vd.lineScoreSection(arena, game);
+        defer vd.freeSection(arena, grid);
+        for (grid.rows) |row| try expectRowInBoth(body, seen, row, cols, false);
+    }
+    // Situation chip + last play: wrapped, fitted.
+    if (game.situation) |situation| {
+        const chip = try vd.situationText(arena, situation);
+        defer arena.free(chip);
+        const chip_lines = try table.wrapLines(arena, chip, cols);
+        defer vd.freeLines(arena, chip_lines);
+        for (chip_lines) |row| try expectRowInBoth(body, seen, row, cols, false);
+        if (situation.last_play) |last| {
+            const play_lines = try table.wrapLines(arena, last, cols);
+            defer vd.freeLines(arena, play_lines);
+            for (play_lines) |row| try expectRowInBoth(body, seen, row, cols, false);
+        }
+    }
+    // Decisions + probables: fitted.
+    for (game.decisions) |decision| {
+        const line = try std.fmt.allocPrint(arena, "{s}: {s}", .{ decision.outcome, decision.name });
+        defer arena.free(line);
+        try expectRowInBoth(body, seen, line, cols, false);
+    }
+    for (game.participants) |entry| {
+        if (entry.probable) |starter| {
+            const line = try std.fmt.allocPrint(arena, "SP {s}: {s}", .{ entry.abbreviation, starter });
+            defer arena.free(line);
+            try expectRowInBoth(body, seen, line, cols, false);
+        }
+    }
+    // Scoring plays: heading fitted, rows raw.
+    if (game.scoring_plays.len > 0) {
+        const scoring = try vd.scoringSection(arena, game.scoring_plays, cols);
+        defer vd.freeSection(arena, scoring);
+        try expectRowInBoth(body, seen, scoring.heading.?, cols, false);
+        for (scoring.rows) |row| try expectRowInBoth(body, seen, row, cols, true);
+    }
+    // Lineups replace leaders: headings fitted, rows raw either way.
+    if (game.lineups.len > 0) {
+        try expectRowInBoth(body, seen, "Lineups", cols, false);
+        for (game.lineups) |side| {
+            const side_sec = try vd.lineupSection(arena, side, cols);
+            defer vd.freeSection(arena, side_sec);
+            try expectRowInBoth(body, seen, side_sec.heading.?, cols, false);
+            for (side_sec.rows) |row| try expectRowInBoth(body, seen, row, cols, true);
+        }
+    } else if (game.leaders.len > 0) {
+        const leaders = try vd.leadersSection(arena, game.leaders[0..@min(game.leaders.len, 8)], game.participants, cols);
+        defer vd.freeLeadersSection(arena, leaders);
+        try expectRowInBoth(body, seen, leaders.heading, cols, false);
+        for (leaders.block.lines, leaders.block.is_header) |row, header| try expectRowInBoth(body, seen, row, cols, !header);
+    }
+    // Series: fitted.
+    if (game.series) |series| {
+        const series_line = try std.fmt.allocPrint(arena, "Series: {s}", .{series});
+        defer arena.free(series_line);
+        try expectRowInBoth(body, seen, series_line, cols, false);
+    }
+    // Team stats: heading fitted, rows raw.
+    if (game.team_stats.len > 0) {
+        const tstats = try vd.teamStatsSection(arena, game.team_stats[0..@min(game.team_stats.len, 8)], cols);
+        defer vd.freeSection(arena, tstats);
+        try expectRowInBoth(body, seen, tstats.heading.?, cols, false);
+        for (tstats.rows) |row| try expectRowInBoth(body, seen, row, cols, true);
+    }
+}
+
+test "family mlb renders every supported section in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyMlb();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: ESPN", "Citizens Bank Park (42793)", "R   H   E", "85-58", "80-63", "W: Dylan Lee", "SV: Raisel Iglesias", "SP PHI: Aaron Nola", "Scoring plays", "Riley tripled", "Lineups", "Ronald Acuna Jr.", "Team stats", "ATL At Bats", "Series: ATL leads" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    // Hostile broadcaster escapes in HTML, visible text keeps the raw `&<>`.
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "TV: ESPN &amp; &lt;Deportes&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<Deportes>") == null);
+    try expectDetailParity(game);
+}
+
+test "family nfl renders quarters, leaders, and venue in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyNfl();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: FOX", "Lincoln Financial Field (69596)", "Total", "11-3", "10-4", "Jalen Hurts 1 Yd run", "KC Passing", "Total Yards" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "R   H   E") == null);
+    try expectDetailParity(game);
+}
+
+test "family nba renders quarters and leaders in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyNba();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: TNT", "TD Garden (19156)", "Total", "112", "45-20", "Tatum", "Jayson Tatum" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try expectDetailParity(game);
+}
+
+test "family nhl renders periods and records in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyNhl();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final/OT", "TV: ESPN+", "TD Garden (17850)", "Total", "38-14-9", "Pastrnak" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try expectDetailParity(game);
+}
+
+test "family soccer renders leaders and venue without a grid in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familySoccer();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Full Time", "TV: NBC", "Emirates Stadium (60704)", "18-3-5", "Saka", "Possession" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    // No period cells upstream: no linescore grid, no R/H/E, no Total.
+    try std.testing.expect(std.mem.indexOf(u8, body, "Total") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "R   H   E") == null);
+    try expectDetailParity(game);
+}
+
+test "family tennis renders athletes, venue, and network in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyTennis();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: ESPN2", "Arthur Ashe Stadium", "Carlos Alcaraz", "Jannik Sinner" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "Total") == null);
+    try expectDetailParity(game);
+}
+
+test "family racing renders the field and circuit in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyRacing();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: ESPN", "Monza Circuit (93900)", "Max Verstappen", "Lando Norris" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try expectDetailParity(game);
+}
+
+test "family mma renders the bout, venue, and leaders in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyMma();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: PPV", "T-Mobile Arena (19600)", "Islam Makhachev", "Fight of the Night" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try expectDetailParity(game);
+}
+
+test "family golf renders the leaderboard and course in text and HTML" {
+    const arena = std.testing.allocator;
+    const game = familyGolf();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{ "Final", "TV: CBS", "Augusta National", "Scottie Scheffler", "Rory McIlroy" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) != null);
+    }
+    try expectDetailParity(game);
+}
+
+test "family live baseball renders the situation chip under the network line" {
+    const arena = std.testing.allocator;
+    const game = familyLiveBaseball();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    const tv_at = std.mem.indexOf(u8, body, "TV: ESPN").?;
+    const chip_at = std.mem.indexOf(u8, body, "2-1, 1 out").?;
+    try std.testing.expect(tv_at < chip_at);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Aaron Nola vs Ronald Acuna Jr.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Ball 3 outside.") != null);
+    try expectDetailParity(game);
+    // Live HTML arms the updater without breaking parity.
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "data-live") != null);
+}
+
+test "family detail without a network skips the TV line on both surfaces" {
+    const arena = std.testing.allocator;
+    var game = familyNba();
+    game.network = null;
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "TV:") == null);
+    try expectDetailParity(game);
 }
