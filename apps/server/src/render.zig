@@ -10,13 +10,6 @@ const table = @import("table.zig");
 const tz = @import("tz.zig");
 const view = @import("view.zig");
 
-/// Box-table surface, re-exported from the shared `table` module so views
-/// that reached these through `render` (e.g. `team_view`) keep compiling
-/// during the migration. New code should import `table.zig` directly.
-pub const writeCell = table.writeCell;
-pub const writeCellRight = table.writeCellRight;
-pub const writeGameMarks = table.writeGameMarks;
-
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
 
@@ -102,7 +95,7 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
             if (color and participant.winner) try w.writeAll("\x1b[0m");
             try w.writeByte('\n');
         }
-        if (art) try writeGameMarks(w, allocator, board.league, &game, cols, color);
+        if (art) try table.writeGameMarks(w, allocator, board.league, &game, cols, color);
         // TV broadcaster the provider carried on the game row (first
         // ESPN `broadcasts[].names` entry, geo-feed fallback): one `TV:`
         // line per game, skipped when the provider supplies none. The
@@ -171,30 +164,9 @@ fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !
     try w.writeAll("\x1b[0m");
 }
 
-/// Block-character `sprts` wordmark for terminal pages: the pixel logo
-/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated row
-/// for row — s is the notched block (`XX_`/`XXX`/`_XX`), p the bowl with
-/// its descender stem, r stem+flag, t the ascender with crossbar and
-/// foot, s again. Each 10-unit pixel is one 2-wide full block (terminal
-/// cells are ~2:1 tall, so `██` keeps pixels square); letters sit on
-/// 6-cell columns with a 2-cell gap. Five rows (ascender, three x-height
-/// rows, descender) by 38 columns, ragged right, never ANSI.
-///
-/// Legacy large variant: superseded by `text_home_banner_small` (same
-/// 13-polygon letterforms at one cell per pixel, ~23 columns). Kept —
-/// and still covered by tests below — as the reference transliteration;
-/// no page renders it anymore. HTML and JSON never see either banner.
-pub const text_home_banner: []const u8 =
-    \\                          ██
-    \\████    ██████  ██████  ██████  ████
-    \\██████  ██  ██  ██        ██    ██████
-    \\  ████  ██████  ██        ████    ████
-    \\        ██
-++ "\n";
-
 /// Compact `sprts` wordmark for terminal home pages: the same 13
-/// polygons as `text_home_banner`, one cell per 10-unit pixel instead of
-/// two — s stays the notched block (`██_`/`███`/`_██`), p the bowl with
+/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated row
+/// for row at one cell per pixel — s stays the notched block (`██_`/`███`/`_██`), p the bowl with
 /// its descender stem, r stem+flag, t the ascender with crossbar and
 /// right foot, s again. Letters sit on 3-cell columns with a 2-cell gap:
 /// five rows (ascender, three x-height rows, descender) by ~23 columns,
@@ -211,22 +183,6 @@ pub const text_home_banner_small: []const u8 =
 ++ "\n";
 
 test "text homes show the block sprts wordmark above the heading" {
-    // The legacy large banner: 5 block rows, ragged within 40 cells,
-    // valid UTF-8, zero ANSI on its own. No page renders it anymore
-    // (see `text_home_banner_small`), but it stays as the reference
-    // transliteration.
-    var big_rows: usize = 0;
-    var big_lines = std.mem.splitScalar(u8, text_home_banner, '\n');
-    while (big_lines.next()) |line| {
-        if (line.len == 0) continue;
-        big_rows += 1;
-        try std.testing.expect(std.mem.indexOf(u8, line, "█") != null);
-        try std.testing.expect(table.textCells(line) <= 40);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
-    }
-    try std.testing.expectEqual(@as(usize, 5), big_rows);
-    _ = try std.unicode.Utf8View.init(text_home_banner);
-
     // The compact banner itself: block rows, ragged within 26 cells,
     // at most 6 rows, valid UTF-8, zero ANSI on its own.
     var rows: usize = 0;
@@ -302,9 +258,9 @@ pub fn homeDay(allocator: std.mem.Allocator, color: bool, day: ?[]const u8) ![]u
     for (leagues.all) |league| {
         var cell: std.Io.Writer.Allocating = .init(allocator);
         defer cell.deinit();
-        try writeCell(&cell.writer, league.slug, 13, null, color);
+        try table.writeCell(&cell.writer, league.slug, 13, null, color);
         try cell.writer.writeByte(' ');
-        try writeCell(&cell.writer, league.name, 34, null, color);
+        try table.writeCell(&cell.writer, league.name, 34, null, color);
         const padded = try cell.toOwnedSlice();
         defer allocator.free(padded);
         try w.writeAll(std.mem.trimEnd(u8, padded, " "));
@@ -393,7 +349,7 @@ pub fn homeLive(
 /// header/footer — same per-game shape as `scoreOneLine`, across leagues.
 /// Idle leagues (no board or no games) emit nothing; with no games at all
 /// the body is a single `No games scheduled.` line.
-/// Each line carries the zone (`mlb 9/6 ET ...`) via `tz.labelFor`'s zone.
+/// Each line carries the zone (`mlb 09-06 ET ...`) via `tz.labelFor`'s zone.
 pub fn homeOneLineWithZone(
     allocator: std.mem.Allocator,
     boards: []const provider.LeagueResult,
@@ -457,7 +413,7 @@ fn homeSections(
     // down the whole page: widest slug/abbreviation among leagues with
     // shown games (idle-league rows keep their own fixed cells). Floors
     // keep narrow days compact; caps bound exotic abbreviations.
-    const widths = view.homeColumnWidths(boards);
+    const widths = view.homeColumnWidths(provider.LeagueResult, boards);
     const slug_w = widths.slug_w;
     const abbr_w = widths.abbr_w;
     var separated = false;
@@ -535,9 +491,9 @@ fn homeSections(
         {
             var cell: std.Io.Writer.Allocating = .init(allocator);
             defer cell.deinit();
-            try writeCell(&cell.writer, result.league.slug, 13, null, false);
+            try table.writeCell(&cell.writer, result.league.slug, 13, null, false);
             try cell.writer.writeByte(' ');
-            try writeCell(&cell.writer, result.league.name, 34, null, false);
+            try table.writeCell(&cell.writer, result.league.name, 34, null, false);
             const padded = try cell.toOwnedSlice();
             defer allocator.free(padded);
             const trimmed = std.mem.trimEnd(u8, padded, " ");
@@ -563,7 +519,7 @@ fn writeHtmlCell(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, 
     }
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, s, default_inner_width - 2, null, false);
+    try table.writeCell(&cell.writer, s, default_inner_width - 2, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     try escapeCellInto(w, padded);
@@ -578,7 +534,7 @@ fn writeHtmlRow(allocator: std.mem.Allocator, s: []const u8, css: ?[]const u8, i
     _ = inner;
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, s, default_inner_width - 2, null, false);
+    try table.writeCell(&cell.writer, s, default_inner_width - 2, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     const trimmed = std.mem.trimEnd(u8, padded, " ");
@@ -670,7 +626,7 @@ fn writeLinkedGameCell(allocator: std.mem.Allocator, line: []const u8, league: *
     // the text and visible text matches the text renderer byte for byte.
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, line, 50, null, false);
+    try table.writeCell(&cell.writer, line, 50, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     const trimmed = std.mem.trimEnd(u8, padded, " ");
@@ -727,24 +683,12 @@ fn homeFooter(w: *std.Io.Writer, host: []const u8, color: bool) !void {
     try colorize(w, "2", "Code: " ++ repo_url ++ "\n", color);
 }
 
-fn writeShortDate(w: *std.Io.Writer, date: []const u8) !void {
-    if (date.len >= 10 and date[4] == '-' and date[7] == '-') {
-        const m = date[5..7];
-        const d = date[8..10];
-        const mm = if (m[0] == '0') m[1..] else m;
-        const dd = if (d[0] == '0') d[1..] else d;
-        try w.print("{s}/{s}", .{ mm, dd });
-    } else {
-        try w.writeAll(date);
-    }
-}
-
 fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date: []const u8, game: domain.Game, color: bool, zone_tag: []const u8) !void {
     const code: ?[]const u8 = if (color) view.statusAnsi(game.state) else null;
     if (code) |c| try w.print("\x1b[{s}m", .{c});
     try w.writeAll(league_slug);
     try w.writeByte(' ');
-    try writeShortDate(w, board_date);
+    try w.writeAll(view.shortDate(board_date));
     try w.writeByte(' ');
     try w.writeAll(zone_tag);
     try w.writeByte(' ');
@@ -1179,7 +1123,7 @@ fn htmlEscapeByte(w: *std.Io.Writer, b: u8) !void {
 pub fn writeHtmlLine(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const u8, cols: usize, css: ?[]const u8, link: ?[]const u8) !void {
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, s, cols, null, false);
+    try table.writeCell(&cell.writer, s, cols, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     const trimmed = std.mem.trimEnd(u8, padded, " ");
@@ -1206,7 +1150,7 @@ pub fn writeHtmlLine(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const
 pub fn writeHtmlH1(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const u8, cols: usize, css: ?[]const u8) !void {
     var cell: std.Io.Writer.Allocating = .init(allocator);
     defer cell.deinit();
-    try writeCell(&cell.writer, s, cols, null, false);
+    try table.writeCell(&cell.writer, s, cols, null, false);
     const padded = try cell.toOwnedSlice();
     defer allocator.free(padded);
     const trimmed = std.mem.trimEnd(u8, padded, " ");
@@ -1401,9 +1345,9 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
         defer allocator.free(href);
         var cell: std.Io.Writer.Allocating = .init(allocator);
         defer cell.deinit();
-        try writeCell(&cell.writer, league.slug, 13, null, false);
+        try table.writeCell(&cell.writer, league.slug, 13, null, false);
         try cell.writer.writeByte(' ');
-        try writeCell(&cell.writer, league.name, 34, null, false);
+        try table.writeCell(&cell.writer, league.name, 34, null, false);
         const padded = try cell.toOwnedSlice();
         defer allocator.free(padded);
         if (i == 0) try w.writeAll(h1_open);
@@ -2983,10 +2927,10 @@ test "home text heading and one-lines name the zone" {
     const one_sections = [_]provider.LeagueResult{.{ .league = mlb, .board = board }};
     const lines = try homeOneLineWithZone(std.testing.allocator, &one_sections, false, .et);
     defer std.testing.allocator.free(lines);
-    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 9/6 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 09-06 ET") != null);
     const utc_lines = try homeOneLineWithZone(std.testing.allocator, &one_sections, false, .utc);
     defer std.testing.allocator.free(utc_lines);
-    try std.testing.expect(std.mem.indexOf(u8, utc_lines, "mlb 9/6 UTC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, utc_lines, "mlb 09-06 UTC") != null);
 }
 
 test "live home opens with prev/next date nav under the heading" {

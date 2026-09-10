@@ -358,6 +358,39 @@ pub fn leaderHeaderTeam(label: []const u8, participants: []const detail.DetailPa
     return null;
 }
 
+/// Optional per-row label mapping for `keyValueLines`: leaders pass
+/// their team-prefix mapping, plain sections pass null and labels go
+/// through verbatim. The mapper sees the row index so leaders can reuse
+/// the precomputed per-row team/header tables without re-scanning.
+pub const LabelPrefix = struct {
+    ctx: ?*const anyopaque = null,
+    map: ?*const fn (ctx: ?*const anyopaque, allocator: std.mem.Allocator, index: usize, label: []const u8) std.mem.Allocator.Error![]u8 = null,
+
+    pub fn apply(self: LabelPrefix, allocator: std.mem.Allocator, index: usize, label: []const u8) ![]u8 {
+        if (self.map) |f| return f(self.ctx, allocator, index, label);
+        return allocator.dupe(u8, label);
+    }
+};
+
+/// Per-row tables backing the leaders label mapping: the running team
+/// per row plus which rows open a group. Borrowed for the
+/// `keyValueLines` call only.
+const LeaderPrefixCtx = struct {
+    teams: []const ?[]const u8,
+    headers: []const bool,
+};
+
+/// `leadersLines` as a `keyValueLines` label mapping: header rows keep
+/// the bare label; player rows inherit the running team as a prefix
+/// column (`HOU  Jeremy Pena  1-5`) so the team is never a guess.
+fn leaderLabel(ctx: ?*const anyopaque, allocator: std.mem.Allocator, index: usize, label: []const u8) ![]u8 {
+    const tables: *const LeaderPrefixCtx = @ptrCast(@alignCast(ctx.?));
+    if (!tables.headers[index]) {
+        if (tables.teams[index]) |team| return std.fmt.allocPrint(allocator, "{s}  {s}", .{ team, label });
+    }
+    return allocator.dupe(u8, label);
+}
+
 pub fn leadersLines(
     allocator: std.mem.Allocator,
     leaders: []const []const u8,
@@ -366,44 +399,21 @@ pub fn leadersLines(
 ) !LeadersBlock {
     var teams: std.ArrayList(?[]const u8) = .empty;
     defer teams.deinit(allocator);
+    var headers: std.ArrayList(bool) = .empty;
+    errdefer headers.deinit(allocator);
     var value_w: usize = 0;
     var current: ?[]const u8 = null;
     for (leaders) |item| {
         const parts = splitValue(item);
-        if (leaderHeaderTeam(parts.label, participants)) |team| current = team;
+        const header = leaderHeaderTeam(parts.label, participants);
+        if (header) |team| current = team;
         try teams.append(allocator, current);
+        try headers.append(allocator, header != null);
         value_w = @max(value_w, table.textCells(parts.value));
     }
-    var out: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (out.items) |line| allocator.free(line);
-        out.deinit(allocator);
-    }
-    var headers: std.ArrayList(bool) = .empty;
-    errdefer headers.deinit(allocator);
-    for (leaders, teams.items) |item, team| {
-        const parts = splitValue(item);
-        const header = leaderHeaderTeam(parts.label, participants) != null;
-        const label = if (!header and team != null)
-            try std.fmt.allocPrint(allocator, "{s}  {s}", .{ team.?, parts.label })
-        else
-            try allocator.dupe(u8, parts.label);
-        defer allocator.free(label);
-        var buf: std.Io.Writer.Allocating = .init(allocator);
-        errdefer buf.deinit();
-        if (parts.value.len == 0) {
-            try table.writeCell(&buf.writer, label, total, null, false);
-        } else {
-            try table.writeCell(&buf.writer, label, total -| value_w -| 1, null, false);
-            try buf.writer.writeByte(' ');
-            try table.writeCellRight(&buf.writer, parts.value, value_w, null, false);
-        }
-        const raw = try buf.toOwnedSlice();
-        defer allocator.free(raw);
-        try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, raw, " ")));
-        try headers.append(allocator, header);
-    }
-    return .{ .lines = try out.toOwnedSlice(allocator), .is_header = try headers.toOwnedSlice(allocator) };
+    const prefix = LeaderPrefixCtx{ .teams = teams.items, .headers = headers.items };
+    const lines = try keyValueLines(allocator, leaders, total, LabelPrefix{ .ctx = &prefix, .map = leaderLabel });
+    return .{ .lines = lines, .is_header = try headers.toOwnedSlice(allocator) };
 }
 
 /// Split a "label ... value" row at its last space: leaders
@@ -416,8 +426,10 @@ pub fn splitValue(s: []const u8) struct { label: []const u8, value: []const u8 }
 
 /// Aligned key/value rows: labels left, values sharing one right column
 /// (widest value wins). Value-less rows render as plain fitted lines.
-/// `total` is the content width. Shared by text and HTML.
-pub fn keyValueLines(allocator: std.mem.Allocator, items: []const []const u8, total: usize) ![][]u8 {
+/// `total` is the content width. Shared by text and HTML. `prefix`
+/// optionally remaps each row label (`leadersLines` passes its
+/// team-prefix mapping); null keeps labels verbatim.
+pub fn keyValueLines(allocator: std.mem.Allocator, items: []const []const u8, total: usize, prefix: ?LabelPrefix) ![][]u8 {
     var value_w: usize = 0;
     for (items) |item| value_w = @max(value_w, table.textCells(splitValue(item).value));
     var out: std.ArrayList([]u8) = .empty;
@@ -425,14 +437,16 @@ pub fn keyValueLines(allocator: std.mem.Allocator, items: []const []const u8, to
         for (out.items) |line| allocator.free(line);
         out.deinit(allocator);
     }
-    for (items) |item| {
+    for (items, 0..) |item, i| {
         const parts = splitValue(item);
+        const label = if (prefix) |p| try p.apply(allocator, i, parts.label) else try allocator.dupe(u8, parts.label);
+        defer allocator.free(label);
         var buf: std.Io.Writer.Allocating = .init(allocator);
         errdefer buf.deinit();
         if (parts.value.len == 0) {
-            try table.writeCell(&buf.writer, parts.label, total, null, false);
+            try table.writeCell(&buf.writer, label, total, null, false);
         } else {
-            try table.writeCell(&buf.writer, parts.label, total -| value_w -| 1, null, false);
+            try table.writeCell(&buf.writer, label, total -| value_w -| 1, null, false);
             try buf.writer.writeByte(' ');
             try table.writeCellRight(&buf.writer, parts.value, value_w, null, false);
         }
@@ -627,14 +641,14 @@ pub fn lineupSection(allocator: std.mem.Allocator, side: detail.LineupSide, tota
     errdefer allocator.free(heading);
     const items = try lineupItems(allocator, side);
     defer freeLines(allocator, items);
-    return .{ .heading = heading, .rows = try keyValueLines(allocator, items, total) };
+    return .{ .heading = heading, .rows = try keyValueLines(allocator, items, total, null) };
 }
 
 /// Team-stats group as a `Section` headed `Team stats`.
 pub fn teamStatsSection(allocator: std.mem.Allocator, stats: []const []const u8, total: usize) !Section {
     return .{
         .heading = try allocator.dupe(u8, "Team stats"),
-        .rows = try keyValueLines(allocator, stats, total),
+        .rows = try keyValueLines(allocator, stats, total, null),
     };
 }
 
@@ -826,7 +840,7 @@ test "composers hold width, alignment, and valid UTF-8 on hostile input" {
         try std.testing.expect(std.mem.indexOf(u8, rows[1], "✓") != null);
         try std.testing.expect(std.mem.indexOf(u8, rows[0], "\x1b[31m") == null);
 
-        const kv = try keyValueLines(arena, &.{ "ATL <b> & \"hits\"\t10", "no-value-row", "HOU Games Played 1" }, total);
+        const kv = try keyValueLines(arena, &.{ "ATL <b> & \"hits\"\t10", "no-value-row", "HOU Games Played 1" }, total, null);
         defer freeLines(arena, kv);
         try std.testing.expectEqual(@as(usize, 3), kv.len);
         for (kv) |row| {
@@ -1070,10 +1084,11 @@ pub fn statusCssClass(state: []const u8) ?[]const u8 {
 /// Page-wide home column widths so league, team, and score columns align
 /// down the whole page: widest slug/abbreviation among leagues with
 /// shown games (idle-league rows keep their own fixed cells). Floors
-/// keep narrow days compact; caps bound exotic abbreviations. Generic
-/// over the `LeagueResult` shape (`{ .league.slug, .board.?games }`) so
-/// this module stays provider-neutral.
-pub fn homeColumnWidths(boards: anytype) struct { slug_w: usize, abbr_w: usize } {
+/// keep narrow days compact; caps bound exotic abbreviations. Takes a
+/// slice of `LeagueResult`-shaped entries (`{ .league.slug,
+/// .board.?games }`); the element stays generic so this module stays
+/// provider-neutral.
+pub fn homeColumnWidths(comptime T: type, boards: []const T) struct { slug_w: usize, abbr_w: usize } {
     var slug_w: usize = 3;
     var abbr_w: usize = 2;
     for (boards) |result| {
@@ -1091,6 +1106,77 @@ pub fn homeColumnWidths(boards: anytype) struct { slug_w: usize, abbr_w: usize }
 /// the page heading). Whole line links to the league page at emit time.
 pub fn homeLeagueHeader(allocator: std.mem.Allocator, name: []const u8, day: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}  {s}", .{ name, shortDate(day) });
+}
+
+/// Middle slot for a home duel line: fixed score columns (both sides
+/// grid-aligned), single-abbr sides (`CLE 9 v BAL 5`, UFC-style), or
+/// bare names (`Away v Home`). The slug head, winner tick, and
+/// `homeGameTail` tail stay shared in `homeDuelLine`.
+const HomeDuelMiddle = enum {
+    columns,
+    sides,
+    names,
+};
+
+/// Shared composer for the four home duel lines: one slug head, one
+/// winner tick, one `homeGameTail` tail — only the middle varies, so
+/// the branches can never drift row by row.
+fn homeDuelLine(
+    allocator: std.mem.Allocator,
+    league: *const core.leagues.League,
+    away: domain.Participant,
+    home_team: domain.Participant,
+    date: []const u8,
+    rest: []const u8,
+    slug_w: usize,
+    abbr_w: usize,
+    middle: HomeDuelMiddle,
+) ![]u8 {
+    // Winner tick rides a fixed 2-cell column so scores align whether
+    // or not the game is decided yet.
+    const mark: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const b = &buf.writer;
+    try table.writeCell(b, league.slug, slug_w, null, false);
+    try b.writeByte(' ');
+    switch (middle) {
+        .columns => {
+            // Column duel: sides, scores, tick, then the date word
+            // (if any) and the status tail. Callers fit to the frame.
+            try table.writeCell(b, away.abbreviation, abbr_w, null, false);
+            try b.writeByte(' ');
+            try table.writeCellRight(b, away.score, 3, null, false);
+            try b.writeAll(" @ ");
+            try table.writeCell(b, home_team.abbreviation, abbr_w, null, false);
+            try b.writeByte(' ');
+            try table.writeCellRight(b, home_team.score, 3, null, false);
+            try b.writeAll(mark);
+        },
+        .sides => {
+            const away_side = try homeSideText(allocator, away);
+            defer allocator.free(away_side);
+            const home_side = try homeSideText(allocator, home_team);
+            defer allocator.free(home_side);
+            if (away_side.len > 0 and home_side.len > 0) {
+                try b.writeAll(away_side);
+                try b.writeAll(" v ");
+                try b.writeAll(home_side);
+            } else {
+                const side = if (away_side.len > 0) away_side else home_side;
+                try b.writeAll(side);
+            }
+            try b.writeAll(mark);
+        },
+        .names => {
+            try b.writeAll(away.name);
+            try b.writeAll(" v ");
+            try b.writeAll(home_team.name);
+            try b.writeAll(mark);
+        },
+    }
+    try homeGameTail(allocator, b, date, rest);
+    return try buf.toOwnedSlice();
 }
 
 /// Compact home one-liner per game, column-aligned across the page:
@@ -1113,85 +1199,22 @@ pub fn homeGameLine(allocator: std.mem.Allocator, league: *const core.leagues.Le
             .{ second, first }
         else
             .{ first, second };
-        // Winner tick rides a fixed 2-cell column so scores align whether
-        // or not the game is decided yet.
-        const mark: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
         const date_part = homeSplitStatus(homeShortStatus(game.status));
-        const date = date_part.date;
-        const rest = date_part.rest;
-        if (away.abbreviation.len > 0 and home_team.abbreviation.len > 0) {
-            // Column duel: slug, sides, scores, tick, then the date word
-            // (if any) and the status tail. Callers fit to the frame.
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            const b = &buf.writer;
-            try table.writeCell(b, league.slug, slug_w, null, false);
-            try b.writeByte(' ');
-            try table.writeCell(b, away.abbreviation, abbr_w, null, false);
-            try b.writeByte(' ');
-            try table.writeCellRight(b, away.score, 3, null, false);
-            try b.writeAll(" @ ");
-            try table.writeCell(b, home_team.abbreviation, abbr_w, null, false);
-            try b.writeByte(' ');
-            try table.writeCellRight(b, home_team.score, 3, null, false);
-            try b.writeAll(mark);
-            try b.writeAll("  ");
-            try table.writeCell(b, date, 5, null, false);
-            const norm = try tz.normalizeEastern(allocator, rest);
-            defer allocator.free(norm);
-            try b.writeAll(norm);
-            return try buf.toOwnedSlice();
-        }
-        if (away.abbreviation.len > 0 or home_team.abbreviation.len > 0) {
-            const away_side = try homeSideText(allocator, away);
-            defer allocator.free(away_side);
-            const home_side = try homeSideText(allocator, home_team);
-            defer allocator.free(home_side);
-            const mark2: []const u8 = if (away.winner or home_team.winner) " ✓" else "  ";
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try table.writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            if (away_side.len > 0 and home_side.len > 0) {
-                const joiner: []const u8 = " v ";
-                try buf.writer.writeAll(away_side);
-                try buf.writer.writeAll(joiner);
-                try buf.writer.writeAll(home_side);
-            } else {
-                const side = if (away_side.len > 0) away_side else home_side;
-                try buf.writer.writeAll(side);
-            }
-            try buf.writer.writeAll(mark2);
-            try homeGameTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
-        }
-        if (away.name.len > 0 or home_team.name.len > 0) {
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try table.writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            try buf.writer.writeAll(away.name);
-            try buf.writer.writeAll(" v ");
-            try buf.writer.writeAll(home_team.name);
-            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
-            try homeGameTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
-        }
-        if (away.score.len > 0 or home_team.score.len > 0) {
-            var buf: std.Io.Writer.Allocating = .init(allocator);
-            errdefer buf.deinit();
-            try table.writeCell(&buf.writer, league.slug, slug_w, null, false);
-            try buf.writer.writeByte(' ');
-            try table.writeCell(&buf.writer, away.abbreviation, abbr_w, null, false);
-            try buf.writer.writeByte(' ');
-            try table.writeCellRight(&buf.writer, away.score, 3, null, false);
-            try buf.writer.writeAll(" @ ");
-            try table.writeCell(&buf.writer, home_team.abbreviation, abbr_w, null, false);
-            try buf.writer.writeByte(' ');
-            try table.writeCellRight(&buf.writer, home_team.score, 3, null, false);
-            if (away.winner or home_team.winner) try buf.writer.writeAll(" ✓") else try buf.writer.writeAll("  ");
-            try homeGameTail(allocator, &buf.writer, date, rest);
-            return try buf.toOwnedSlice();
+        // The four duel middles (column duel, single-abbr sides, bare
+        // names, score-only columns) share one composer; only the middle
+        // slot varies. Anything emptier falls to the bare tail below.
+        const middle: ?HomeDuelMiddle = if (away.abbreviation.len > 0 and home_team.abbreviation.len > 0)
+            .columns
+        else if (away.abbreviation.len > 0 or home_team.abbreviation.len > 0)
+            .sides
+        else if (away.name.len > 0 or home_team.name.len > 0)
+            .names
+        else if (away.score.len > 0 or home_team.score.len > 0)
+            .columns
+        else
+            null;
+        if (middle) |m| {
+            return try homeDuelLine(allocator, league, away, home_team, date_part.date, date_part.rest, slug_w, abbr_w, m);
         }
         var tail_buf: std.Io.Writer.Allocating = .init(allocator);
         errdefer tail_buf.deinit();
