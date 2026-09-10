@@ -312,11 +312,20 @@ test "text homes show the block sprts wordmark above the heading" {
 }
 
 pub fn home(allocator: std.mem.Allocator, color: bool) ![]u8 {
+    return homeDay(allocator, color, null);
+}
+
+/// Dated static home: the same league list as `home`, plus the date-nav
+/// line under the heading when a day is in hand. Dateless stays
+/// byte-identical to `home` (no day, no nav to compute) so the bare
+/// landing page never changes.
+pub fn homeDay(allocator: std.mem.Allocator, color: bool, day: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
     try w.writeAll(text_home_banner_small);
     try colorize(w, "2", "sprts\n", color);
+    if (day) |d| try writeHomeNavLine(w, allocator, d);
     try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
         var cell: std.Io.Writer.Allocating = .init(allocator);
@@ -353,8 +362,10 @@ pub fn sanitizeHost(value: ?[]const u8) []const u8 {
 /// Live home page: leagues with live games first, then the rest of today
 /// as compact one-liners, then idle leagues as links. Leagues whose fetch
 /// failed render as plain links, so one ESPN outage never fails the page.
-/// The heading names its zone (`sprts  2026-09-06 ET`); section rows keep
-/// the shared `homeSections` layout untouched (the HTML home owns it too).
+/// The heading names its zone (`sprts  2026-09-06 ET`); the date-nav line
+/// sits directly under it, above the sections (see `writeHomeNavLine`);
+/// section rows keep the shared `homeSections` layout untouched (the HTML
+/// home owns it too).
 pub fn homeLiveWithZone(
     allocator: std.mem.Allocator,
     color: bool,
@@ -376,6 +387,10 @@ pub fn homeLiveWithZone(
         try colorize(w, "2", heading, color);
         try w.writeByte('\n');
     }
+    // Date nav sits directly under the heading (or tops quiet mode,
+    // which drops the heading): the same unconditional line the
+    // scoreboard footer prints, so navigation never depends on chrome.
+    try writeHomeNavLine(w, allocator, day);
     try table.writeSeparator(w, 50);
     try homeSections(allocator, w, boards, color, false, day);
     try w.writeByte('\n');
@@ -1461,6 +1476,56 @@ fn writeScoreSummaries(w: *std.Io.Writer, board: domain.Scoreboard, shown: usize
     try w.writeAll("</div>");
 }
 
+/// Prev/next dates for a home day, via the same `dates.shift` the
+/// scoreboard footer uses — month boundaries roll over by construction
+/// (`2026-09-01` → `2026-08-31`). Returned owned; callers free both.
+/// Shared composer behind the text and HTML nav lines so the two homes
+/// can never disagree on the dates. Null unless `day` is a strict
+/// calendar date: serve paths resolve tokens first, so renderers always
+/// see strict days in practice; hostile text renders no nav instead of
+/// failing the page (the league-href escaping tests pin this).
+fn homeNavDates(allocator: std.mem.Allocator, day: []const u8) !?struct { prev: []u8, next: []u8 } {
+    if (!dates.validate(day)) return null;
+    const prev = try dates.shift(allocator, day, -1);
+    errdefer allocator.free(prev);
+    const next = try dates.shift(allocator, day, 1);
+    return .{ .prev = prev, .next = next };
+}
+
+/// Home date-nav line, text spelling: `/all?date={prev}    /all?date={next}`.
+/// Same 4-space join as the scoreboard footer (`/{league}?date=` × 2);
+/// the target is `/all` — the date-addressable all-leagues view — while
+/// `/` itself renders the live overview. Plain, never ANSI: the scoreboard
+/// footer precedent, so piped output stays clean.
+fn writeHomeNavLine(w: *std.Io.Writer, allocator: std.mem.Allocator, day: []const u8) !void {
+    const nav = try homeNavDates(allocator, day) orelse return;
+    defer allocator.free(nav.prev);
+    defer allocator.free(nav.next);
+    try w.print("/all?date={s}    /all?date={s}\n", .{ nav.prev, nav.next });
+}
+
+/// HTML twin of `writeHomeNavLine`: byte-identical visible text, each
+/// half its own link. Hrefs escape via `escapeInto` like every other
+/// built href, so hostile day text can never break the page.
+fn writeHomeNavHtml(w: *std.Io.Writer, allocator: std.mem.Allocator, day: []const u8) !void {
+    const nav = try homeNavDates(allocator, day) orelse return;
+    defer allocator.free(nav.prev);
+    defer allocator.free(nav.next);
+    const prev_href = try std.fmt.allocPrint(allocator, "/all?date={s}", .{nav.prev});
+    defer allocator.free(prev_href);
+    const next_href = try std.fmt.allocPrint(allocator, "/all?date={s}", .{nav.next});
+    defer allocator.free(next_href);
+    try w.writeAll("<a href=\"");
+    try escapeInto(w, prev_href);
+    try w.writeAll("\">");
+    try escapeInto(w, prev_href);
+    try w.writeAll("</a>    <a href=\"");
+    try escapeInto(w, next_href);
+    try w.writeAll("\">");
+    try escapeInto(w, next_href);
+    try w.writeAll("</a>\n");
+}
+
 /// Per-league today link shared by the static home rows and the live
 /// home rows: `/{slug}?date={day}` when a day is in hand, dateless
 /// `/{slug}` otherwise. One spelling everywhere, so the shortcut never
@@ -1507,6 +1572,9 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     const w = &out.writer;
     try pageHead(w, "sprts");
     try table.writeSeparator(w, 50);
+    // Dated static home carries the same nav as the live homes, above the
+    // league rows; dateless stays exactly as before (no day, no nav).
+    if (day) |d| try writeHomeNavHtml(w, allocator, d);
     // The first league row doubles as the page `<h1>` title (the skip
     // link's `#content` target): tags strip clean, so visible text and
     // layout never change.
@@ -1539,7 +1607,8 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
 /// Live HTML home: same sections as `homeLive`, never ANSI, with links.
 /// Game lines link to their league page; per-league links spell today
 /// out (`/{slug}?date={day}`), sharing the static home spelling. The
-/// nav mirrors `homeHtml`.
+/// footer nav mirrors `homeHtml`; the date-nav line up top mirrors the
+/// live text home's (`writeHomeNavLine`, same visible text).
 pub fn homeHtmlLive(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -1553,6 +1622,10 @@ pub fn homeHtmlLive(
     const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
     defer allocator.free(heading);
     try pageHead(w, heading);
+    // Date nav opens the page, ahead of the sections: the HTML twin of
+    // the live text home's nav line. Emitted directly (not through the
+    // section buffer) so the first section row keeps the page `<h1>`.
+    try writeHomeNavHtml(w, allocator, day);
     // Sections render aside, then the first row becomes the page `<h1>`
     // title (see `writeH1FirstLine`): tags strip clean, so visible text
     // and layout never change.
@@ -3102,6 +3175,80 @@ test "home text heading and one-lines name the zone" {
     const utc_lines = try homeOneLineWithZone(std.testing.allocator, &one_sections, false, .utc);
     defer std.testing.allocator.free(utc_lines);
     try std.testing.expect(std.mem.indexOf(u8, utc_lines, "mlb 9/6 UTC") != null);
+}
+
+test "live home opens with prev/next date nav under the heading" {
+    var results: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
+    // Month boundary: Sep 1 navigates to Aug 31 and Sep 2.
+    const output = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", false);
+    defer std.testing.allocator.free(output);
+    const nav = "/all?date=2026-08-31    /all?date=2026-09-02";
+    const nav_at = std.mem.indexOf(u8, output, nav).?;
+    // Directly under the date heading, above the sections.
+    const heading_at = std.mem.indexOf(u8, output, "sprts  2026-09-01 ET").?;
+    try std.testing.expect(nav_at > heading_at);
+    try std.testing.expect(output[nav_at - 1] == '\n');
+    try std.testing.expect(output[nav_at + nav.len] == '\n');
+    const leagues_at = std.mem.indexOf(u8, output, "ALL LEAGUES").?;
+    try std.testing.expect(nav_at < leagues_at);
+    // Text lockstep: plain line, no tags, no ANSI.
+    try std.testing.expect(std.mem.indexOf(u8, output, "<") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+    try expectAlignedTable(output);
+    try expectNoBrokenLines(output, 52);
+    try std.testing.expect(countRules(output) == 0);
+
+    // Quiet mode drops the heading but keeps the nav on top.
+    const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-01", true);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, nav) != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "sprts") == null);
+}
+
+test "live HTML home nav links mirror the text nav" {
+    var results: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| results[i] = .{ .league = league };
+    const page = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-01", false);
+    defer std.testing.allocator.free(page);
+    // Same visible text as the text nav, each half its own well-formed link.
+    const linked = "<a href=\"/all?date=2026-08-31\">/all?date=2026-08-31</a>" ++
+        "    " ++
+        "<a href=\"/all?date=2026-09-02\">/all?date=2026-09-02</a>";
+    const nav_at = std.mem.indexOf(u8, page, linked).?;
+    // Inside <pre>, ahead of the sections.
+    const pre_at = std.mem.indexOf(u8, page, "<pre>").?;
+    try std.testing.expect(nav_at > pre_at);
+    const leagues_at = std.mem.indexOf(u8, page, "ALL LEAGUES").?;
+    try std.testing.expect(nav_at < leagues_at);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "static homes carry the same date nav when dated" {
+    // Dated static text home: nav under the heading, same spelling.
+    const dated = try homeDay(std.testing.allocator, false, "2026-09-01");
+    defer std.testing.allocator.free(dated);
+    const nav = "/all?date=2026-08-31    /all?date=2026-09-02";
+    const nav_at = std.mem.indexOf(u8, dated, nav).?;
+    const heading_at = std.mem.indexOf(u8, dated, "sprts\n").?;
+    try std.testing.expect(nav_at > heading_at);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "<") == null);
+    // Dateless static home is unchanged: no day, no nav.
+    const plain = try home(std.testing.allocator, false);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "?date=") == null);
+    // Dated static HTML home: linked twins of the same line.
+    const html_dated = try homeHtmlDay(std.testing.allocator, "2026-09-01");
+    defer std.testing.allocator.free(html_dated);
+    try std.testing.expect(std.mem.indexOf(u8, html_dated, "<a href=\"/all?date=2026-08-31\">/all?date=2026-08-31</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html_dated, "<a href=\"/all?date=2026-09-02\">/all?date=2026-09-02</a>") != null);
+    _ = try std.unicode.Utf8View.init(dated);
+    // Hostile day text renders no nav instead of failing the page.
+    const hostile = try homeDay(std.testing.allocator, false, "2026-09-06&<>\"'");
+    defer std.testing.allocator.free(hostile);
+    try std.testing.expect(std.mem.indexOf(u8, hostile, "?date=") == null);
 }
 
 test "?tz= wiring flips day and label, invalid is ignored" {

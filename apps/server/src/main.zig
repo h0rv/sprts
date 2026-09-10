@@ -133,7 +133,9 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
         },
         .home => |home_route| {
             status = .ok;
-            const day = try server_app.tz.resolveDay(arena, null, now_s, zone);
+            // Explicit ?date wins verbatim via tz.resolveDay (relative
+            // tokens ride the request zone); missing ?date is today.
+            const day = try server_app.tz.resolveDay(arena, home_route.date, now_s, zone);
             const boards = try adapter.fetchAll(arena, day);
             defer server_app.provider.EspnAdapter.releaseAll(boards);
             const color = home_route.color orelse color_default;
@@ -592,7 +594,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .docs => arena.dupe(u8, "docs"),
         .llms => arena.dupe(u8, "llms"),
         .favicon => arena.dupe(u8, "favicon"),
-        .home => arena.dupe(u8, "home"),
+        .home => |r| std.fmt.allocPrint(arena, "home/{s}", .{r.date orelse "today"}),
         .leagues => arena.dupe(u8, "leagues"),
         .bad_date => arena.dupe(u8, "bad_date"),
         .not_found => arena.dupe(u8, "not_found"),

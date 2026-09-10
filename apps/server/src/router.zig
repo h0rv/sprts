@@ -114,6 +114,7 @@ pub const TeamsRoute = struct {
 };
 
 pub const HomeRoute = struct {
+    date: ?[]const u8,
     color: ?bool,
     quiet: bool = false,
     oneline: bool = false,
@@ -167,11 +168,16 @@ pub fn parse(target: []const u8) Route {
     const query = if (query_at) |at| target[at + 1 ..] else "";
     const display = parseDisplay(query);
 
-    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .home = .{
-        .color = display.color,
-        .quiet = display.quiet,
-        .oneline = display.oneline,
-    } };
+    if (std.mem.eql(u8, path, "/") or path.len == 0) {
+        const day = queryValue(query, "date");
+        if (day) |value| if (!dates.validate(value) and !dates.isRelativeToken(value)) return .bad_date;
+        return .{ .home = .{
+            .date = day,
+            .color = display.color,
+            .quiet = display.quiet,
+            .oneline = display.oneline,
+        } };
+    }
     if (std.mem.eql(u8, path, "/healthz")) return .health;
     if (std.mem.eql(u8, path, "/openapi.json")) return .openapi;
     if (std.mem.eql(u8, path, "/docs")) return .docs;
@@ -733,6 +739,28 @@ test "relative date tokens parse on scoreboard and all routes" {
     const composed = parse("/mlb?date=today&width=80").scoreboard;
     try std.testing.expectEqualStrings("today", composed.date.?);
     try std.testing.expect(composed.width.? == 80);
+}
+
+test "home honors an optional date like scoreboard and all" {
+    // Dateless home is unchanged: today by serve-time default.
+    try std.testing.expect(parse("/").home.date == null);
+    try std.testing.expect(parse("/").home.color == null);
+    // Strict dates and relative tokens ride through verbatim; the serve
+    // path resolves them via tz.resolveDay like every other dated route.
+    try std.testing.expectEqualStrings("2026-09-01", parse("/?date=2026-09-01").home.date.?);
+    try std.testing.expectEqualStrings("today", parse("/?date=today").home.date.?);
+    try std.testing.expectEqualStrings("tomorrow", parse("/?date=tomorrow").home.date.?);
+    try std.testing.expectEqualStrings("yesterday", parse("/?date=yesterday").home.date.?);
+    // Junk dates miss the same way they do on scoreboard and all.
+    try std.testing.expect(parse("/?date=2026-13-40") == .bad_date);
+    try std.testing.expect(parse("/?date=Tomorrow") == .bad_date);
+    try std.testing.expect(parse("/?date=TODAY") == .bad_date);
+    // Date composes with the display flags.
+    const composed = parse("/?date=2026-09-01&q&0").home;
+    try std.testing.expectEqualStrings("2026-09-01", composed.date.?);
+    try std.testing.expect(composed.quiet);
+    try std.testing.expect(composed.oneline);
+    try std.testing.expect(parse("/?date=2026-09-01&color=0").home.color.? == false);
 }
 
 test "single-letter aliases combine and separate" {

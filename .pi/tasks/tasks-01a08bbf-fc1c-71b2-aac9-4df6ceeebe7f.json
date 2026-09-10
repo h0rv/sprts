@@ -1,0 +1,49 @@
+{
+  "nextId": 5,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Add ?date= to HomeRoute in router.zig",
+      "description": "Router parses ?date= on / into HomeRoute.date with bad_date on invalid; add router test",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789051247363,
+      "updatedAt": 1789051264125
+    },
+    {
+      "id": "2",
+      "subject": "Add date-nav line to home renderers in render.zig",
+      "description": "Shared homeNavDates composer + text/HTML emitters; wire into homeLiveWithZone, homeHtmlLive, homeHtmlDay, new homeDay (home delegates); add render tests incl month boundary",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789051247364,
+      "updatedAt": 1789051302800
+    },
+    {
+      "id": "3",
+      "subject": "Wire ?date= through serve paths in main/worker",
+      "description": "Pass home_route.date to tz.resolveDay in apps/server/src/main.zig and worker.zig home branches (incl routeLabel)",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789051247364,
+      "updatedAt": 1789051377877
+    },
+    {
+      "id": "4",
+      "subject": "Run tests, commit, report",
+      "description": "Run apps/server tests via mise exec, fix fallout, commit in worktree, report SHA/design/files/tests/counts",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789051247364,
+      "updatedAt": 1789051623482
+    }
+  ]
+}
