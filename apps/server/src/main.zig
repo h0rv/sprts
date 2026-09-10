@@ -179,7 +179,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
             const day = try server_app.tz.resolveDay(arena, score_route.date, now_s, zone);
             // SSE is a text-only progressive render: JSON and HTML shape a
             // document, not a redraw loop. Header- or query-triggered stream
@@ -282,23 +282,21 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
             var fetch_ctx = DetailFetchCtx{ .adapter = adapter, .league = league, .id = game_route.id };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            const cached = cache.getOrFetchDetail(arena, slug, game_route.id, cache.now(), &fetch_ctx, fetchDetailPayload) catch |err| switch (err) {
-                error.GameNotFound => {
+            const cached = cache.getOrFetchDetail(arena, slug, game_route.id, cache.now(), &fetch_ctx, fetchDetailPayload) catch |err| {
+                if (core.isNotFound(err)) {
                     upstream_ms = elapsedMs(start, io);
                     status = .not_found;
                     try respondError(arena, request, "game not found", format, .not_found);
                     return;
-                },
-                else => {
-                    upstream_ms = elapsedMs(start, io);
-                    status = .bad_gateway;
-                    std.log.warn("ESPN detail request failed for {s} {s}: {t}", .{ league.slug, game_route.id, err });
-                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
-                    return;
-                },
+                }
+                upstream_ms = elapsedMs(start, io);
+                status = .bad_gateway;
+                std.log.warn("ESPN detail request failed for {s} {s}: {t}", .{ league.slug, game_route.id, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
             };
             upstream_ms = if (cached.outcome == .hit) 0 else elapsedMs(start, io);
             cache_state = @tagName(cached.outcome);
@@ -326,18 +324,16 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const view = server_app.provider.fetchTeam(adapter, arena, league, today_route.abbr) catch |err| switch (err) {
-                error.TeamNotFound => {
+            const view = server_app.provider.fetchTeam(adapter, arena, league, today_route.abbr) catch |err| {
+                if (core.isNotFound(err)) {
                     status = .not_found;
                     try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
                     return;
-                },
-                else => {
-                    status = .bad_gateway;
-                    std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, today_route.abbr, err });
-                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
-                    return;
-                },
+                }
+                status = .bad_gateway;
+                std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, today_route.abbr, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
             };
             const dest = if (core.schedule.findTodayGame(view)) |game|
                 if (today_route.api)
@@ -544,25 +540,23 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
-            const abbr = try server_app.edge_cache.canonicalAbbr(arena, team_route.abbr);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
+            const abbr = try core.cache.canonicalAbbr(arena, team_route.abbr);
             const key: server_app.native_cache.Key = .{ .team = .{ .slug = slug, .abbr = abbr } };
             var fetch_ctx = TeamFetchCtx{ .adapter = adapter, .league = league, .abbr = team_route.abbr };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchTeamPayload) catch |err| switch (err) {
-                error.TeamNotFound => {
+            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchTeamPayload) catch |err| {
+                if (core.isNotFound(err)) {
                     upstream_ms = elapsedMs(start, io);
                     status = .not_found;
                     try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
                     return;
-                },
-                else => {
-                    upstream_ms = elapsedMs(start, io);
-                    status = .bad_gateway;
-                    std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, team_route.abbr, err });
-                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
-                    return;
-                },
+                }
+                upstream_ms = elapsedMs(start, io);
+                status = .bad_gateway;
+                std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, team_route.abbr, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
             };
             upstream_ms = if (cached.outcome == .hit) 0 else elapsedMs(start, io);
             cache_state = @tagName(cached.outcome);
@@ -585,24 +579,22 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
             const key: server_app.native_cache.Key = .{ .standings = .{ .slug = slug } };
             var fetch_ctx = StandingsFetchCtx{ .adapter = adapter, .league = league };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
-            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchStandingsPayload) catch |err| switch (err) {
-                error.UnsupportedLeague => {
+            const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchStandingsPayload) catch |err| {
+                if (core.isNotFound(err)) {
                     upstream_ms = elapsedMs(start, io);
                     status = .not_found;
                     try respondError(arena, request, "standings unavailable for this league; see /api/v1/leagues", format, .not_found);
                     return;
-                },
-                else => {
-                    upstream_ms = elapsedMs(start, io);
-                    status = .bad_gateway;
-                    std.log.warn("ESPN standings request failed for {s}: {t}", .{ league.slug, err });
-                    try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
-                    return;
-                },
+                }
+                upstream_ms = elapsedMs(start, io);
+                status = .bad_gateway;
+                std.log.warn("ESPN standings request failed for {s}: {t}", .{ league.slug, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
             };
             upstream_ms = if (cached.outcome == .hit) 0 else elapsedMs(start, io);
             cache_state = @tagName(cached.outcome);
@@ -657,7 +649,7 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const slug = try server_app.edge_cache.canonicalSlug(arena, league.slug);
+            const slug = try core.cache.canonicalSlug(arena, league.slug);
             const key: server_app.native_cache.Key = .{ .teams = .{ .slug = slug } };
             var fetch_ctx = TeamsFetchCtx{ .adapter = adapter, .league = league };
             const start = std.Io.Clock.Timestamp.now(io, .awake);

@@ -5,7 +5,7 @@
 //! - Namespaces use the same components: board `(slug, day)`, detail
 //!   `(slug, id)`, team `(slug, abbr)`, standings `(slug)` (no date: the
 //!   endpoint is the current table only). Slugs/abbrevs must arrive
-//!   pre-canonicalized (lowercase via `edge_cache.canonicalSlug` /
+//!   pre-canonicalized (lowercase via `core.cache.canonicalSlug` /
 //!   `canonicalAbbr`); canonicalization stays in the serve layer exactly
 //!   like the worker's `serveBoard`/`serveTeam`.
 //! - Fresh windows serve directly (board/detail 30s, 10s when the stored
@@ -62,7 +62,7 @@ fn kindOf(key: Key) Kind {
     };
 }
 
-/// Fresh window, reused from `edge_cache`: board/detail share the 30s
+/// Fresh window, shared from `core.cache`: board/detail share the 30s
 /// board window; team renders track the 60s schedule window. Standings
 /// track the schedule window too: tables move at schedule cadence (a game
 /// final at a time), not at live-score cadence.
@@ -72,18 +72,18 @@ fn kindOf(key: Key) Kind {
 /// expires after 10s even though this function still reports 30s.
 pub fn freshTtl(kind: Kind) i64 {
     return switch (kind) {
-        .board, .detail => edge.fresh_ttl_s,
-        .team, .standings, .teams => edge.schedule_fresh_ttl_s,
+        .board, .detail => core.cache.fresh_ttl_s,
+        .team, .standings, .teams => core.cache.schedule_fresh_ttl_s,
     };
 }
 
-/// Stale window, reused from `edge_cache`: 300s board/detail, 600s team.
+/// Stale window, shared from `core.cache`: 300s board/detail, 600s team.
 /// Standings reuse the 600s schedule window: a stale table still renders
 /// usefully (positions barely move in 10 minutes).
 pub fn staleTtl(kind: Kind) i64 {
     return switch (kind) {
-        .board, .detail => edge.stale_ttl_s,
-        .team, .standings, .teams => edge.schedule_stale_ttl_s,
+        .board, .detail => core.cache.stale_ttl_s,
+        .team, .standings, .teams => core.cache.schedule_stale_ttl_s,
     };
 }
 
@@ -94,9 +94,9 @@ pub fn staleTtl(kind: Kind) i64 {
 /// that was actually cached — never the request.
 fn freshWindowFor(kind: Kind, data: Data) i64 {
     return switch (kind) {
-        .board => if (edge.isLiveBoard(data.board)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
-        .detail => if (edge.isLiveDetail(data.detail)) edge.live_fresh_ttl_s else edge.fresh_ttl_s,
-        .team, .standings, .teams => edge.schedule_fresh_ttl_s,
+        .board => if (core.cache.isLiveBoard(data.board)) core.cache.live_fresh_ttl_s else core.cache.fresh_ttl_s,
+        .detail => if (core.cache.isLiveDetail(data.detail)) core.cache.live_fresh_ttl_s else core.cache.fresh_ttl_s,
+        .team, .standings, .teams => core.cache.schedule_fresh_ttl_s,
     };
 }
 
@@ -322,9 +322,8 @@ pub const NativeCache = struct {
 
     /// Fresh hit returns `.hit`; a successful fetch stores and returns
     /// `.miss`; a failed fetch with a live stale entry returns `.stale`,
-    /// else the fetch error propagates. `GameNotFound`/`TeamNotFound`/
-    /// `UnsupportedLeague` bypass the stale path (a 404 is authoritative,
-    /// never staleable).
+    /// else the fetch error propagates. `core.isNotFound` errors bypass
+    /// the stale path (a 404 is authoritative, never staleable).
     pub fn getOrFetch(
         cache: *NativeCache,
         arena: std.mem.Allocator,
@@ -335,7 +334,7 @@ pub const NativeCache = struct {
     ) !Cached {
         if (try cache.getFresh(arena, key, at)) |data| return .{ .data = data, .outcome = .hit };
         const data = fetch(ctx, arena) catch |err| {
-            if (err == error.GameNotFound or err == error.TeamNotFound or err == error.UnsupportedLeague) return err;
+            if (core.isNotFound(err)) return err;
             if (try cache.getStale(arena, key, at)) |stale| return .{ .data = stale, .outcome = .stale };
             return err;
         };
@@ -392,14 +391,14 @@ pub const NativeCache = struct {
         if (try cache.getFresh(arena, live_key, at)) |data| return .{ .data = data, .outcome = .hit };
         if (try cache.getFresh(arena, final_key, at)) |data| return .{ .data = data, .outcome = .hit };
         const data = fetch(ctx, arena) catch |err| {
-            if (err == error.GameNotFound or err == error.TeamNotFound or err == error.UnsupportedLeague) return err;
+            if (core.isNotFound(err)) return err;
             if (try cache.getStale(arena, live_key, at)) |stale| return .{ .data = stale, .outcome = .stale };
             if (try cache.getStale(arena, final_key, at)) |stale| return .{ .data = stale, .outcome = .stale };
             return err;
         };
         const live = switch (data) {
-            .board => |b| edge.isLiveBoard(b),
-            .detail => |d| edge.isLiveDetail(d),
+            .board => |b| core.cache.isLiveBoard(b),
+            .detail => |d| core.cache.isLiveDetail(d),
             .team, .standings, .teams => false,
         };
         cache.put(if (live) live_key else final_key, data, at) catch |err| {
