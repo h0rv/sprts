@@ -188,10 +188,15 @@ pub const Navigator = struct {
     }
 
     /// Push `current` and move to `next`; selection resets at the call site.
+    /// `next` is duped BEFORE `current` is freed: every caller threads
+    /// `current` slices (league/date) into `next`, so freeing first reads
+    /// freed memory (garbage league -> 404 -> `BadStatus` on open).
     pub fn open(self: *Navigator, next: Frame) !void {
+        var owned = try dupeFrame(self.alloc, next);
+        errdefer freeFrame(self.alloc, &owned);
         try self.history.append(self.alloc, try dupeFrame(self.alloc, self.current));
         freeFrame(self.alloc, &self.current);
-        self.current = try dupeFrame(self.alloc, next);
+        self.current = owned;
     }
 
     /// Pop back; false when already at the root (caller stays put).
@@ -310,31 +315,329 @@ pub fn boardHasLive(board: sprts_client.Scoreboard) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Row text (compact `AWY 2 @ HME 5  Final` rows, plain.zig shape)
+// Server-parity text kit (production web/curl views, text mode)
+//
+// Mirrors `apps/server/src/table.zig` (cell widths, fit, padded cells) and
+// `apps/server/src/render.zig` (`scoreParticipantLine`, `statusColor`,
+// `writeGameMarks`, `text_home_banner_small`). String literals below are
+// duplicated from those server sources with citing comments; the CLI never
+// imports server code.
 // ---------------------------------------------------------------------------
 
-pub fn gameRowText(allocator: Allocator, game: gen.ScoreboardGamesItem) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
-    const away = pickSide(game.participants, "away", 0);
-    const home = pickSide(game.participants, "home", 1);
-    if (away == null or home == null) {
-        const label = if (game.name.len > 0) game.name else game.id;
-        try w.print("{s}  {s}", .{ label, game.status });
-        return out.toOwnedSlice();
-    }
-    try teamChunk(w, away.?);
-    try w.writeAll(" @ ");
-    try teamChunk(w, home.?);
-    try w.print("  {s}", .{game.status});
-    return out.toOwnedSlice();
+/// Server text boards render 52 columns wide by default
+/// (`textWithZoneArt` clamps `width orelse 52` into `52..200`); the TUI
+/// uses the same width so participant rows match byte for byte.
+pub const board_cols: usize = 52;
+
+/// Team-mark height cap: braille cards stay a glanceable block instead of
+/// pushing games off the viewport (checked-in xs marks are ~4 rows).
+pub const mark_cap_height: usize = 6;
+
+/// Block `sprts` wordmark topping every TUI screen. Letterforms duplicated
+/// from the server's `text_home_banner_small` in
+/// `apps/server/src/render.zig` (same 13-polygon pixel logo, one cell per
+/// pixel, 3-cell letters with 2-cell gaps). Never ANSI, like the original.
+pub const tui_banner: []const u8 =
+    \\                █
+    \\██   ███  ███  ███  ██
+    \\███  █ █  █     █   ███
+    \\ ██  ███  █     ██   ██
+    \\     █
+++ "\n";
+
+pub fn renderBanner(w: *std.Io.Writer) !void {
+    try w.writeAll(tui_banner);
 }
 
-fn teamChunk(w: *std.Io.Writer, p: gen.ScoreboardGamesItemParticipantsItem) !void {
-    try w.writeAll(p.abbreviation);
-    if (p.record) |record| try w.print(" ({s})", .{record});
-    if (p.score.len > 0) try w.print(" {s}", .{p.score});
+/// Terminal cells for one code point: 0 for combining marks, 2 for
+/// East-Asian wide, 1 for everything else (controls render as one blank
+/// cell). Mirrors `cellWidth` in `apps/server/src/table.zig`.
+fn cellWidth(cp: u21) usize {
+    if (isCombining(cp)) return 0;
+    if (isWide(cp)) return 2;
+    return 1;
+}
+
+/// Combining-mark ranges, mirrored from `apps/server/src/table.zig`.
+fn isCombining(cp: u21) bool {
+    return (cp >= 0x0300 and cp <= 0x036F) or
+        (cp >= 0x0483 and cp <= 0x0489) or
+        (cp >= 0x0591 and cp <= 0x05BD) or
+        cp == 0x05BF or
+        (cp >= 0x05C1 and cp <= 0x05C2) or
+        (cp >= 0x05C4 and cp <= 0x05C5) or
+        cp == 0x05C7 or
+        (cp >= 0x0610 and cp <= 0x061A) or
+        (cp >= 0x064B and cp <= 0x065F) or
+        cp == 0x0670 or
+        (cp >= 0x06D6 and cp <= 0x06DC) or
+        (cp >= 0x06DF and cp <= 0x06E4) or
+        (cp >= 0x06E7 and cp <= 0x06E8) or
+        (cp >= 0x06EA and cp <= 0x06ED) or
+        cp == 0x0711 or
+        (cp >= 0x0730 and cp <= 0x074A) or
+        (cp >= 0x07A6 and cp <= 0x07B0) or
+        (cp >= 0x0900 and cp <= 0x0903) or
+        (cp >= 0x093A and cp <= 0x094F) or
+        (cp >= 0x0951 and cp <= 0x0957) or
+        (cp >= 0x0962 and cp <= 0x0963) or
+        (cp >= 0x1AB0 and cp <= 0x1AFF) or
+        (cp >= 0x1DC0 and cp <= 0x1DFF) or
+        (cp >= 0x20D0 and cp <= 0x20FF) or
+        (cp >= 0xFE20 and cp <= 0xFE2F);
+}
+
+/// East-Asian wide ranges, mirrored from `apps/server/src/table.zig`.
+fn isWide(cp: u21) bool {
+    return (cp >= 0x1100 and cp <= 0x115F) or
+        cp == 0x231A or cp == 0x231B or
+        cp == 0x2329 or cp == 0x232A or
+        (cp >= 0x23E9 and cp <= 0x23EC) or
+        cp == 0x23F0 or cp == 0x23F3 or
+        cp == 0x25FD or cp == 0x25FE or
+        cp == 0x2614 or cp == 0x2615 or
+        (cp >= 0x2648 and cp <= 0x2653) or
+        cp == 0x267F or cp == 0x2693 or cp == 0x26A1 or
+        cp == 0x26AA or cp == 0x26AB or
+        cp == 0x26BD or cp == 0x26BE or
+        cp == 0x26C4 or cp == 0x26C5 or
+        cp == 0x26CE or cp == 0x26D4 or
+        cp == 0x26EA or
+        cp == 0x26F2 or cp == 0x26F3 or
+        cp == 0x26F5 or cp == 0x26FA or cp == 0x26FD or
+        cp == 0x2705 or cp == 0x270A or cp == 0x270B or
+        cp == 0x2728 or cp == 0x274C or cp == 0x274E or
+        (cp >= 0x2753 and cp <= 0x2755) or
+        cp == 0x2757 or
+        (cp >= 0x2795 and cp <= 0x2797) or
+        cp == 0x27B0 or cp == 0x27BF or
+        cp == 0x2B1B or cp == 0x2B1C or
+        cp == 0x2B50 or cp == 0x2B55 or
+        (cp >= 0x2E80 and cp <= 0xA4CF and cp != 0x303F) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE10 and cp <= 0xFE19) or
+        (cp >= 0xFE30 and cp <= 0xFE4F) or
+        (cp >= 0xFF00 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x20000 and cp <= 0x2FFFD) or
+        (cp >= 0x30000 and cp <= 0x3FFFD);
+}
+
+/// Decode one code point: byte length and value. Invalid bytes decode as
+/// U+FFFD with length 1. Mirrors `decode` in `apps/server/src/table.zig`.
+fn decodeCell(s: []const u8, i: usize) struct { len: usize, cp: u21 } {
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .len = 1, .cp = 0xFFFD };
+    if (i + len > s.len) return .{ .len = 1, .cp = 0xFFFD };
+    const cp = std.unicode.utf8Decode(s[i..][0..len]) catch return .{ .len = 1, .cp = 0xFFFD };
+    return .{ .len = len, .cp = cp };
+}
+
+fn isControl(cp: u21) bool {
+    return cp < 0x20 or cp == 0x7F or (cp >= 0x80 and cp <= 0x9F);
+}
+
+/// Terminal cells in a text cell (name, status, record). Mirrors
+/// `textCells` in `apps/server/src/table.zig`.
+fn textCells(s: []const u8) usize {
+    var cells: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeCell(s, i);
+        cells += cellWidth(d.cp);
+        i += d.len;
+    }
+    return cells;
+}
+
+/// Fits `s` into `width` columns: byte length to keep plus whether an
+/// ellipsis is owed. Mirrors `fit` in `apps/server/src/table.zig`.
+fn fitEnd(s: []const u8, width: usize) struct { usize, bool } {
+    if (s.len <= width) return .{ s.len, false };
+    if (width < 4) return .{ 0, true };
+    var end: usize = width - 3;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return .{ end, true };
+}
+
+/// Copy `s[0..end]` with hardening: controls become one ASCII space each,
+/// invalid bytes become U+FFFD. Mirrors `writeSanitized` in
+/// `apps/server/src/table.zig`.
+fn writeSanitized(w: *std.Io.Writer, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const d = decodeCell(s, i);
+        if (d.cp == 0xFFFD and !(s[i] == 0xEF and d.len == 3)) {
+            try w.writeAll("�");
+        } else if (isControl(d.cp)) {
+            try w.writeByte(' ');
+        } else {
+            try w.writeAll(s[i..][0..d.len]);
+        }
+        i += d.len;
+    }
+}
+
+/// `s` fitted to exactly `width` cells, left-aligned. Color wraps at emit
+/// time, never inside. Mirrors `writeCell` in `apps/server/src/table.zig`.
+fn writeCell(w: *std.Io.Writer, s: []const u8, width: usize) !void {
+    const end, const ellipsis = fitEnd(s, width);
+    try writeSanitized(w, s[0..end]);
+    if (ellipsis) try w.writeAll("…");
+    const n_written: usize = textCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
+    var i: usize = n_written;
+    while (i < width) : (i += 1) try w.writeByte(' ');
+}
+
+/// `s` fitted to exactly `width` cells, right-aligned. Mirrors
+/// `writeCellRight` in `apps/server/src/table.zig`.
+fn writeCellRight(w: *std.Io.Writer, s: []const u8, width: usize) !void {
+    const end, const ellipsis = fitEnd(s, width);
+    const n_written: usize = textCells(s[0..end]) + (if (ellipsis) @as(usize, 1) else 0);
+    var spaces: usize = width -| n_written;
+    while (spaces > 0) : (spaces -= 1) try w.writeByte(' ');
+    try writeSanitized(w, s[0..end]);
+    if (ellipsis) try w.writeAll("…");
+}
+
+/// Server ANSI roles (`statusColor` in `apps/server/src/render.zig`): live
+/// rows read red, upcoming yellow, everything else plain. Winner rows wrap
+/// green at emit time; headings dim. `enabled == false` emits zero escapes.
+fn statusColor(state: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, state, "in")) return "1;31";
+    if (std.mem.eql(u8, state, "pre")) return "33";
+    return null;
+}
+
+fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !void {
+    if (!enabled) {
+        try w.writeAll(s);
+        return;
+    }
+    try w.print("\x1b[{s}m", .{code});
+    try w.writeAll(s);
+    try w.writeAll("\x1b[0m");
+}
+
+/// One columnar participant row, byte-identical to the server's
+/// `scoreParticipantLine` in `apps/server/src/render.zig` for the same
+/// inputs at the same `cols`: abbr in 4, padded name, right-aligned score
+/// in 4, ` (record)`, winner ` ✓`, trailing blanks trimmed. Generic over
+/// the board and detail participant shapes (same fields, different
+/// generated type names).
+pub fn participantRow(allocator: Allocator, p: anytype, cols: usize) ![]u8 {
+    const rec_w: usize = if (p.record) |r| @min(textCells(r), 10) else 0;
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const b = &buf.writer;
+    if (p.abbreviation.len > 0) {
+        try writeCell(b, p.abbreviation, 4);
+        try b.writeByte(' ');
+        try writeCell(b, p.name, cols -| 4 -| 2 -| 4 -| 2 -| (if (p.record != null) rec_w + 3 else 0));
+    } else {
+        // Athlete identities carry no abbreviation: the name absorbs it.
+        try writeCell(b, p.name, cols -| 7 -| (if (p.record != null) rec_w + 3 else 0));
+    }
+    try b.writeByte(' ');
+    try writeCellRight(b, p.score, 4);
+    if (p.record) |r| {
+        try b.writeAll(" (");
+        try writeCell(b, r, rec_w);
+        try b.writeByte(')');
+    }
+    if (p.winner) try b.writeAll(" ✓") else try b.writeAll("  ");
+    const raw = try buf.toOwnedSlice();
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trimEnd(u8, raw, " "));
+}
+
+/// Both teams' braille marks as terminal rows, mirroring the server's
+/// `writeGameMarks` card in `apps/server/src/table.zig`: direct
+/// `core.art.teamArt(league, abbr, .xs)` lookups, side by side with a
+/// 2-cell gap when the pair fits in `cols`, stacked otherwise. Color on
+/// resolves the color sidecar and strips its SGR runs (the TUI owns its
+/// own palette, so mark escapes never reach the frame); color off takes
+/// the mono mark. Height is capped at `mark_cap_height` rows; a side with
+/// no mark is skipped, so unknown abbrevs yield zero rows. Caller frees
+/// each row and the slice.
+pub fn gameMarks(
+    allocator: Allocator,
+    league: []const u8,
+    first_abbr: []const u8,
+    second_abbr: []const u8,
+    color: bool,
+    cols: usize,
+) ![][]u8 {
+    var sides: [2]std.ArrayList([]u8) = .{ .empty, .empty };
+    var widths: [2]usize = .{ 0, 0 };
+    var n: usize = 0;
+    errdefer {
+        for (&sides) |*side| {
+            for (side.items) |row| allocator.free(row);
+            side.deinit(allocator);
+        }
+    }
+    for ([2][]const u8{ first_abbr, second_abbr }) |abbr| {
+        if (n == sides.len) break;
+        const raw = if (color)
+            core.art.teamArtColor(league, abbr, .xs) orelse
+                core.art.teamArt(league, abbr, .xs)
+        else
+            core.art.teamArt(league, abbr, .xs);
+        const mark = raw orelse continue;
+        var stripped: std.Io.Writer.Allocating = .init(allocator);
+        defer stripped.deinit();
+        try core.art.stripSgr(&stripped.writer, mark);
+        const blob = try stripped.toOwnedSlice();
+        defer allocator.free(blob);
+        var collected: std.ArrayList([]const u8) = .empty;
+        defer collected.deinit(allocator);
+        var lines = std.mem.splitScalar(u8, blob, '\n');
+        while (lines.next()) |line| try collected.append(allocator, line);
+        // Drop only the trailing empty from the file's final newline;
+        // interior blanks are real logo rows.
+        if (collected.items.len > 0 and collected.items[collected.items.len - 1].len == 0)
+            _ = collected.pop();
+        for (collected.items[0..@min(collected.items.len, mark_cap_height)]) |line| {
+            widths[n] = @max(widths[n], core.art.countCells(line));
+            try sides[n].append(allocator, try allocator.dupe(u8, line));
+        }
+        if (sides[n].items.len == 0) continue;
+        n += 1;
+    }
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |row| allocator.free(row);
+        out.deinit(allocator);
+    }
+    const gap: usize = 2;
+    if (n == 2 and widths[0] + gap + widths[1] <= cols -| 2) {
+        const height = @max(sides[0].items.len, sides[1].items.len);
+        for (0..height) |r| {
+            var row: std.Io.Writer.Allocating = .init(allocator);
+            defer row.deinit();
+            for (0..2) |i| {
+                if (i == 1) {
+                    var g: usize = 0;
+                    while (g < gap) : (g += 1) try row.writer.writeByte(' ');
+                }
+                const line = if (r < sides[i].items.len) sides[i].items[r] else "";
+                try row.writer.writeAll(line);
+                var pad: usize = widths[i] - core.art.countCells(line);
+                while (pad > 0) : (pad -= 1) try row.writer.writeByte(' ');
+            }
+            try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, row.written(), " ")));
+        }
+    } else {
+        for (sides[0..n]) |side| {
+            for (side.items) |line| try out.append(allocator, try allocator.dupe(u8, line));
+        }
+    }
+    for (sides[0..n]) |*side| {
+        for (side.items) |row| allocator.free(row);
+        side.deinit(allocator);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn pickSide(
@@ -395,27 +698,50 @@ pub const ViewContext = struct {
     auto_refresh: bool = false,
     filter: []const u8 = "",
     err: ?[]const u8 = null,
+    color: bool = true,
+    view: ViewTag = .board,
 };
 
 pub fn renderHeader(w: *std.Io.Writer, ctx: ViewContext) !void {
+    if (ctx.color) try w.writeAll("\x1b[2m");
     if (ctx.league_name.len > 0) {
-        try w.print("{s} ({s}) — {s}  [{s}]\n", .{ ctx.league_name, ctx.league, ctx.date, ctx.view_label });
+        try w.print("{s} ({s}) — {s}  [{s}]", .{ ctx.league_name, ctx.league, ctx.date, ctx.view_label });
     } else {
-        try w.print("sprts  [{s}]\n", .{ctx.view_label});
+        try w.print("sprts  [{s}]", .{ctx.view_label});
     }
+    if (ctx.color) try w.writeAll("\x1b[0m");
+    try w.writeByte('\n');
     if (ctx.filter.len > 0) try w.print("filter: {s}\n", .{ctx.filter}) else try w.writeByte('\n');
 }
 
+pub const BoardOptions = struct {
+    color: bool = true,
+    cols: usize = board_cols,
+};
+
+/// Scoreboard blocks in the server's section rhythm (`textWithZoneArt` in
+/// `apps/server/src/render.zig`): dim `GAMES` heading, then per game the
+/// status line (red live, yellow upcoming), columnar participant rows
+/// (`participantRow`), the braille mark card, and a separator rule. Only
+/// the status line carries the selection gutter, so participant rows stay
+/// byte-identical to the server. Nothing emits ANSI with `color == false`.
 pub fn renderBoardRows(
     w: *std.Io.Writer,
     allocator: Allocator,
+    league: []const u8,
     games: []const gen.ScoreboardGamesItem,
     filter: []const u8,
     selected: usize,
     scroll: usize,
     visible: usize,
+    opts: BoardOptions,
 ) !void {
-    try w.writeAll("GAMES\n");
+    try colorize(w, "2", "GAMES", opts.color);
+    try w.writeByte('\n');
+    if (games.len == 0) {
+        try w.writeAll("No games scheduled.\n");
+        return;
+    }
     var filtered: usize = 0;
     var emitted: usize = 0;
     for (games) |game| {
@@ -426,22 +752,51 @@ pub fn renderBoardRows(
             continue;
         }
         if (emitted >= visible) return;
-        const row = try gameRowText(allocator, game);
-        defer allocator.free(row);
-        const live = std.mem.eql(u8, game.state, "in");
-        try w.print("{s}{s}{s}\n", .{ if (filtered == selected) "> " else "  ", if (live) "LIVE " else "", row });
+        var status: std.Io.Writer.Allocating = .init(allocator);
+        defer status.deinit();
+        try status.writer.print("{s}{s}", .{ if (filtered == selected) "> " else "  ", game.status });
+        if (statusColor(game.state)) |code| try colorize(w, code, status.written(), opts.color) else try w.writeAll(status.written());
+        try w.writeByte('\n');
+        if (game.participants.len == 0) {
+            const label = if (game.name.len > 0) game.name else game.id;
+            try w.print("  {s}\n", .{label});
+        }
+        for (game.participants) |p| {
+            const row = try participantRow(allocator, p, opts.cols);
+            defer allocator.free(row);
+            if (opts.color and p.winner) try w.writeAll("\x1b[32m");
+            try w.writeAll(row);
+            if (opts.color and p.winner) try w.writeAll("\x1b[0m");
+            try w.writeByte('\n');
+        }
+        const first = if (game.participants.len > 0) game.participants[0].abbreviation else "";
+        const second = if (game.participants.len > 1) game.participants[1].abbreviation else "";
+        const marks = try gameMarks(allocator, league, first, second, opts.color, opts.cols);
+        defer {
+            for (marks) |line| allocator.free(line);
+            allocator.free(marks);
+        }
+        for (marks) |line| try w.print("{s}\n", .{line});
+        var i: usize = 0;
+        while (i < opts.cols) : (i += 1) try w.writeAll("─");
+        try w.writeByte('\n');
         filtered += 1;
         emitted += 1;
     }
     if (filtered == 0) try w.writeAll("No games match filter. Press / to change.\n");
 }
 
+/// Persistent bottom help bar: freshness plus the key line. The game view
+/// additionally hints `b back` (context-sensitive: every other view pops
+/// with the same key, but only the drill-in view advertises it).
 pub fn renderFooter(w: *std.Io.Writer, ctx: ViewContext) !void {
     if (ctx.err) |msg| try w.print("ERROR: {s}\n", .{msg});
-    try w.print("{s} · auto:{s} · j/k move · h/l day · enter open · s standings · / filter · r refresh · a auto · ? help · b back · q quit\n", .{
+    try w.print("{s} · auto:{s} · j/k move · h/l day · enter open · s standings · / filter · r refresh · a auto · ? help ·", .{
         ctx.age_text,
         if (ctx.auto_refresh) "on" else "off",
     });
+    if (ctx.view == .game) try w.writeAll(" b back ·");
+    try w.writeAll(" q quit\n");
 }
 
 pub fn renderHelp(w: *std.Io.Writer) !void {
@@ -616,6 +971,7 @@ const Tui = struct {
     scroll: usize = 0,
     filter: []u8,
     auto_refresh: bool = true,
+    color: bool = true,
     show_help: bool = false,
     last_update_s: ?i64 = null,
     last_fetch_s: ?i64 = null,
@@ -1017,6 +1373,7 @@ const Tui = struct {
         defer aw.deinit();
         const w = &aw.writer;
         try w.writeAll("\x1b[H");
+        try renderBanner(w);
 
         if (self.show_help) {
             try renderHelp(w);
@@ -1057,6 +1414,7 @@ const Tui = struct {
             .date = frame.date orelse "",
             .view_label = label,
             .filter = self.filter,
+            .color = self.color,
         });
 
         switch (frame.view) {
@@ -1071,12 +1429,14 @@ const Tui = struct {
             .age_text = age_text,
             .auto_refresh = self.auto_refresh,
             .err = self.last_error,
+            .view = frame.view,
         });
         try writeFrame(self.io, aw.written());
     }
 
     fn renderLeagues(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
-        try w.writeAll("LEAGUES\n");
+        try colorize(w, "2", "LEAGUES", self.color);
+        try w.writeByte('\n');
         const list = self.leagues orelse {
             try w.writeAll("No leagues loaded. Press r to retry.\n");
             return;
@@ -1099,10 +1459,11 @@ const Tui = struct {
 
     fn renderBoard(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
         const board = self.board orelse {
-            try w.writeAll("GAMES\nNo games loaded. Press r to retry.\n");
+            try colorize(w, "2", "GAMES", self.color);
+            try w.writeAll("\nNo games loaded. Press r to retry.\n");
             return;
         };
-        try renderBoardRows(w, self.gpa, board.games, self.filter, self.selected, scroll, visible);
+        try renderBoardRows(w, self.gpa, board.league, board.games, self.filter, self.selected, scroll, visible, .{ .color = self.color });
     }
 
     fn renderGame(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
@@ -1121,7 +1482,8 @@ const Tui = struct {
         }
         if (game.venue) |venue| try w.print("venue: {s}\n", .{venue});
         if (game.series) |series| try w.print("series: {s}\n", .{series});
-        try w.writeAll("TEAMS (enter opens schedule)\n");
+        try colorize(w, "2", "TEAMS (enter opens schedule)", self.color);
+        try w.writeByte('\n');
         var filtered: usize = 0;
         var emitted: usize = 0;
         for (game.participants) |p| {
@@ -1131,10 +1493,9 @@ const Tui = struct {
                 continue;
             }
             if (emitted >= visible) return;
-            try w.print("{s}{s} ({s})", .{ if (filtered == self.selected) "> " else "  ", p.abbreviation, p.name });
-            if (p.record) |record| try w.print(" {s}", .{record});
-            if (p.score.len > 0) try w.print(" {s}", .{p.score});
-            try w.writeByte('\n');
+            const row = try participantRow(self.gpa, p, board_cols);
+            defer self.gpa.free(row);
+            try w.print("{s}{s}\n", .{ if (filtered == self.selected) "> " else "  ", row });
             filtered += 1;
             emitted += 1;
         }
@@ -1161,7 +1522,8 @@ const Tui = struct {
     }
 
     fn renderStandings(self: *Tui, w: *std.Io.Writer, scroll: usize, visible: usize) !void {
-        try w.writeAll("STANDINGS (enter opens team)\n");
+        try colorize(w, "2", "STANDINGS (enter opens team)", self.color);
+        try w.writeByte('\n');
         const table = self.standings orelse {
             try w.writeAll("No standings loaded. Press r to retry.\n");
             return;
@@ -1543,22 +1905,31 @@ test "settled boards report no live games" {
     try std.testing.expect(!boardHasLive(board));
 }
 
-test "board rows render compact scores with a live marker" {
+test "board blocks follow the server rhythm with a selected status line" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var fake = FakeTransportState{ .body = canned_board };
     const board = try loadBoard(arena, fake.asTransport(), "https://example.test", "mlb", null);
 
-    const first = try gameRowText(arena, board.games[0]);
-    try std.testing.expectEqualStrings("AWY (10-5) 2 @ HME (12-3) 5  Final", first);
+    const first = try participantRow(arena, board.games[0].participants[0], board_cols);
+    try std.testing.expectEqualStrings("AWY  Away Club                            2 (10-5)", first);
+    const winner = try participantRow(arena, board.games[0].participants[1], board_cols);
+    try std.testing.expectEqualStrings("HME  Home Club                            5 (12-3) ✓", winner);
 
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
-    try renderBoardRows(&out.writer, arena, board.games, "", 1, 0, 10);
+    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 1, 0, 10, .{ .color = false });
     const text = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, text, "> LIVE BEE 0 @ CEE 3  Top 7th") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "  AWY (10-5) 2 @ HME (12-3) 5  Final") != null);
+    // Selected game carries the gutter on its status line; the settled
+    // game keeps a plain gutter. No legacy LIVE text marker remains.
+    try std.testing.expect(std.mem.indexOf(u8, text, "> Top 7th") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Final") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "LIVE") == null);
+    // Columnar participant rows plus the separator rule per game.
+    try std.testing.expect(std.mem.indexOf(u8, text, "AWY  Away Club") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "BEE  Bee Club") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "─") != null);
 }
 
 test "board rows honor filter and scroll windows" {
@@ -1570,19 +1941,19 @@ test "board rows honor filter and scroll windows" {
 
     var filtered: std.Io.Writer.Allocating = .init(arena);
     defer filtered.deinit();
-    try renderBoardRows(&filtered.writer, arena, board.games, "bee", 0, 0, 10);
+    try renderBoardRows(&filtered.writer, arena, board.league, board.games, "bee", 0, 0, 10, .{ .color = false });
     try std.testing.expect(std.mem.indexOf(u8, filtered.written(), "BEE") != null);
     try std.testing.expect(std.mem.indexOf(u8, filtered.written(), "AWY") == null);
 
     var scrolled: std.Io.Writer.Allocating = .init(arena);
     defer scrolled.deinit();
-    try renderBoardRows(&scrolled.writer, arena, board.games, "", 1, 1, 1);
+    try renderBoardRows(&scrolled.writer, arena, board.league, board.games, "", 1, 1, 1, .{ .color = false });
     try std.testing.expect(std.mem.indexOf(u8, scrolled.written(), "BEE") != null);
     try std.testing.expect(std.mem.indexOf(u8, scrolled.written(), "AWY") == null);
 
     var empty: std.Io.Writer.Allocating = .init(arena);
     defer empty.deinit();
-    try renderBoardRows(&empty.writer, arena, board.games, "quidditch", 0, 0, 10);
+    try renderBoardRows(&empty.writer, arena, board.league, board.games, "quidditch", 0, 0, 10, .{ .color = false });
     try std.testing.expect(std.mem.indexOf(u8, empty.written(), "No games match filter") != null);
 }
 
@@ -1625,4 +1996,240 @@ test "footer carries age auto state and the key line" {
     try renderFooter(&off.writer, .{ .age_text = "updated 2h ago", .auto_refresh = false, .err = "boom" });
     try std.testing.expect(std.mem.indexOf(u8, off.written(), "auto:off") != null);
     try std.testing.expect(std.mem.indexOf(u8, off.written(), "ERROR: boom") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Regression + parity tests: pre-game board→enter→game flow, banner,
+// footer hints, server-identical rows, marks, and color-off output.
+// Fixtures replay the PHI pre-game case (`mlb/401816884`, state `pre`)
+// behind a routing fake that 404s anything but the two exact URLs, so a
+// wrong id threading or URL shows up as `BadStatus` here, as in the TUI.
+// ---------------------------------------------------------------------------
+
+const pregame_board =
+    \\{"schema_version":"1","league":"mlb","league_name":"MLB","date":"2026-09-10","source":"test","games":[
+    \\{"id":"401816884","name":"Houston Astros at Philadelphia Phillies","starts_at":"2026-09-10T17:05Z","state":"pre","status":"9/10 - 1:05 PM EDT","participants":[
+    \\{"id":"18","name":"Houston Astros","abbreviation":"HOU","score":"0","winner":false,"home_away":"away","record":"74-72"},
+    \\{"id":"22","name":"Philadelphia Phillies","abbreviation":"PHI","score":"0","winner":false,"home_away":"home","record":"82-64"}]}]}
+;
+
+const pregame_game =
+    \\{"schema_version":"1","league":"mlb","league_name":"MLB","id":"401816884","date":"2026-09-10","state":"pre","status":"9/10 - 1:05 PM EDT",
+    \\"venue":"Citizens Bank Park","series":"tied 1-1 (game 3 of 3)","attendance":null,"situation":null,
+    \\"participants":[
+    \\{"id":"18","name":"Houston Astros","abbreviation":"HOU","score":"0","winner":false,"home_away":"away","record":"74-72","probable":"Cristian Javier","hits":null,"errors":null,"lines":[]},
+    \\{"id":"22","name":"Philadelphia Phillies","abbreviation":"PHI","score":"0","winner":false,"home_away":"home","record":"82-64","probable":"Zack Wheeler","hits":null,"errors":null,"lines":[]}],
+    \\"scoring_plays":[],"decisions":[],"lineups":[],"team_stats":[],"leaders":[]}
+;
+
+const FlowRouter = struct {
+    urls: std.ArrayList([]const u8) = .empty,
+    alloc: Allocator,
+    fn dispatch(ptr: *anyopaque, arena: Allocator, url: []const u8, extra: []const std.http.Header) anyerror!sprts_client.FetchResult {
+        _ = extra;
+        const self: *FlowRouter = @ptrCast(@alignCast(ptr));
+        try self.urls.append(self.alloc, try self.alloc.dupe(u8, url));
+        if (std.mem.eql(u8, url, "https://example.test/api/v1/mlb?date=2026-09-10"))
+            return .{ .status = .ok, .body = try arena.dupe(u8, pregame_board) };
+        if (std.mem.eql(u8, url, "https://example.test/api/v1/mlb/401816884"))
+            return .{ .status = .ok, .body = try arena.dupe(u8, pregame_game) };
+        return .{ .status = .not_found, .body = try arena.dupe(u8, "nope") };
+    }
+    fn asTransport(self: *FlowRouter) sprts_client.HttpTransport {
+        return .{ .ptr = self, .fetchFn = dispatch };
+    }
+};
+
+fn flowIo() std.Io {
+    const S = struct {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+    };
+    return S.threaded.io();
+}
+
+test "regression: board enter opens the pre-game PHI detail at its exact URL" {
+    // Replays the `No game loaded / ERROR: game failed: BadStatus` report:
+    // the pre-game PHI board row must thread its id into exactly
+    // `/api/v1/mlb/401816884` (anything else 404s in the routing fake).
+    var router = FlowRouter{ .alloc = std.testing.allocator };
+    defer {
+        for (router.urls.items) |u| std.testing.allocator.free(u);
+        router.urls.deinit(std.testing.allocator);
+    }
+    var tui = try Tui.init(std.testing.allocator, flowIo(), router.asTransport(), "https://example.test", .{ .view = .board, .league = "mlb", .target = "", .date = "2026-09-10" });
+    defer tui.deinit();
+    tui.loadCurrent();
+    try std.testing.expect(tui.board != null);
+    try std.testing.expect(tui.last_error == null);
+    tui.openSelected();
+    try std.testing.expectEqual(@as(usize, 2), router.urls.items.len);
+    try std.testing.expectEqualStrings("https://example.test/api/v1/mlb?date=2026-09-10", router.urls.items[0]);
+    try std.testing.expectEqualStrings("https://example.test/api/v1/mlb/401816884", router.urls.items[1]);
+    try std.testing.expect(tui.nav.current.view == .game);
+    try std.testing.expectEqualStrings("mlb", tui.nav.current.league);
+    try std.testing.expectEqualStrings("401816884", tui.nav.current.target);
+    try std.testing.expect(tui.game != null);
+    try std.testing.expect(tui.last_error == null);
+    try std.testing.expectEqualStrings("PHI", tui.game.?.participants[1].abbreviation);
+}
+
+test "banner opens every board screen above the heading" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeTransportState{ .body = canned_board };
+    const board = try loadBoard(arena, fake.asTransport(), "https://example.test", "mlb", null);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    defer out.deinit();
+    try renderBanner(&out.writer);
+    try renderHeader(&out.writer, .{
+        .league_name = board.league_name,
+        .league = board.league,
+        .date = board.date,
+        .view_label = "scores",
+        .color = false,
+    });
+    try renderBoardRows(&out.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false });
+    const text = out.written();
+    // Same block wordmark on top, then the heading, then the sections.
+    try std.testing.expect(std.mem.startsWith(u8, text, tui_banner));
+    try std.testing.expect(std.mem.indexOf(u8, text, "GAMES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "GAMES").? > tui_banner.len);
+    // Five block rows, ragged, never ANSI.
+    var rows: usize = 0;
+    var lines = std.mem.splitScalar(u8, tui_banner, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        rows += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "█") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expect(std.mem.indexOf(u8, text[0..tui_banner.len], "\x1b") == null);
+}
+
+test "footer hints follow the view" {
+    var board_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer board_out.deinit();
+    try renderFooter(&board_out.writer, .{ .age_text = "updated 12s ago", .auto_refresh = true });
+    try std.testing.expect(std.mem.indexOf(u8, board_out.written(), "q quit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, board_out.written(), "enter open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, board_out.written(), "b back") == null);
+
+    var game_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer game_out.deinit();
+    try renderFooter(&game_out.writer, .{ .age_text = "updated 12s ago", .auto_refresh = true, .view = .game });
+    try std.testing.expect(std.mem.indexOf(u8, game_out.written(), "q quit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, game_out.written(), "b back") != null);
+}
+
+test "participant rows equal the server columnar layout" {
+    // Pre-game PHI sample: byte-identical to the production text board
+    // (`scoreParticipantLine` in `apps/server/src/render.zig` at 52
+    // columns: abbr in 4, padded name, right-aligned score in 4, record).
+    const phi = gen.ScoreboardGamesItemParticipantsItem{
+        .record = "82-64",
+        .abbreviation = "PHI",
+        .winner = false,
+        .score = "0",
+        .home_away = "home",
+        .id = "22",
+        .name = "Philadelphia Phillies",
+    };
+    const phi_row = try participantRow(std.testing.allocator, phi, board_cols);
+    defer std.testing.allocator.free(phi_row);
+    try std.testing.expectEqualStrings("PHI  Philadelphia Phillies               0 (82-64)", phi_row);
+
+    // Winner tick rides the row like the server's.
+    const hme = gen.ScoreboardGamesItemParticipantsItem{
+        .record = "12-3",
+        .abbreviation = "HME",
+        .winner = true,
+        .score = "5",
+        .home_away = "home",
+        .id = "h",
+        .name = "Home Club",
+    };
+    const hme_row = try participantRow(std.testing.allocator, hme, board_cols);
+    defer std.testing.allocator.free(hme_row);
+    try std.testing.expectEqualStrings("HME  Home Club                            5 (12-3) ✓", hme_row);
+
+    // Missing records collapse without shifting the score column.
+    const bee = gen.ScoreboardGamesItemParticipantsItem{
+        .record = null,
+        .abbreviation = "BEE",
+        .winner = false,
+        .score = "0",
+        .home_away = "away",
+        .id = "b",
+        .name = "Bee Club",
+    };
+    const bee_row = try participantRow(std.testing.allocator, bee, board_cols);
+    defer std.testing.allocator.free(bee_row);
+    try std.testing.expectEqualStrings("BEE  Bee Club                                    0", bee_row);
+}
+
+test "marks show for known teams and vanish for unknown" {
+    for ([2]bool{ false, true }) |color| {
+        const marks = try gameMarks(std.testing.allocator, "mlb", "PHI", "HOU", color, board_cols);
+        defer {
+            for (marks) |line| std.testing.allocator.free(line);
+            std.testing.allocator.free(marks);
+        }
+        // Both xs cards are 4 rows; side by side the card stays 4 tall.
+        try std.testing.expectEqual(@as(usize, 4), marks.len);
+        for (marks) |line| {
+            try std.testing.expect(line.len > 0);
+            try std.testing.expect(core.art.countCells(line) > 0);
+            try std.testing.expect(std.mem.indexOfScalar(u8, line, 0xE2) != null); // braille glyphs
+            try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
+        }
+        // One known side still renders its card.
+        const one = try gameMarks(std.testing.allocator, "mlb", "PHI", "ZZZ", color, board_cols);
+        defer {
+            for (one) |line| std.testing.allocator.free(line);
+            std.testing.allocator.free(one);
+        }
+        try std.testing.expectEqual(@as(usize, 4), one.len);
+        // Unknown abbrevs yield zero rows, cleanly.
+        const none = try gameMarks(std.testing.allocator, "mlb", "ZZZ", "QQQ", color, board_cols);
+        defer std.testing.allocator.free(none);
+        try std.testing.expectEqual(@as(usize, 0), none.len);
+    }
+}
+
+test "color off strips every escape and color on keeps server roles" {
+    const tri_board =
+        \\{"schema_version":"1","league":"mlb","league_name":"MLB","date":"2026-09-10","source":"test","games":[
+        \\{"id":"1","name":"","starts_at":"2026-09-10T17:00Z","state":"post","status":"Final","participants":[
+        \\{"id":"a","name":"Away Club","abbreviation":"AWY","score":"2","winner":false,"home_away":"away","record":"10-5"},
+        \\{"id":"h","name":"Home Club","abbreviation":"HME","score":"5","winner":true,"home_away":"home","record":"12-3"}]},
+        \\{"id":"2","name":"","starts_at":"2026-09-10T19:00Z","state":"in","status":"Top 7th","participants":[
+        \\{"id":"b","name":"Bee Club","abbreviation":"BEE","score":"0","winner":false,"home_away":"away","record":null},
+        \\{"id":"c","name":"Cee Club","abbreviation":"CEE","score":"3","winner":false,"home_away":"home","record":null}]},
+        \\{"id":"401816884","name":"Houston Astros at Philadelphia Phillies","starts_at":"2026-09-10T17:05Z","state":"pre","status":"9/10 - 1:05 PM EDT","participants":[
+        \\{"id":"18","name":"Houston Astros","abbreviation":"HOU","score":"0","winner":false,"home_away":"away","record":"74-72"},
+        \\{"id":"22","name":"Philadelphia Phillies","abbreviation":"PHI","score":"0","winner":false,"home_away":"home","record":"82-64"}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = FakeTransportState{ .body = tri_board };
+    const board = try loadBoard(arena, fake.asTransport(), "https://example.test", "mlb", null);
+
+    var plain: std.Io.Writer.Allocating = .init(arena);
+    defer plain.deinit();
+    try renderBoardRows(&plain.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = false });
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "\x1b") == null);
+    // Winners still read without color: the tick survives the strip.
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "✓") != null);
+
+    var vivid: std.Io.Writer.Allocating = .init(arena);
+    defer vivid.deinit();
+    try renderBoardRows(&vivid.writer, arena, board.league, board.games, "", 0, 0, 10, .{ .color = true });
+    // Dim heading, red live status, yellow upcoming status, green winner.
+    try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[2mGAMES\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[1;31m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[33m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vivid.written(), "\x1b[32m") != null);
 }
