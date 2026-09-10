@@ -3,7 +3,6 @@
 /// Wave 2 is one-shot only (`--plain` default, `--json` raw dump). Any
 /// failure prints one readable line to stderr and exits nonzero — never a
 /// stack trace.
-
 const std = @import("std");
 const cli_app = @import("sprts_cli");
 const core = @import("sprts_core");
@@ -90,7 +89,10 @@ pub fn main(init: std.process.Init) !void {
     var live = LiveState{ .http = &http, .io = io };
     const transport: sprts_client.HttpTransport = .{ .ptr = &live, .fetchFn = LiveState.fetch };
 
-    cli_app.app.run(arena, transport, base_url, opts, today, out, err) catch {
+    // Interactive loop by default on a real terminal; pipes stay one-shot.
+    const tty = cli_app.tui.stdioIsTerminal();
+
+    cli_app.app.run(gpa, arena, transport, base_url, opts, today, out, err, io, tty) catch {
         out.flush() catch {};
         err.flush() catch {};
         std.process.exit(1);

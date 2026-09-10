@@ -1,10 +1,10 @@
-/// Argument parsing for `sprts-tui` (wave 2: one-shot `--plain` mode).
+/// Argument parsing for `sprts-tui`: one-shot `--plain`/`--json` modes plus
+/// the interactive `--tui` loop (wave 3: default when stdout is a TTY).
 ///
 /// Grammar: `sprts-tui [league] [--date YYYY-MM-DD|today|tomorrow|yesterday]
-/// [--plain] [--host URL] [--json] [--tui] [--help]`. `--plain` is the
-/// default one-shot path; `--tui` parses so `app.run` can report its wave-3
-/// stub instead of an unknown-flag error.
-
+/// [--plain] [--host URL] [--json] [--tui] [--help]`. `--plain`/`--json`
+/// force the one-shot path; `--tui` forces the interactive loop, which is
+/// also the default when stdout is a TTY.
 const std = @import("std");
 const core = @import("sprts_core");
 const sprts_client = @import("sprts_client");
@@ -90,10 +90,10 @@ pub fn printUsage(w: *std.Io.Writer) !void {
     try w.print("  --host URL    API base URL (default: {s})\n", .{sprts_client.default_base_url});
     try w.writeAll(
         \\  --json        Dump the raw API response body and exit
-        \\  --tui         Interactive mode (not yet: coming in wave 3)
+        \\  --tui         Interactive scoreboard (default when stdout is a TTY)
         \\  --help, -h    Print this help
         \\
-        \\Keys (coming in wave 3): j/down move · k/up move · h/left prev day · l/right next day · enter open · r refresh · / filter · a auto · ? help · b back · q quit
+        \\Keys: j/down move · k/up move · h/left prev day · l/right next day · enter open · s standings · r refresh · / filter · a auto · ? help · b back · q quit
         \\
     );
 }
@@ -171,7 +171,7 @@ test "date forms resolve to query URLs" {
     try std.testing.expectEqualStrings("https://sprts.horv.co/api/v1/all", all_bare);
 }
 
-test "usage names the binary plus wave-3 keys" {
+test "usage names the binary plus tui keys" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try printUsage(&out.writer);
@@ -179,6 +179,7 @@ test "usage names the binary plus wave-3 keys" {
     try std.testing.expect(std.mem.indexOf(u8, text, "sprts-tui [league]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--host") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "coming in wave 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "--tui") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "j/down") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "s standings") != null);
 }
