@@ -4347,7 +4347,10 @@ test "empty offseason slate is an empty board, outage stays an error" {
     // never an empty board.
     var down = FakeTransportState{ .body = "{\"events\":[]}", .status = .bad_gateway };
     const failing = weekAliasAdapter(&down, threaded.io());
-    try std.testing.expectError(error.UpstreamResponse, failing.fetch(arena, nfl, "2026-06-01"));test "past-date game alias parses and resolves to the canonical game" {
+    try std.testing.expectError(error.UpstreamResponse, failing.fetch(arena, nfl, "2026-06-01"));
+}
+
+test "past-date game alias parses and resolves to the canonical game" {
     // End-to-end shape of the serve path (`main.serveConnection` date_alias
     // arm, `worker.serveDateAlias`): the pretty URL parses, the past day
     // passes through verbatim, and the matchup lookup lands on the board
