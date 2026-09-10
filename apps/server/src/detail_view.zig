@@ -1518,7 +1518,7 @@ fn familyNfl() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "Q4", .text = "Jalen Hurts 1 Yd run (Jake Elliott Kick)", .away_score = "27", .home_score = "24" },
         },
-        .leaders = &.{"KC Passing 320 YDS", "Jalen Hurts 25/34, 280 YDS"},
+        .leaders = &.{ "KC Passing 320 YDS", "Jalen Hurts 25/34, 280 YDS" },
         .team_stats = &.{"KC Total Yards 410"},
     };
 }
@@ -1569,7 +1569,7 @@ fn familyNba() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "Q4", .text = "Jayson Tatum 26-foot three point shot.", .away_score = "112", .home_score = "108" },
         },
-        .leaders = &.{"BOS PTS 112", "Jayson Tatum 34 PTS"},
+        .leaders = &.{ "BOS PTS 112", "Jayson Tatum 34 PTS" },
     };
 }
 
@@ -1619,7 +1619,7 @@ fn familyNhl() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "OT", .text = "David Pastrnak wrist shot, assisted by Brad Marchand.", .away_score = "3", .home_score = "4" },
         },
-        .leaders = &.{"BOS Shots 34", "David Pastrnak 2 G"},
+        .leaders = &.{ "BOS Shots 34", "David Pastrnak 2 G" },
     };
 }
 
@@ -1657,7 +1657,7 @@ fn familySoccer() detail.GameDetail {
         .scoring_plays = &.{
             .{ .period = "78'", .text = "Bukayo Saka right footed shot from the centre of the box.", .away_score = "1", .home_score = "2" },
         },
-        .leaders = &.{"ARS Shots 14", "Bukayo Saka 1 G"},
+        .leaders = &.{ "ARS Shots 14", "Bukayo Saka 1 G" },
         .team_stats = &.{"ARS Possession 58"},
     };
 }
@@ -2024,4 +2024,161 @@ test "family detail without a network skips the TV line on both surfaces" {
     defer arena.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "TV:") == null);
     try expectDetailParity(game);
+}
+
+/// Live regression (2026-09-10, game 401816884): the HOU winner row
+/// rendered `2 ✓ …` — record replaced by an ellipsis — despite space
+/// remaining on the line. Root cause (traced, not guessed): the
+/// participant composer is cell-exact, but the HTML emit refits the row
+/// through the byte-budget `table.fit` (`s.len <= width`), and the
+/// 3-byte `✓` makes an exactly-fitting row look 2 bytes over. The
+/// record column was never dropped by the composer; the refit cut it.
+fn truncFixture() detail.GameDetail {
+    return .{
+        .id = "401816884",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .venue = "Daikin Park",
+        .participants = &.{
+            .{
+                .id = "19",
+                .name = "Philadelphia Phillies",
+                .abbreviation = "PHI",
+                .score = "1",
+                .winner = false,
+                .home_away = "away",
+                .record = "82-65",
+            },
+            .{
+                .id = "18",
+                .name = "Houston Astros",
+                .abbreviation = "HOU",
+                .score = "2",
+                .winner = true,
+                .home_away = "home",
+                .record = "74-73",
+            },
+        },
+    };
+}
+
+fn expectParticipantRowsIntact(page_text: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, page_text, '\n');
+    var phi = false;
+    var hou = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "PHI") == null and std.mem.indexOf(u8, line, "HOU") == null) continue;
+        if (std.mem.indexOf(u8, line, "Philadelphia Phillies") != null) {
+            phi = true;
+            try std.testing.expect(std.mem.indexOf(u8, line, "82-65") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+        }
+        if (std.mem.indexOf(u8, line, "Houston Astros") != null) {
+            hou = true;
+            try std.testing.expect(std.mem.indexOf(u8, line, "2") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "✓") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "74-73") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+        }
+    }
+    try std.testing.expect(phi and hou);
+}
+
+test "detail winner row keeps its record instead of an ellipsis" {
+    const arena = std.testing.allocator;
+    const game = truncFixture();
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try expectParticipantRowsIntact(body);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    const seen = try visiblePre(arena, page);
+    defer arena.free(seen);
+    try expectParticipantRowsIntact(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "…") == null);
+    try expectDetailParity(game);
+}
+
+test "detail participant rows never truncate with space to spare, widths 40..200" {
+    const arena = std.testing.allocator;
+    const game = truncFixture();
+    // Composer level: the honest every-width sweep (`participantLines`
+    // takes the width directly; the page functions clamp below 52).
+    var w: usize = 40;
+    while (w <= 200) : (w += 1) {
+        const rows = try vd.participantLines(arena, game.participants, w);
+        defer vd.freeLines(arena, rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        for (rows) |row| {
+            _ = try std.unicode.Utf8View.init(row);
+            try std.testing.expect(table.textCells(row) <= w);
+            try std.testing.expect(std.mem.indexOf(u8, row, "…") == null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, rows[0], "82-65") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows[1], "74-73") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows[1], "✓") != null);
+    }
+    // Page level: text and HTML agree at every rendered width, and the
+    // short fixture never overflows so no row may carry an ellipsis.
+    w = 52;
+    while (w <= 200) : (w += 1) {
+        const width: u16 = @intCast(w);
+        const body = try renderText(arena, game, false, width, null);
+        defer arena.free(body);
+        try expectParticipantRowsIntact(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "…") == null);
+        const page = try detailHtml(arena, game, width, null);
+        defer arena.free(page);
+        const seen = try visiblePre(arena, page);
+        defer arena.free(seen);
+        try expectParticipantRowsIntact(seen);
+        try std.testing.expect(std.mem.indexOf(u8, seen, "…") == null);
+    }
+}
+
+test "scoreboard and team composers hold the same fixture without truncation" {
+    const arena = std.testing.allocator;
+    // Scoreboard composer: same two sides as domain participants.
+    const sides = [_]core.domain.Participant{
+        .{ .id = "19", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "1", .winner = false, .home_away = "away", .record = "82-65" },
+        .{ .id = "18", .name = "Houston Astros", .abbreviation = "HOU", .score = "2", .winner = true, .home_away = "home", .record = "74-73" },
+    };
+    // Team composer: the same final from the viewed side's schedule row.
+    const sched: core.schedule.GameRef = .{
+        .id = "401816884",
+        .date = "2026-09-06",
+        .opponent_abbrev = "HOU",
+        .opponent_name = "Houston Astros",
+        .home_away = "away",
+        .status = "Final",
+        .state = "post",
+        .result = "L 1-2",
+    };
+    // Scoreboard sweep starts at 41: the name column is `w - 20`
+    // (abbr 4 + gaps + score 4 + ` (record)` 7 + tick 2 + separators),
+    // so the 21-cell "Philadelphia Phillies" needs w >= 41 — below
+    // that the name (never the record) legitimately truncates.
+    var w: usize = 41;
+    while (w <= 200) : (w += 1) {
+        for (sides) |side| {
+            const row = try vd.scoreParticipantLine(arena, side, w);
+            defer arena.free(row);
+            _ = try std.unicode.Utf8View.init(row);
+            try std.testing.expect(table.textCells(row) <= w);
+            try std.testing.expect(std.mem.indexOf(u8, row, "…") == null);
+            try std.testing.expect(std.mem.indexOf(u8, row, side.record.?) != null);
+            if (side.winner) try std.testing.expect(std.mem.indexOf(u8, row, "✓") != null);
+        }
+        const base = try vd.gameLine(arena, sched);
+        defer arena.free(base);
+        const fitted = try vd.fitLine(arena, base, w, null, false);
+        defer arena.free(fitted);
+        _ = try std.unicode.Utf8View.init(fitted);
+        try std.testing.expect(table.textCells(fitted) <= w);
+        try std.testing.expect(std.mem.indexOf(u8, fitted, "…") == null);
+        try std.testing.expect(std.mem.indexOf(u8, fitted, "L 1-2") != null);
+    }
 }
