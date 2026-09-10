@@ -79,6 +79,26 @@ pub fn changed(previous: u64, current: u64) bool {
     return previous != current;
 }
 
+/// Machine timestamp for an SSE frame as a comment line (`:mtime <epoch>`).
+/// SSE comments are invisible to event parsers (EventSource drops them)
+/// and the clear-screen prefix opening the following data lines repaints
+/// over the comment for naive `curl -N` viewers, so terminal output shows
+/// no new lines while machine consumers can read render freshness.
+pub fn mtimeComment(allocator: std.mem.Allocator, epoch_s: i64) ![]u8 {
+    return std.fmt.allocPrint(allocator, ":mtime {d}\n", .{epoch_s});
+}
+
+/// Frame with a leading `:mtime` comment line. Stripping `:`-comment lines
+/// from the result yields exactly `frame(body)`, so data-line consumers
+/// (curl, EventSource `data:` joins) see zero change.
+pub fn frameWithMtime(allocator: std.mem.Allocator, body: []const u8, epoch_s: i64) ![]u8 {
+    const comment = try mtimeComment(allocator, epoch_s);
+    defer allocator.free(comment);
+    const data = try frame(allocator, body);
+    defer allocator.free(data);
+    return std.mem.concat(allocator, u8, &.{ comment, data });
+}
+
 /// Frame one full render as SSE `data:` lines terminated by a blank line.
 /// The clear-screen prefix opens the first data line so `curl -N` repaints
 /// in place. Multi-line bodies become one `data:` line each; empty lines
@@ -461,6 +481,39 @@ test "keepalive is an SSE comment frame" {
     try std.testing.expectEqualStrings(": ping\n\n", keepalive_frame);
     try std.testing.expect(std.mem.startsWith(u8, keepalive_frame, ":"));
     try std.testing.expect(std.mem.endsWith(u8, keepalive_frame, "\n\n"));
+}
+
+test "mtime comment carries a parseable epoch" {
+    const comment = try mtimeComment(std.testing.allocator, 1757328000);
+    defer std.testing.allocator.free(comment);
+    try std.testing.expectEqualStrings(":mtime 1757328000\n", comment);
+    // SSE comment shape: colon-led single line, parseable trailing epoch.
+    try std.testing.expect(std.mem.startsWith(u8, comment, ":mtime "));
+    const epoch = try std.fmt.parseInt(i64, std.mem.trimEnd(u8, comment[":mtime ".len..], "\n"), 10);
+    try std.testing.expectEqual(@as(i64, 1757328000), epoch);
+}
+
+test "mtime frame is comment plus unchanged data lines" {
+    const event = try frameWithMtime(std.testing.allocator, "line one\nline two\n", 1757328000);
+    defer std.testing.allocator.free(event);
+    try std.testing.expect(std.mem.startsWith(u8, event, ":mtime 1757328000\n"));
+    try std.testing.expect(std.mem.endsWith(u8, event, "\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, event, clear_prefix) != null);
+    // Naive consumer check: stripping `:`-comment lines yields exactly
+    // `frame(body)` — curl data lines and EventSource joins see no change.
+    const bare = try frame(std.testing.allocator, "line one\nline two\n");
+    defer std.testing.allocator.free(bare);
+    var visible: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer visible.deinit();
+    var lines = std.mem.splitScalar(u8, event, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and line[0] == ':') continue;
+        try visible.writer.writeAll(line);
+        if (lines.peek() != null) try visible.writer.writeByte('\n');
+    }
+    const visible_slice = try visible.toOwnedSlice();
+    defer std.testing.allocator.free(visible_slice);
+    try std.testing.expectEqualStrings(bare, visible_slice);
 }
 
 test "subscriber key separates leagues, days, and renders" {
