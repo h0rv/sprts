@@ -1418,7 +1418,10 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
         "<title>");
     try escapeInto(w, title);
-    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>" ++ home_logo_mark ++ "<pre>");
+    // Theme script before the stylesheet: the stored/OS theme lands on
+    // `data-theme` ahead of first CSS application, so navigating between
+    // pages never flashes the default theme (the reported "reset").
+    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ home_logo_mark ++ "<pre>");
 }
 
 /// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
@@ -1954,6 +1957,71 @@ test "footer nav ends with the theme toggle on every page" {
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
+}
+
+test "theme head block is identical on every page type" {
+    // One shared `pageHead` owns the theme script, so navigating between
+    // pages can never disagree about the stored theme. Every HTML page
+    // must carry the exact same block verbatim.
+    const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(scoreboard);
+    const static_home = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(static_home);
+    var idle: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| idle[i] = .{ .league = league };
+    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false);
+    defer std.testing.allocator.free(live_home);
+    const err = try errorBody(std.testing.allocator, "nope", .html);
+    defer std.testing.allocator.free(err);
+    for ([_][]const u8{ scoreboard, static_home, live_home, err }) |page| {
+        try std.testing.expect(std.mem.indexOf(u8, page, theme_script) != null);
+    }
+    // Same block, same position contract: head opens, scripts run, then
+    // the stylesheet, all before `</head>`.
+    for ([_][]const u8{ scoreboard, static_home }) |page| {
+        const script_at = std.mem.indexOf(u8, page, theme_script).?;
+        const style_at = std.mem.indexOf(u8, page, page_style).?;
+        const head_end = std.mem.indexOf(u8, page, "</head>").?;
+        try std.testing.expect(script_at < style_at);
+        try std.testing.expect(style_at < head_end);
+    }
+    // Quiet live home keeps the head script (persistence) even though it
+    // drops the footer nav chrome.
+    const quiet = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", true);
+    defer std.testing.allocator.free(quiet);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, theme_script) != null);
+}
+
+test "theme persistence contract: one key, data-theme both ways, OS fallback" {
+    // The init script reads exactly the key the toggle writes; anything
+    // else resets the theme on every navigation.
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "localStorage.getItem(\"sprts-theme\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "localStorage.setItem(\"sprts-theme\",n)") != null);
+    // `sprts-theme` appears exactly twice: one read, one write. A third
+    // occurrence means a divergent key somewhere.
+    var key_hits: usize = 0;
+    var rest: []const u8 = theme_script;
+    while (std.mem.indexOf(u8, rest, "sprts-theme")) |at| {
+        key_hits += 1;
+        rest = rest[at + "sprts-theme".len ..];
+    }
+    try std.testing.expectEqual(@as(usize, 2), key_hits);
+    // Both directions ride `data-theme` (never a class swap), and first
+    // visits fall back to the OS preference.
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "document.documentElement.dataset.theme=t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "h.dataset.theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "matchMedia") != null);
+    try std.testing.expect(std.mem.indexOf(u8, theme_script, "prefers-color-scheme") != null);
+    // The toggle footer the script's writer needs is on every
+    // non-quiet page.
+    const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(scoreboard);
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, themeNavSuffix()) != null);
+    const static_home = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(static_home);
+    try std.testing.expect(std.mem.indexOf(u8, static_home, themeNavSuffix()) != null);
 }
 
 fn expectAlignedTable(output: []const u8) !void {
