@@ -140,6 +140,17 @@ pub const DetailGame = struct {
     // (e.g. "ATL At Bats 35"). Empty when the provider supplies none;
     // renderers skip the section rather than erroring.
     team_stats: []const []const u8 = &.{},
+    /// Betting line from the summary odds (`details`, e.g. "SEA -3");
+    /// null when the provider supplies none.
+    odds: ?[]const u8 = null,
+    /// Over/under total from the same odds entry; null when absent.
+    over_under: ?[]const u8 = null,
+    /// Injury report lines (e.g. "SEA Sam Darnold Doubtful (Hip)");
+    /// empty when the provider supplies none.
+    injuries: []const []const u8 = &.{},
+    /// Home-team win probability from the last win-probability sample
+    /// (e.g. "SEA 61.3%"); null when the provider supplies none.
+    win_probability: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "DetailGame",
@@ -152,6 +163,10 @@ pub const DetailGame = struct {
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },
             .network = .{ .description = "TV broadcaster when the provider supplies one." },
             .leaders = .{ .description = "Short statistical leader strings, e.g. team totals and top performers." },
+            .odds = .{ .description = "Betting line when the provider supplies one." },
+            .over_under = .{ .description = "Over/under total when the provider supplies one." },
+            .injuries = .{ .description = "Injury report lines when the provider supplies them; absent otherwise." },
+            .win_probability = .{ .description = "Home-team win probability when the provider supplies it." },
             .lineups = .{ .description = "Starting lineups in batting order when the provider supplies a batting group; absent otherwise." },
             .team_stats = .{ .description = "Box-score team total lines when the provider supplies them; absent otherwise." },
         },
@@ -187,6 +202,10 @@ test "game detail defaults to empty collections" {
     try std.testing.expectEqual(@as(usize, 0), game_detail.scoring_plays.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.leaders.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.lineups.len);
+    try std.testing.expect(game_detail.odds == null);
+    try std.testing.expect(game_detail.over_under == null);
+    try std.testing.expectEqual(@as(usize, 0), game_detail.injuries.len);
+    try std.testing.expect(game_detail.win_probability == null);
 }
 
 pub const LineupEntry = DetailLineupEntry;
