@@ -1422,7 +1422,7 @@ test "worker all?0 matches the native one-line composer" {
     // league emits nothing.
     const lines = try serveAllOneLine(arena, &sections, false, false, .et);
     defer arena.free(lines);
-    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 9/6 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 09-06 ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines, "2026-09-06") == null);
     try std.testing.expect(std.mem.indexOf(u8, lines, "Final AWY 2 @ HME 5 ✓") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines, "nfl") == null);

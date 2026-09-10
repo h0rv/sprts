@@ -1005,13 +1005,13 @@ test "all?0 shares the home one-line shape with zone labels" {
     defer arena.free(lines);
     // M/D ZONE label, never the raw board date; status plus the winner
     // check survive on a scored duel.
-    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 9/6 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines, "mlb 09-06 ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines, "2026-09-06") == null);
     try std.testing.expect(std.mem.indexOf(u8, lines, "Final AWY 2 @ HME 5 ✓") != null);
 
     const utc = try allOneLine(arena, &sections, false, false, .utc);
     defer arena.free(utc);
-    try std.testing.expect(std.mem.indexOf(u8, utc, "mlb 9/6 UTC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, utc, "mlb 09-06 UTC") != null);
 }
 
 test "all?0 resolves home and away checking both sides" {
