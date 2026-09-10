@@ -94,7 +94,32 @@ pub const WeekAliasRoute = struct {
     n: ?u16 = null,
 };
 
-/// Standings tab (`/{league}/standings`, plaintextsports parity with the
+/// Human game ordinal, date form: `/{league}/{YYYY-MM-DD}/event[-N]`
+/// (bare `event` is 1; `event-2` is the second game; the relative tokens
+/// `today|tomorrow|yesterday` ride too). Redirects to the canonical
+/// `/{league}/{id}` — never renders, no `/api/v1/` twin (JSON keeps ids).
+/// N counts EVERY game on the day board in listed order (duels and
+/// non-duels alike), so every game has a human URL even when no abbr pair
+/// can name it. Out-of-range N misses at lookup (404); malformed shapes
+/// stay not_found here. Checked BEFORE the duel form: `event-2` would
+/// otherwise parse as away=event/home=2.
+pub const DateEventRoute = struct {
+    league: []const u8,
+    date: []const u8,
+    /// 1-based board ordinal (bare `event` parses as 1).
+    n: u16 = 1,
+};
+
+/// Human game ordinal, week form (football only — the serve layer gates on
+/// the league sport): `/{league}/{YYYY}/week{N}/event[-N]`, e.g.
+/// `/nfl/2026/week1/event-3`. Redirects like the date form, no twin.
+pub const WeekEventRoute = struct {
+    league: []const u8,
+    season: []const u8,
+    week: u16,
+    /// 1-based board ordinal (bare `event` parses as 1).
+    n: u16 = 1,
+};
 /// Schedule/Standings/Teams tabs). No date or week: the endpoint is the
 /// current table only. Display flags ride along like every human route.
 pub const StandingsRoute = struct {
@@ -174,6 +199,8 @@ pub const Route = union(enum) {
     today: TodayRoute,
     date_alias: DateAliasRoute,
     week_alias: WeekAliasRoute,
+    date_event: DateEventRoute,
+    week_event: WeekEventRoute,
     standings: StandingsRoute,
     tour: TourRoute,
     tour_asset: TourAssetRoute,
@@ -266,10 +293,23 @@ pub fn parse(target: []const u8) Route {
             }
             // Human game aliases (human URLs only — no /api/v1/ twins,
             // JSON keeps ids): date form `/{league}/{date}/{away}-{home}[-N]`
-            // and football week form `/{league}/{YYYY}/week{N}/{matchup}[-N]`.
-            // Anything else stays not_found.
+            // or the ordinal `/{league}/{date}/event[-N]`, and football
+            // week form `/{league}/{YYYY}/week{N}/{matchup}[-N]` or
+            // `/{league}/{YYYY}/week{N}/event[-N]`. Anything else stays
+            // not_found. The ordinal checks first: `event-2` would
+            // otherwise parse as a duel (away=event, home=2).
             if (!api) {
                 if (isAliasDate(seg2)) {
+                    if (parseEventSegment(seg3)) |n| {
+                        return .{ .date_event = .{
+                            .league = league,
+                            .date = seg2,
+                            .n = n,
+                        } };
+                    }
+                    // Reserved ordinal namespace: malformed `event-*`
+                    // never falls through to the duel form.
+                    if (isEventPrefixed(seg3)) return .not_found;
                     if (parseMatchup(seg3)) |matchup| {
                         return .{ .date_alias = .{
                             .league = league,
@@ -284,6 +324,17 @@ pub fn parse(target: []const u8) Route {
                         const week_seg = seg3[0..slash3];
                         const duel = seg3[slash3 + 1 ..];
                         if (parseWeekSegment(week_seg)) |week| {
+                            if (parseEventSegment(duel)) |n| {
+                                return .{ .week_event = .{
+                                    .league = league,
+                                    .season = seg2,
+                                    .week = week,
+                                    .n = n,
+                                } };
+                            }
+                            // Reserved ordinal namespace (see the date
+                            // form): malformed `event-*` never duels.
+                            if (isEventPrefixed(duel)) return .not_found;
                             if (parseMatchup(duel)) |matchup| {
                                 return .{ .week_alias = .{
                                     .league = league,
@@ -453,6 +504,34 @@ fn parseGameNumber(s: []const u8) ?u16 {
     }
     if (n < 1 or n > 99) return null;
     return n;
+}
+
+/// Ordinal game selector: bare `event` is 1, `event-N` (N = 1-99) is N.
+/// Prefix case-insensitive like week/standings. Anything else is not an
+/// ordinal (the caller falls through to the duel form, unless the
+/// reserved `event-` prefix applies — see `isEventPrefixed`): `event-0`,
+/// `event-100`, non-digit tails, empty tails, extra dashes, and longer
+/// literals like `events` or `eventx` (no dash: not even prefixed).
+fn parseEventSegment(s: []const u8) ?u16 {
+    if (std.ascii.eqlIgnoreCase(s, "event")) return 1;
+    if (s.len < 7) return null;
+    if (!std.ascii.eqlIgnoreCase(s[0..5], "event")) return null;
+    if (s[5] != '-') return null;
+    return parseGameNumber(s[6..]);
+}
+
+/// Reserved ordinal namespace: bare `event` or anything starting with
+/// `event-` (case-insensitive). Valid ordinals parse via
+/// `parseEventSegment`; anything else under the prefix (`event-0`,
+/// `event-x`, `event-bos`) is not_found — it must never fall through to
+/// the duel form (`event-0` would otherwise read as away=event/home=0).
+/// A team literally abbreviated "event" keeps its id and team page; only
+/// the alias slot reserves the word.
+fn isEventPrefixed(s: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(s, "event")) return true;
+    if (s.len < 7) return false;
+    if (!std.ascii.eqlIgnoreCase(s[0..5], "event")) return false;
+    return s[5] == '-';
 }
 
 fn isAliasAbbr(s: []const u8) bool {
@@ -1044,6 +1123,84 @@ test "alias game-number suffix parses on both forms, human only" {
     try std.testing.expect(parse("/mlb/2026-09-09/-det-2") == .not_found);
     try std.testing.expect(parse("/nfl/2026/week1/ne-sea-0") == .not_found);
     try std.testing.expect(parse("/nfl/2026/week1/ne-sea-100") == .not_found);
+}
+
+test "event ordinal parses on the date form, human only" {
+    // Bare `event` is the first game; `event-N` is the Nth in board order.
+    const bare = parse("/ufc/2026-09-05/event").date_event;
+    try std.testing.expectEqualStrings("ufc", bare.league);
+    try std.testing.expectEqualStrings("2026-09-05", bare.date);
+    try std.testing.expect(bare.n == 1);
+    const second = parse("/ufc/2026-09-05/event-2").date_event;
+    try std.testing.expectEqualStrings("ufc", second.league);
+    try std.testing.expect(second.n == 2);
+    try std.testing.expect(parse("/f1/2025-09-07/event-3").date_event.n == 3);
+    try std.testing.expect(parse("/f1/2025-09-07/event-99").date_event.n == 99);
+    // Rides the relative tokens like the duel form.
+    try std.testing.expectEqualStrings("today", parse("/ufc/today/event-2").date_event.date);
+    try std.testing.expectEqualStrings("tomorrow", parse("/pga/tomorrow/event").date_event.date);
+    // Case-insensitive prefix like week/standings; query strings ride
+    // along ignored (redirects carry no query).
+    try std.testing.expect(parse("/ufc/2026-09-05/EVENT-2").date_event.n == 2);
+    try std.testing.expect(parse("/ufc/2026-09-05/Event").date_event.n == 1);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-2?color=0").date_event.n == 2);
+    // Beats the duel parse: `event-2` as away=event/home=2 would mislead
+    // (a team literally abbreviated "event" aside), so it must be the
+    // ordinal, never the duel.
+    try std.testing.expect(parse("/ufc/2026-09-05/event-2") == .date_event);
+    // No /api/v1/ twins: JSON keeps ids.
+    try std.testing.expect(parse("/api/v1/ufc/2026-09-05/event-2") == .not_found);
+    try std.testing.expect(parse("/api/v1/ufc/2026-09-05/event") == .not_found);
+    // Bad shapes stay not_found: N of 0/100, non-digit tails, empty
+    // tails, extra dashes, longer literals, and bad dates.
+    try std.testing.expect(parse("/ufc/2026-09-05/event-0") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-100") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-x") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-2x") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-2-3") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/events") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/eventx") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-09-05/event-2/x") == .not_found);
+    try std.testing.expect(parse("/ufc/2026-13-40/event-2") == .not_found);
+    try std.testing.expect(parse("/ufc/Today/event-2") == .not_found);
+    // A duel side literally abbreviated "event" cannot use the alias slot
+    // (the `event-` prefix is reserved for the ordinal); it keeps its id
+    // and team page.
+    try std.testing.expect(parse("/mlb/2026-09-09/event-bos") == .not_found);
+    // Existing regions untouched.
+    try std.testing.expect(parse("/mlb/2026-09-09/min-det") == .date_alias);
+    try std.testing.expect(parse("/mlb/phi") == .team);
+}
+
+test "event ordinal parses on the week form, human only" {
+    const ordinal = parse("/nfl/2026/week1/event-2").week_event;
+    try std.testing.expectEqualStrings("nfl", ordinal.league);
+    try std.testing.expectEqualStrings("2026", ordinal.season);
+    try std.testing.expect(ordinal.week == 1);
+    try std.testing.expect(ordinal.n == 2);
+    try std.testing.expect(parse("/nfl/2026/week1/event").week_event.n == 1);
+    try std.testing.expect(parse("/nfl/2026/week18/event-16").week_event.n == 16);
+    try std.testing.expectEqualStrings("ncaaf", parse("/ncaaf/2026/week2/EVENT-3").week_event.league);
+    // Beats the duel parse here too.
+    try std.testing.expect(parse("/nfl/2026/week1/event-2") == .week_event);
+    // No /api/v1/ twins.
+    try std.testing.expect(parse("/api/v1/nfl/2026/week1/event-2") == .not_found);
+    try std.testing.expect(parse("/api/v1/nfl/2026/week1/event") == .not_found);
+    // Bad shapes stay not_found.
+    try std.testing.expect(parse("/nfl/2026/week1/event-0") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/event-100") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/event-x") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/event-") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/event-2-3") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week0/event-2") == .not_found);
+    try std.testing.expect(parse("/nfl/26/week1/event-2") == .not_found);
+    try std.testing.expect(parse("/nfl/2026/week1/event-2/x") == .not_found);
+    // A duel side literally abbreviated "event" cannot use the alias slot
+    // (the `event-` prefix is reserved); it keeps its id and team page.
+    try std.testing.expect(parse("/nfl/2026/week1/event-sea") == .not_found);
+    // Duel form untouched.
+    try std.testing.expect(parse("/nfl/2026/week1/ne-sea") == .week_alias);
 }
 
 test "stream flag parses query values and Accept header" {

@@ -230,6 +230,8 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .today => |route| return serveToday(env, alloc, route, format),
         .date_alias => |route| return serveDateAlias(env, alloc, route, format, zone),
         .week_alias => |route| return serveWeekAlias(env, alloc, route, format),
+        .date_event => |route| return serveDateEvent(env, alloc, route, format, zone),
+        .week_event => |route| return serveWeekEvent(env, alloc, route, format),
         .standings => |route| return serveStandings(env, alloc, route, format, zone),
         .tour => |route| return serveTour(alloc, route, format),
         .tour_asset => |route| return serveTourAsset(route),
@@ -786,6 +788,101 @@ fn serveWeekAlias(
         return errorResponse(alloc, "game not found", format, .not_found);
     }
     const game = provider.findGameByMatchupN(week_board.board, route.away, route.home, route.n orelse 1) orelse {
+        const browse = try std.fmt.allocPrint(alloc, "/{s}?week={d}", .{ league.slug, route.week });
+        return errorResponse(alloc, try provider.aliasMissMessage(alloc, week_board.board, browse), format, .not_found);
+    };
+    const target = try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id });
+    const body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var resp = workers.Response.new();
+    resp.setStatus(.found);
+    resp.setHeader("location", target);
+    resp.setHeader("cache-control", "no-store");
+    resp.setHeader("x-content-type-options", "nosniff");
+    resp.setBody(body);
+    return resp;
+}
+
+/// Human game ordinal, date form `/{league}/{date}/event[-N]`: resolve the
+/// day in the request zone, fetch that board fresh, redirect to the Nth
+/// game in board order (every game: duels and non-duels alike; a miss
+/// 404s with the duel/non-duel-aware message). Fresh-only, no-store, no
+/// `/api/v1/` twin (serveDateAlias parity).
+fn serveDateEvent(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.DateEventRoute,
+    format: router.Format,
+    zone: tz.Zone,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const day = try tz.resolveDay(alloc, route.date, epochSecondsNow(), zone);
+    const board = adapter.fetch(alloc, league, day) catch {
+        workers.log("upstream ESPN fetch failed for {s} {s}", .{ league.slug, day });
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const game = provider.findGameByOrdinal(board, route.n) orelse {
+        const browse = try std.fmt.allocPrint(alloc, "/{s}?date={s}", .{ league.slug, day });
+        return errorResponse(alloc, try provider.aliasMissMessage(alloc, board, browse), format, .not_found);
+    };
+    const target = try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, game.id });
+    const body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var resp = workers.Response.new();
+    resp.setStatus(.found);
+    resp.setHeader("location", target);
+    resp.setHeader("cache-control", "no-store");
+    resp.setHeader("x-content-type-options", "nosniff");
+    resp.setBody(body);
+    return resp;
+}
+
+/// Human game ordinal, week form `/{league}/{YYYY}/week{N}/event[-N]`
+/// (football only — gated on the league sport): fetch the week's board
+/// with NO dates param, verify the response season year against the URL
+/// season (a mismatch 404s, never misleads), redirect to the Nth game in
+/// board order. Fresh-only, no-store (serveWeekAlias parity).
+fn serveWeekEvent(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.WeekEventRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    if (!std.mem.eql(u8, league.sport, "Football")) {
+        return errorResponse(alloc, "week games are football-only", format, .not_found);
+    }
+    const season = std.fmt.parseInt(u16, route.season, 10) catch {
+        return errorResponse(alloc, "game not found", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const week_board = adapter.fetchWeekBoard(alloc, league, route.season, route.week) catch {
+        workers.log("upstream ESPN week fetch failed for {s}", .{league.slug});
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    if (week_board.season_year == null or week_board.season_year.? != season) {
+        return errorResponse(alloc, "game not found", format, .not_found);
+    }
+    const game = provider.findGameByOrdinal(week_board.board, route.n) orelse {
         const browse = try std.fmt.allocPrint(alloc, "/{s}?week={d}", .{ league.slug, route.week });
         return errorResponse(alloc, try provider.aliasMissMessage(alloc, week_board.board, browse), format, .not_found);
     };

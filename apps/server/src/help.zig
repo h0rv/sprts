@@ -142,8 +142,10 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  /{league}/{id}                 one game (all digits = game, else team)
         \\  /{league}/{abbr}               one team, e.g. /mlb/phi
         \\  /{league}/{date}/{away}-{home}[-N] game by date+teams, 302, e.g. /mlb/2026-09-09/min-det (-2 = doubleheader game 2; curl -L)
+        \\  /{league}/{date}/event[-N] Nth game on the day board, 302, e.g. /ufc/2026-09-05/event-14 (bare event = 1; every game: bouts, sessions, fields, name-only duels; curl -L)
         \\  /{league}/{YYYY}/week{N}/{a}-{h}[-N] football week game, 302, e.g. /nfl/2026/week1/ne-sea (curl -L)
-        \\  aliases match two team abbreviations only: cards, races, tournaments without abbrs 404 (browse the day board for the id)
+        \\  /{league}/{YYYY}/week{N}/event[-N] Nth game of the football week, 302 (curl -L)
+        \\  duel aliases match two team abbreviations only: cards, races, tournaments, name-only duels use event-N (browse the day board for the list)
         \\  /{league}/{abbr}/today        today's game, redirects to it
         \\  /{league}/standings            current table, no date
         \\  /{league}/teams                 team list as JSON (no text twin: picker payload)
@@ -196,6 +198,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  curl 'localhost:8080/mlb/401816828?0'
         \\  curl -L localhost:8080/mlb/2026-09-09/min-det
         \\  curl -L localhost:8080/mlb/2026-09-09/min-det-2
+        \\  curl -L localhost:8080/ufc/2026-09-05/event-14
         \\  curl -L localhost:8080/nfl/2026/week1/ne-sea
         \\  curl localhost:8080/all
         \\  curl localhost:8080/nfl/standings
@@ -208,7 +211,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
-    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/standings /{league}/teams(JSON only) /{league}/tour /tour /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
+    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(digits=game,else team) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](redirect, curl -L) /{league}/{date}/event[-N](Nth game, redirect, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football redirect, curl -L) /{league}/{YYYY}/week{N}/event[-N](football redirect, curl -L) /{league}/standings /{league}/teams(JSON only) /{league}/tour /tour /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
     try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
@@ -258,7 +261,9 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "/{league}/{id}", .description = "One game (all digits = game, else team)" },
             .{ .name = "/{league}/{abbr}", .description = "One team, e.g. /mlb/phi" },
             .{ .name = "/{league}/{date}/{away}-{home}", .description = "One game by date and teams, 302 to the game (date or today|tomorrow|yesterday; -N = doubleheader game N, 1 = first; curl -L; duel-only, cards/races 404 with the day board)" },
+            .{ .name = "/{league}/{date}/event[-N]", .description = "Nth game on the day board, 302 to the game (bare event = 1; every game: bouts, sessions, fields, name-only duels; curl -L)" },
             .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, 302 to the game (-N = doubleheader game N; curl -L)" },
+            .{ .name = "/{league}/{YYYY}/week{N}/event[-N]", .description = "Nth game of the football week, 302 to the game (bare event = 1; curl -L)" },
             .{ .name = "/{league}/standings", .description = "Current table, no date" },
             .{ .name = "/{league}/teams", .description = "Team list: id, abbrev, name per team. JSON-only (no text twin: picker payload); the human path serves the same JSON body" },
             .{ .name = "/{league}/tour", .description = "Live terminal tour in the browser: vendored xterm.js fed by the SSE stream, read-only (no keyboard control)" },
@@ -294,6 +299,7 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             "curl 'localhost:8080/mlb/401816828?0'",
             "curl -L localhost:8080/mlb/2026-09-09/min-det",
             "curl -L localhost:8080/mlb/2026-09-09/min-det-2",
+            "curl -L localhost:8080/ufc/2026-09-05/event-14",
             "curl -L localhost:8080/nfl/2026/week1/ne-sea",
             "curl localhost:8080/all",
             "curl localhost:8080/nfl/standings",
