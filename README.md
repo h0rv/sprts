@@ -26,6 +26,34 @@ curl 'localhost:8080/mlb?date=2026-09-06'
 Set `PORT` or `SPRTS_PORT` to change the port. Set `SPRTS_HOST` to change the
 listen address. The default address is `0.0.0.0`.
 
+## Shell CLI
+
+`tools/sprts.sh` is a dependency-free (`curl` only) shell function. Drop it
+in `~/.local/bin/` as `sprts` (it runs directly) or source it from your rc
+file, then register favorites:
+
+```sh
+cp tools/sprts.sh ~/.local/bin/sprts && chmod +x ~/.local/bin/sprts
+export SPRTS_LEAGUE=mlb SPRTS_TEAM=PHI   # e.g. in .zshrc
+```
+
+```sh
+sprts                  # home: every league today
+sprts mlb              # scoreboard
+sprts mlb phi          # team page
+sprts mlb 401816856    # one game (digits = game id)
+sprts mlb tomorrow     # any date word or YYYY-MM-DD
+sprts team             # $SPRTS_LEAGUE/$SPRTS_TEAM
+sprts watch mlb        # re-curl every 15s until Ctrl-C
+sprts --json mlb       # /api/v1/... instead of text
+```
+
+For push-style updates instead of polling, stream server-sent events:
+
+```sh
+curl -N 'https://sprts.horv.co/mlb?stream=sse'
+```
+
 ## Run it with Docker
 
 ```sh
