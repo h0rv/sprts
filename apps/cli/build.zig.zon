@@ -1,0 +1,11 @@
+.{
+    .name = .sprts_cli,
+    .version = "0.1.0",
+    .fingerprint = 0xf298f93e3b4e2726,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sprts_core = .{ .path = "../../packages/core" },
+        .sprts_client = .{ .path = "../../clients/sprts" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
