@@ -360,6 +360,90 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
         },
+        .date_alias => |alias| {
+            // Human game alias, date form: resolve the day (relative tokens
+            // ride the request zone via tz.resolveDay, like the scoreboard),
+            // fetch that board fresh, and redirect to the canonical game id.
+            // Fresh-only, no-store, no query carried over (today-arm parity).
+            const league = core.leagues.find(alias.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const day = try server_app.tz.resolveDay(arena, alias.date, now_s, zone);
+            const board = adapter.fetch(arena, league, day) catch |err| {
+                status = .bad_gateway;
+                std.log.warn("ESPN request failed for {s}: {t}", .{ league.slug, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            const game = server_app.provider.findGameByMatchup(board, alias.away, alias.home) orelse {
+                status = .not_found;
+                try respondError(arena, request, "game not found", format, .not_found);
+                return;
+            };
+            const dest = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
+        .week_alias => |alias| {
+            // Human game alias, week form (football only): fetch the week's
+            // board with NO dates param (ESPN resolves the week alone;
+            // sending dates alongside empties the slate), verify the response
+            // season year against the URL season (ESPN ignores unknown season
+            // params — a mismatch 404s, never misleads), and redirect to the
+            // canonical game id. Fresh-only, no-store (today-arm parity).
+            const league = core.leagues.find(alias.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            if (!std.mem.eql(u8, league.sport, "Football")) {
+                status = .not_found;
+                try respondError(arena, request, "week games are football-only", format, .not_found);
+                return;
+            }
+            const season = std.fmt.parseInt(u16, alias.season, 10) catch {
+                status = .not_found;
+                try respondError(arena, request, "game not found", format, .not_found);
+                return;
+            };
+            const week_board = adapter.fetchWeekBoard(arena, league, alias.season, alias.week) catch |err| {
+                status = .bad_gateway;
+                std.log.warn("ESPN week request failed for {s}: {t}", .{ league.slug, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            if (week_board.season_year == null or week_board.season_year.? != season) {
+                status = .not_found;
+                try respondError(arena, request, "game not found", format, .not_found);
+                return;
+            }
+            const game = server_app.provider.findGameByMatchup(week_board.board, alias.away, alias.home) orelse {
+                status = .not_found;
+                try respondError(arena, request, "game not found", format, .not_found);
+                return;
+            };
+            const dest = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game.id });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
         .team => |team_route| {
             const league = core.leagues.find(team_route.league) orelse {
                 status = .not_found;
@@ -485,6 +569,8 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .game => |r| std.fmt.allocPrint(arena, "detail/{s}/{s}", .{ r.league, r.id }),
         .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}", .{ r.league, r.abbr }),
         .today => |r| std.fmt.allocPrint(arena, "today/{s}/{s}", .{ r.league, r.abbr }),
+        .date_alias => |r| std.fmt.allocPrint(arena, "date-alias/{s}/{s}", .{ r.league, r.date }),
+        .week_alias => |r| std.fmt.allocPrint(arena, "week-alias/{s}/{s}", .{ r.league, r.season }),
         .standings => |r| std.fmt.allocPrint(arena, "standings/{s}", .{r.league}),
     };
 }

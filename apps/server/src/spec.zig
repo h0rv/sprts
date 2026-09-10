@@ -190,6 +190,10 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  Second segment all digits is a game: /mlb/401816828.\n" ++
             "  Anything else is a team: /mlb/PHI.\n" ++
             "\n" ++
+            "ALIASES human only, 302 to /{league}/{id}, no /api/v1/ twins\n" ++
+            "  /{league}/YYYY-MM-DD/{away}-{home} one game by date and teams: /mlb/2026-09-09/min-det (today/tomorrow/yesterday also work)\n" ++
+            "  /{league}/YYYY/weekN/{away}-{home} football-only week game: /nfl/2026/week1/ne-sea\n" ++
+            "\n" ++
             "TEXT HTML JSON\n" ++
             "  Text default: curl localhost:8080/mlb\n" ++
             "  HTML: curl localhost:8080/mlb?format=html\n" ++
@@ -219,6 +223,8 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl localhost:8080/api/v1/all\n" ++
             "  curl localhost:8080/api/v1/mlb?date=2026-09-06\n" ++
             "  curl localhost:8080/mlb/401816828?0\n" ++
+            "  curl localhost:8080/mlb/2026-09-09/min-det\n" ++
+            "  curl localhost:8080/nfl/2026/week1/ne-sea\n" ++
             "  curl localhost:8080/mlb/PHI/today\n" ++
             "  curl localhost:8080/openapi.json\n" ++
             "\n" ++
