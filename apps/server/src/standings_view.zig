@@ -132,7 +132,7 @@ pub fn html(
     const title = try std.fmt.allocPrint(allocator, "{s} standings", .{st.league_name});
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try render.escapeInto(w, body);
+    try render.writeEscapedBodyH1(w, body);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}\">scores</a>", .{st.league});
     try w.print("<a href=\"/api/v1/{s}/standings\">json</a>", .{st.league});
@@ -285,6 +285,8 @@ test "standings HTML escapes hostile text and never carries ANSI" {
     const page = try html(std.testing.allocator, hostile, null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Arsenal <b>") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Arsenal &lt;b&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Table &amp; co") != null);

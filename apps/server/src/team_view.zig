@@ -287,8 +287,11 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
         var lines = std.mem.splitScalar(u8, mark, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
+            // Decorative logo: hidden from assistive tech (the header
+            // below names the team), never a link.
+            try w.writeAll("<span aria-hidden=\"true\">");
             try table.writeArtLineHtml(w, line, escapeByte);
-            try w.writeByte('\n');
+            try w.writeAll("</span>\n");
         }
         try w.writeByte('\n');
     }
@@ -301,7 +304,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
         else
             try std.fmt.allocPrint(allocator, "{s} ({s})  {s}", .{ view.team.name, view.team.abbrev, zone_tag });
         defer allocator.free(header);
-        try render.writeHtmlLine(w, allocator, header, cols, null, null);
+        try render.writeHtmlH1(w, allocator, header, cols, null);
     }
     if (view.team.record_summary) |record| {
         const line = if (view.team.standing_summary) |standing|
@@ -402,7 +405,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
                 next_open = true;
             }
             const side_height = @max(view.next.len, view.extra_next.len);
-            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{hidden, side_height});
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ hidden, side_height });
             defer allocator.free(more);
             const href = try std.fmt.allocPrint(allocator, "/{s}/{s}?height={d}", .{ league_slug, view.team.abbrev, side_height });
             defer allocator.free(href);
@@ -608,6 +611,8 @@ test "team HTML links and never carries ANSI" {
     const page = try teamHtml(std.testing.allocator, testView(), "mlb", null, null);
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/scores\">") == null);
     // Schedule rows link to their game views; both last and next shown.
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") != null);

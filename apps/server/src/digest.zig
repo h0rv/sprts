@@ -197,7 +197,7 @@ pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSec
     const title = try std.fmt.allocPrint(allocator, "sprts all {s} {s}", .{ day, tag });
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try render.escapeInto(w, body);
+    try render.writeEscapedBodyH1(w, body);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/all?date={s}\">all</a>", .{day});
     try w.print("<a href=\"/api/v1/all?date={s}\">json</a>", .{day});
@@ -371,6 +371,8 @@ test "digest html links and never carries ANSI" {
     };
     const page = try html(html_arena, &html_sections, "2026-09-06", null, null, false);
     try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Skip to content") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "/api/v1/all?date=2026-09-06") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     _ = try std.unicode.Utf8View.init(page);

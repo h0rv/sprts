@@ -149,7 +149,6 @@ pub fn textArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bo
 /// One scoreboard participant row, column-aligned like the old table
 /// interior (abbr, name, score, winner tick, record) but borderless and
 /// unpadded. Winner coloring wraps at emit time, never inside.
-
 fn scoreParticipantLine(allocator: std.mem.Allocator, p: domain.Participant, cols: usize) ![]u8 {
     var rec_w: usize = 0;
     if (p.record) |r| rec_w = table.textCells(r);
@@ -217,7 +216,7 @@ pub const text_home_banner: []const u8 =
     \\██████  ██  ██  ██        ██    ██████
     \\  ████  ██████  ██        ████    ████
     \\        ██
-    ++ "\n";
+++ "\n";
 
 test "text homes show the block sprts wordmark above the heading" {
     // The banner itself: 5 block rows, ragged within 40 cells, valid
@@ -1002,6 +1001,7 @@ pub fn scoreHtmlWithZoneArtMtime(allocator: std.mem.Allocator, board: domain.Sco
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
     try w.writeAll("</pre>");
+    try writeScoreSummaries(w, board, shown);
     // Live pages stream: freshness line plus the updater script. Final
     // pages stay byte-identical to the static render (no div, no script).
     if (boardIsLive(board)) {
@@ -1085,10 +1085,12 @@ fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board:
             continue;
         }
         if (first_row) {
-            // Heading row: league context already, no link.
+            // Heading row doubles as the page `<h1>` title (the skip
+            // link's `#content` target): league context already, no link.
             first_row = false;
+            try w.writeAll(h1_open);
             try escapeInto(w, line);
-            try w.writeByte('\n');
+            try w.writeAll("</h1>\n");
             continue;
         }
         if (pending_rule) {
@@ -1274,13 +1276,16 @@ fn containsBraille(line: []const u8) bool {
 
 /// One colored mark row as HTML: the color twin's line becomes rgb spans
 /// via `table.writeArtLineHtml`, ragged like the text renderer.
-/// Link-free and cursor-free by construction.
+/// Link-free and cursor-free by construction, and `aria-hidden` so
+/// assistive tech skips the braille (the sr-only game summaries after
+/// `</pre>` carry the same game instead).
 fn writeColorArtRow(
     w: *std.Io.Writer,
     color_line: []const u8,
 ) !void {
+    try w.writeAll("<span aria-hidden=\"true\">");
     try table.writeArtLineHtml(w, color_line, &htmlEscapeByte);
-    try w.writeByte('\n');
+    try w.writeAll("</span>\n");
 }
 
 /// One-byte HTML escaper for `table.writeArtLineHtml`: escape `&<>"'`,
@@ -1324,6 +1329,101 @@ pub fn writeHtmlLine(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const
     try w.writeByte('\n');
 }
 
+/// Title-line variant of `writeHtmlLine`: the fitted row becomes the page
+/// `<h1>` (the skip link's `#content` target) with identical text and no
+/// link. UA margins die in CSS, so the row keeps its exact box and
+/// `<pre>` visible text never changes.
+pub fn writeHtmlH1(w: *std.Io.Writer, allocator: std.mem.Allocator, s: []const u8, cols: usize, css: ?[]const u8) !void {
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try writeCell(&cell.writer, s, cols, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    const trimmed = std.mem.trimEnd(u8, padded, " ");
+    try w.writeAll(h1_open);
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    try escapeInto(w, trimmed);
+    if (css != null) try w.writeAll("</span>");
+    try w.writeAll("</h1>\n");
+}
+
+/// Escape a whole text body blob with its first line wrapped as the page
+/// `<h1>` title (help, standings, digest share this shape). The tags strip
+/// clean, so `<pre>` visible text never changes.
+pub fn writeEscapedBodyH1(w: *std.Io.Writer, body: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, body, '\n')) |nl| {
+        try w.writeAll(h1_open);
+        try escapeInto(w, body[0..nl]);
+        try w.writeAll("</h1>\n");
+        try escapeInto(w, body[nl + 1 ..]);
+    } else if (body.len > 0) {
+        try w.writeAll(h1_open);
+        try escapeInto(w, body);
+        try w.writeAll("</h1>");
+    }
+}
+
+/// Wrap the first line of an already-rendered HTML block as the page
+/// `<h1>` title; remaining bytes pass through untouched. Used where the
+/// title line is positional (the live home's first section row), never
+/// structural: tags strip clean, so visible text never changes.
+fn writeH1FirstLine(w: *std.Io.Writer, rendered: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, rendered, '\n')) |nl| {
+        if (nl == 0) {
+            try w.writeAll(rendered);
+            return;
+        }
+        try w.writeAll(h1_open);
+        try w.writeAll(rendered[0..nl]);
+        try w.writeAll("</h1>\n");
+        try w.writeAll(rendered[nl + 1 ..]);
+    } else if (rendered.len > 0) {
+        try w.writeAll(h1_open);
+        try w.writeAll(rendered);
+        try w.writeAll("</h1>");
+    }
+}
+
+/// Screen-reader game summaries for scoreboard pages: one visually-hidden
+/// paragraph per shown game (`Game {id}: {status}...`), emitted after
+/// `</pre>` so tag-stripped visible-text assertions never see them. Art
+/// rows inside the table are `aria-hidden`; these paragraphs are their
+/// non-visual equivalent (game id, status, and sides always present).
+fn writeScoreSummaries(w: *std.Io.Writer, board: domain.Scoreboard, shown: usize) !void {
+    if (shown == 0) return;
+    try w.writeAll("<div class=\"sr-only\">");
+    for (board.games[0..shown]) |game| {
+        try w.writeAll("<p>Game ");
+        try escapeInto(w, game.id);
+        try w.writeAll(": ");
+        try escapeInto(w, game.status);
+        if (game.participants.len > 0) {
+            try w.writeAll(". ");
+            for (game.participants, 0..) |p, i| {
+                if (i > 0) try w.writeAll(" vs ");
+                if (p.name.len > 0) {
+                    try escapeInto(w, p.name);
+                } else if (p.abbreviation.len > 0) {
+                    try escapeInto(w, p.abbreviation);
+                }
+                if (p.score.len > 0) {
+                    try w.writeByte(' ');
+                    try escapeInto(w, p.score);
+                }
+            }
+        } else if (game.name.len > 0) {
+            try w.writeAll(". ");
+            try escapeInto(w, game.name);
+        }
+        try w.writeAll("</p>");
+    }
+    try w.writeAll("</div>");
+}
+
 /// Per-league today link shared by the static home rows and the live
 /// home rows: `/{slug}?date={day}` when a day is in hand, dateless
 /// `/{slug}` otherwise. One spelling everywhere, so the shortcut never
@@ -1348,9 +1448,21 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
 /// `<pre>`, so visible-text tests never see it). Fixed size, cached with
 /// the favicon itself.
 pub const home_logo_mark =
-    "<a class=\"logo-home\" href=\"/\">" ++
+    "<a class=\"logo-home\" href=\"/\" aria-label=\"sprts home\">" ++
     "<span class=\"logo-dark\">" ++ logo_dark_svg ++ "</span>" ++
     "<span class=\"logo-light\">" ++ logo_light_svg ++ "</span></a>\n";
+
+/// Skip-to-content link: the first `<main>` child on every HTML page,
+/// visually hidden until focused. Its target is the page `<h1>
+/// (see `h1_open`), so keyboard and screen-reader users land on the
+/// title line past the brand mark.
+pub const skip_link = "<a class=\"skip-link\" href=\"#content\">Skip to content</a>";
+
+/// Page-title heading opener: every HTML page wraps its title line in
+/// exactly one `<h1 id="content">`. The id serves the skip link; the
+/// `h1{margin:0;padding:0;font:inherit}` rule kills UA margins so the
+/// row keeps its exact box and `<pre>` visible text never changes.
+pub const h1_open = "<h1 id=\"content\">";
 
 pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1358,7 +1470,10 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     const w = &out.writer;
     try pageHead(w, "sprts");
     try table.writeSeparator(w, 50);
-    for (leagues.all) |league| {
+    // The first league row doubles as the page `<h1>` title (the skip
+    // link's `#content` target): tags strip clean, so visible text and
+    // layout never change.
+    for (leagues.all, 0..) |league, i| {
         const href = try homeLeagueHref(allocator, league.slug, day);
         defer allocator.free(href);
         var cell: std.Io.Writer.Allocating = .init(allocator);
@@ -1368,11 +1483,14 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
         try writeCell(&cell.writer, league.name, 34, null, false);
         const padded = try cell.toOwnedSlice();
         defer allocator.free(padded);
+        if (i == 0) try w.writeAll(h1_open);
         try w.writeAll("<a href=\"");
         try escapeInto(w, href);
         try w.writeAll("\">");
         try escapeInto(w, std.mem.trimEnd(u8, padded, " "));
-        try w.writeAll("</a>\n");
+        try w.writeAll("</a>");
+        if (i == 0) try w.writeAll("</h1>");
+        try w.writeByte('\n');
     }
     try w.writeByte('\n');
     try w.writeAll("Try: curl localhost:8080/mlb\n");
@@ -1398,7 +1516,17 @@ pub fn homeHtmlLive(
     const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
     defer allocator.free(heading);
     try pageHead(w, heading);
-    try homeSections(allocator, w, boards, false, true, day);
+    // Sections render aside, then the first row becomes the page `<h1>`
+    // title (see `writeH1FirstLine`): tags strip clean, so visible text
+    // and layout never change.
+    {
+        var sec: std.Io.Writer.Allocating = .init(allocator);
+        defer sec.deinit();
+        try homeSections(allocator, &sec.writer, boards, false, true, day);
+        const rendered = try sec.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeH1FirstLine(w, rendered);
+    }
     if (!quiet) {
         try w.writeAll("Try: curl ");
         try escapeInto(w, host);
@@ -1439,7 +1567,7 @@ pub fn pageHeadLive(w: *std.Io.Writer, title: []const u8, live: bool) !void {
     // Theme script before the stylesheet: the stored/OS theme lands on
     // `data-theme` ahead of first CSS application, so navigating between
     // pages never flashes the default theme (the reported "reset").
-    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ home_logo_mark);
+    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ skip_link ++ home_logo_mark);
     if (live) {
         try w.writeAll("<pre data-live=\"1\">");
     } else {
@@ -1534,7 +1662,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:var(--link);text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}</style>
+    \\<style>:root{--bg:#10140f;--ink:#e6ebe7;--muted:#8b968f;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
 ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -1551,11 +1679,11 @@ pub const favicon_svg =
 /// `logo_light_svg` dark ink for light surfaces; the home page
 /// shows one or the other via the theme-swap classes below.
 pub const logo_dark_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#e6ebe7"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
+    \\<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#e6ebe7"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
 ;
 
 pub const logo_light_svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#1c2420"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
+    \\<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#1c2420"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
 ;
 /// Footer theme toggle: a single localStorage key persists the choice;
 /// without one the OS preference wins (matchMedia before first paint, so
@@ -1565,14 +1693,16 @@ pub const logo_light_svg =
 /// pages can never disagree with each other.
 const theme_script =
     \\<script>(function(){try{var t=localStorage.getItem("sprts-theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.dataset.theme=t;}catch(e){}})();</script>
-    \\<script>function sprtsTheme(){try{var h=document.documentElement;var n=h.dataset.theme==="light"?"dark":"light";h.dataset.theme=n;localStorage.setItem("sprts-theme",n);}catch(e){}return false;}</script>
+    \\<script>function sprtsTheme(){try{var h=document.documentElement;var n=h.dataset.theme==="light"?"dark":"light";h.dataset.theme=n;localStorage.setItem("sprts-theme",n);var b=document.querySelector(".theme-toggle");if(b)b.setAttribute("aria-pressed",n==="dark"?"true":"false");}catch(e){}return false;}document.addEventListener("DOMContentLoaded",function(){try{var b=document.querySelector(".theme-toggle");if(b)b.setAttribute("aria-pressed",document.documentElement.dataset.theme==="dark"?"true":"false");}catch(e){}});</script>
 ;
 
 /// Theme toggle link appended to every page footer nav. A plain link
 /// (not a button) so it needs no button CSS and keeps the plaintext
-/// vibe; with JS off it is a harmless `#` jump.
+/// vibe; with JS off it is a harmless `#` jump. It carries
+/// `role="button"` with `aria-pressed` tracking the dark theme, so
+/// assistive tech announces it as the toggle it is.
 pub fn themeNavSuffix() []const u8 {
-    return "<a href=\"#\" onclick=\"return sprtsTheme()\">light/dark</a>";
+    return "<a class=\"theme-toggle\" href=\"#\" role=\"button\" aria-pressed=\"false\" onclick=\"return sprtsTheme()\">light/dark</a>";
 }
 
 /// Closing tags shared by every HTML page: theme toggle link, then
@@ -1602,9 +1732,9 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
         .text => try out.writer.print("sprts: {s}\n", .{message}),
         .html => {
             try pageHead(&out.writer, "sprts error");
-            try out.writer.writeAll("sprts: ");
+            try out.writer.writeAll(h1_open ++ "sprts: ");
             try escapeInto(&out.writer, message);
-            try out.writer.writeAll("</pre><nav><a href=\"/\">leagues</a>");
+            try out.writer.writeAll("</h1></pre><nav><a href=\"/\">leagues</a>");
             try closePageWithNav(&out.writer);
         },
         .json => {
@@ -1775,8 +1905,9 @@ test "HTML pages link and never carry ANSI" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<OT>") == null);
     // Visible text still matches the unlinked table byte for byte.
     try expectVisiblePreText(page, board, null, null);
-    // Every page carries the clickable brand: logo links back home.
-    try std.testing.expect(std.mem.indexOf(u8, page, "<a class=\"logo-home\" href=\"/\">") != null);
+    // Every page carries the clickable brand: logo links back home with
+    // an accessible name; theme SVGs hide from assistive tech.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a class=\"logo-home\" href=\"/\" aria-label=\"sprts home\">") != null);
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);
@@ -1952,7 +2083,8 @@ fn expectVisiblePreText(page: []const u8, board: domain.Scoreboard, width: ?u16,
 }
 
 test "scoreboard links read by color, padding outside anchors" {
-    // Links carry no static underline (hover only); cell padding still
+    // Links carry no static underline (hover only) — the non-color cue
+    // is bold (`pre a` keeps color + hover-underline); cell padding still
     // rides outside anchors so a hover underline stops at the text:
     // no anchor may close on a blank (padded-inside form `  </a>`).
     const board: domain.Scoreboard = .{
@@ -1989,6 +2121,111 @@ test "scoreboard links read by color, padding outside anchors" {
     }
     try std.testing.expect(anchors > 0);
     try expectVisiblePreText(page, board, null, null);
+}
+
+test "web accessibility: names, focus, art, targets, live, headings, links" {
+    // Fixture: live duel with color marks (PHI ships a color sidecar),
+    // so art rows, live state, and summaries all render at once.
+    try std.testing.expect(core.art.teamArtColor("mlb", "PHI", .xs) != null);
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = false },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
+                },
+            },
+        },
+    };
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(page);
+
+    // 1. Logo link has an accessible name; theme SVGs hide from AT.
+    try std.testing.expect(std.mem.indexOf(u8, page, "aria-label=\"sprts home\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "aria-hidden=\"true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "aria-hidden=\"true\"") != null);
+
+    // 2. Keyboard focus is visible.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "a:focus-visible{outline:2px solid var(--link);outline-offset:2px}") != null);
+
+    // 3. Theme toggle announces as a button with pressed state.
+    try std.testing.expect(std.mem.indexOf(u8, page, "role=\"button\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "aria-pressed=\"") != null);
+
+    // 4. Braille art rows hide from AT; one sr-only summary per game
+    // carries the game id and status outside `<pre>`.
+    var art_rows: usize = 0;
+    var page_lines = std.mem.splitScalar(u8, page, '\n');
+    while (page_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "rgb(") != null) {
+            art_rows += 1;
+            try std.testing.expect(std.mem.indexOf(u8, line, "aria-hidden=\"true\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "<a href") == null);
+        }
+    }
+    try std.testing.expect(art_rows > 0);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, ".sr-only{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<div class=\"sr-only\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Game 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Top 7th") != null);
+
+    // 5. Nav links get touch-sized padding (never min-height chrome).
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "nav a{margin-right:16px;padding:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "min-height:44px") == null);
+
+    // 6. Live state never rides on color alone: bold plus a
+    // forced-contrast strengthening rule.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, ".live{color:var(--live);font-weight:bold}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "prefers-contrast") != null);
+    const mlb_live = [_]provider.LeagueResult{.{ .league = core.leagues.find("mlb").?, .board = board }};
+    const live_home_page = try homeHtmlLive(std.testing.allocator, "example.test", &mlb_live, "2026-09-06", false);
+    defer std.testing.allocator.free(live_home_page);
+    try std.testing.expect(std.mem.indexOf(u8, live_home_page, "<span class=\"live\">") != null);
+
+    // 7. Exactly one `<h1>` title plus a skip link as the first `<main>`
+    // child; visible `<pre>` text never changes.
+    var h1_hits: usize = 0;
+    var rest: []const u8 = page;
+    while (std.mem.indexOf(u8, rest, "<h1")) |at| {
+        h1_hits += 1;
+        rest = rest[at + "<h1".len ..];
+    }
+    try std.testing.expectEqual(@as(usize, 1), h1_hits);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<h1 id=\"content\">MLB  2026-09-06 ET</h1>") != null);
+    const main_at = std.mem.indexOf(u8, page, "<main>").?;
+    try std.testing.expect(std.mem.startsWith(u8, page[main_at + "<main>".len ..], skip_link));
+    try expectVisiblePreText(page, board, null, null);
+
+    // 8. Links keep color + hover-underline with bold as the non-color
+    // cue, never a resting underline (owner style decision).
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre a{color:var(--link);font-weight:bold;text-decoration:none}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre a:hover{text-decoration:underline;") != null);
+
+    // Every page type carries the same heading + skip landmarks.
+    const static_home = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(static_home);
+    try std.testing.expect(std.mem.indexOf(u8, static_home, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, static_home, skip_link) != null);
+    var idle: [core.leagues.all.len]provider.LeagueResult = undefined;
+    for (&core.leagues.all, 0..) |*league, i| idle[i] = .{ .league = league };
+    const live_home = try homeHtmlLive(std.testing.allocator, "example.test", &idle, "2026-09-06", false);
+    defer std.testing.allocator.free(live_home);
+    try std.testing.expect(std.mem.indexOf(u8, live_home, "<h1 id=\"content\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live_home, skip_link) != null);
+    const err = try errorBody(std.testing.allocator, "nope", .html);
+    defer std.testing.allocator.free(err);
+    try std.testing.expect(std.mem.indexOf(u8, err, "<h1 id=\"content\">sprts: nope</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, skip_link) != null);
+    _ = try std.unicode.Utf8View.init(page);
 }
 
 test "scoreHtml art rows stay pos-indexed and unlinked" {
@@ -3015,7 +3252,6 @@ test "home html game lines use sibling anchors, never nested" {
     _ = try std.unicode.Utf8View.init(page);
 }
 
-
 test "logo stack is byte-identical across page types" {
     // The shared composer (`pageHead`) owns `<main>` through `<pre>`:
     // home, live home, and scoreboard must agree there byte for byte.
@@ -3044,9 +3280,6 @@ test "logo stack is byte-identical across page types" {
     try std.testing.expectEqualStrings(stacks[0], stacks[1]);
     try std.testing.expectEqualStrings(stacks[0], stacks[2]);
 }
-
-
-
 
 /// Art-off layout contract: `off` must equal `on` minus the art rows —
 /// braille lines drop, and a blank line directly following a dropped line
