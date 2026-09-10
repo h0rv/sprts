@@ -275,7 +275,6 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
     const title = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try w.writeAll("<pre>");
     // Colored logo mark as HTML rows: SGR runs become rgb spans via
     // `table.writeArtLineHtml` (mono marks emit plain glyphs). No box,
     // no padding — art lines are ragged by nature.

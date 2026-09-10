@@ -995,7 +995,6 @@ pub fn scoreHtmlWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboa
     const title = try std.fmt.allocPrint(allocator, "{s} scores {s} {s}", .{ board.league_name, board.date, tag });
     defer allocator.free(title);
     try pageHead(w, title);
-    try w.writeAll("<pre>");
     const shown: usize = shown_pre;
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
     try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
@@ -1348,7 +1347,6 @@ pub fn homeHtmlDay(allocator: std.mem.Allocator, day: ?[]const u8) ![]u8 {
     errdefer out.deinit();
     const w = &out.writer;
     try pageHead(w, "sprts");
-    try w.writeAll("<pre>");
     try table.writeSeparator(w, 50);
     for (leagues.all) |league| {
         const href = try homeLeagueHref(allocator, league.slug, day);
@@ -1390,7 +1388,6 @@ pub fn homeHtmlLive(
     const heading = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
     defer allocator.free(heading);
     try pageHead(w, heading);
-    try w.writeAll("<pre>\n");
     try homeSections(allocator, w, boards, false, true, day);
     if (!quiet) {
         try w.writeAll("Try: curl ");
@@ -1409,13 +1406,19 @@ pub fn homeHtmlLive(
     return out.toOwnedSlice();
 }
 
+/// Shared page opener: doctype through `<main>`, the clickable brand,
+/// and the `<pre>` opening as one owned byte run, so the logo stack
+/// (`<main>` .. `<pre>`) is identical on every HTML page. Callers emit
+/// content immediately after; nothing may interpose whitespace there —
+/// a stray `\n` after `<pre>` is preserved by `pre-wrap` and renders
+/// as a blank row, shifting that page's logo-to-content gap alone.
 pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
         "<title>");
     try escapeInto(w, title);
-    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>" ++ home_logo_mark);
+    try w.writeAll("</title>" ++ page_style ++ theme_script ++ "</head><body><main>" ++ home_logo_mark ++ "<pre>");
 }
 
 /// Escaped copy of a padded cell: escape `&<>"'` but pass spaces and
@@ -1504,7 +1507,7 @@ pub fn errorBody(allocator: std.mem.Allocator, message: []const u8, format: rout
         .text => try out.writer.print("sprts: {s}\n", .{message}),
         .html => {
             try pageHead(&out.writer, "sprts error");
-            try out.writer.writeAll("<pre>sprts: ");
+            try out.writer.writeAll("sprts: ");
             try escapeInto(&out.writer, message);
             try out.writer.writeAll("</pre><nav><a href=\"/\">leagues</a>");
             try closePageWithNav(&out.writer);
@@ -2745,11 +2748,33 @@ test "home html game lines use sibling anchors, never nested" {
 }
 
 
-test "tmp debug narrow" {
+test "logo stack is byte-identical across page types" {
+    // The shared composer (`pageHead`) owns `<main>` through `<pre>`:
+    // home, live home, and scoreboard must agree there byte for byte.
+    // A stray `\n` after `<pre>` on any one page is preserved by
+    // `pre-wrap` and renders as a blank row, shifting only that page's
+    // logo-to-content gap (team/detail/help/digest/standings share the
+    // same composer, so they match by construction).
     const board = testBoard();
-    const page = try scoreHtml(std.testing.allocator, board, 40, 2);
-    defer std.testing.allocator.free(page);
-    std.debug.print("\n=====PAGE=====\n{s}\n=====END=====\n", .{page});
+    const score = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(score);
+    const static = try homeHtml(std.testing.allocator);
+    defer std.testing.allocator.free(static);
+    var results: [1]provider.LeagueResult = .{.{ .league = core.leagues.find("mlb").? }};
+    results[0].board = board;
+    const live = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-06", false);
+    defer std.testing.allocator.free(live);
+    const pages = [_][]const u8{ score, static, live };
+    var stacks: [3][]const u8 = undefined;
+    for (pages, 0..) |page, i| {
+        const main_at = std.mem.indexOf(u8, page, "<main>").?;
+        const pre_at = std.mem.indexOf(u8, page, "<pre>").?;
+        stacks[i] = page[main_at .. pre_at + "<pre>".len];
+        // Content starts immediately: no blank row between logo and body.
+        try std.testing.expect(page[pre_at + "<pre>".len] != '\n');
+    }
+    try std.testing.expectEqualStrings(stacks[0], stacks[1]);
+    try std.testing.expectEqualStrings(stacks[0], stacks[2]);
 }
 
 

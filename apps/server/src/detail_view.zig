@@ -197,7 +197,6 @@ pub fn detailHtml(allocator: std.mem.Allocator, game: detail.GameDetail, width: 
     const title = try std.fmt.allocPrint(allocator, "{s} game detail", .{game.league_name});
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try w.writeAll("<pre>");
     // Heading names league + full date + zone once (see renderText).
     const zone_tag = try tz.zoneTag(allocator, .et);
     defer allocator.free(zone_tag);

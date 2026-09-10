@@ -132,7 +132,6 @@ pub fn html(
     const title = try std.fmt.allocPrint(allocator, "{s} standings", .{st.league_name});
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try w.writeAll("<pre>");
     try render.escapeInto(w, body);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/{s}\">scores</a>", .{st.league});

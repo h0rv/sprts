@@ -197,7 +197,6 @@ pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSec
     const title = try std.fmt.allocPrint(allocator, "sprts all {s} {s}", .{ day, tag });
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try w.writeAll("<pre>");
     try render.escapeInto(w, body);
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/all?date={s}\">all</a>", .{day});
