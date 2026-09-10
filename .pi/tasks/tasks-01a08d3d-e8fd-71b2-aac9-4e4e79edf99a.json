@@ -1,0 +1,16 @@
+{
+  "nextId": 2,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Implement tui.zig review fixes",
+      "description": "Implement all tui.zig production fixes: team scroll window, scratch-arena ticks, settled backoff + standings tick, width clamp + footer collapse, short-viewport mark skip, per-view footer, manualRefresh SSE reset, fallible setError/setFilter/load chain, delete frameDate, unify pick fns, clock seam",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789076381384,
+      "updatedAt": 1789077035289
+    }
+  ]
+}
