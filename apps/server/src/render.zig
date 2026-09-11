@@ -775,7 +775,9 @@ fn writeBoardGameOneLine(w: *std.Io.Writer, league_slug: []const u8, board_date:
 /// True when any participant in the first `shown` games has a color mark.
 /// The score HTML linkifier only reads the color twin on art rows, so a
 /// false here means the twin render can be skipped with identical output.
-fn boardHasColorArt(board: domain.Scoreboard, shown: usize) bool {
+/// Pub so the digest HTML composer can reuse the same fast path per
+/// section (see `digest.htmlWithZoneArt`).
+pub fn boardHasColorArt(board: domain.Scoreboard, shown: usize) bool {
     for (board.games[0..shown]) |game| {
         for (game.participants) |participant| {
             if (core.art.teamArtColor(board.league, participant.abbreviation, .xs) != null) return true;
@@ -828,7 +830,7 @@ pub fn scoreHtmlWithZoneArtMtime(allocator: std.mem.Allocator, board: domain.Sco
     try pageHeadLive(w, title, boardIsLive(board));
     const shown: usize = shown_pre;
     const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
-    try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown);
+    try writeLinkedScoreboard(w, allocator, board, body, color_body, inner, shown, true);
     try w.writeAll("</pre>");
     try writeScoreSummaries(w, board, shown);
     // Live pages stream: freshness line plus the updater script. Final
@@ -875,13 +877,22 @@ pub fn scoreHtmlArt(allocator: std.mem.Allocator, board: domain.Scoreboard, widt
 /// `table.writeArtLineHtml`, so SGR becomes rgb spans and `\x1b[` never
 /// reaches the page. Every other row uses the mono body, so the visible
 /// text still matches `text(color=false)` byte for byte.
-fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, color_body: []const u8, inner: usize, shown: usize) !void {
+///
+/// Pub so the digest HTML composer reuses it per league section (see
+/// `digest.htmlWithZoneArt`): one call per section with that section's
+/// board slice. `heading_as_h1` selects whether the section heading
+/// doubles as the page `<h1>` title (the skip link's `#content`
+/// target): true for a standalone board and the digest's first section,
+/// false for later digest sections so the page keeps exactly one `<h1>`.
+/// A demoted heading escapes as plain text, so visible text is identical
+/// either way.
+pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, color_body: []const u8, inner: usize, shown: usize, heading_as_h1: bool) !void {
     _ = inner;
     var game_idx: usize = 0;
     var current: ?usize = null;
     var part_pos: usize = 0;
     var pending_rule = false;
-    var first_row = true;
+    var first_row = heading_as_h1;
     // Name-only games (no participants) link exactly one content row
     // (the name); every later row in the block — the `TV:` line, the
     // plain-text game pointer — escapes as plain text. Participant games

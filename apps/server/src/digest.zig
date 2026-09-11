@@ -206,9 +206,17 @@ fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) 
 /// Same single-source layout principle as `render.scoreHtml`. `dated`
 /// skips off-day sections exactly like the text digest (see
 /// `textWithZoneArt`).
+///
+/// Game and team hrefs ride the shared scoreboard linkifier
+/// (`render.writeLinkedScoreboard`, one call per league section with that
+/// section's board slice), so every status cell links its game view and
+/// every abbreviation links its team page — same anchors, same
+/// scoped-underline CSS (padding outside anchors), same empty-abbr guard
+/// as scoreboards. Digest-level lines (outage markers, `+N more`
+/// pointers) escape as plain text; only invisible tags are added, so the
+/// `<pre>` visible text matches the quiet text digest byte for byte.
 pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, art: bool, dated: bool) ![]u8 {
-    const body = try textWithZoneArt(allocator, sections, day, false, width, height, true, zone, art, dated);
-    defer allocator.free(body);
+    const per_league = height orelse default_games_per_league;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -217,7 +225,57 @@ pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSec
     const title = try std.fmt.allocPrint(allocator, "sprts all {s} {s}", .{ day, tag });
     defer allocator.free(title);
     try render.pageHead(w, title);
-    try render.writeEscapedBodyH1(w, body);
+    const inner: usize = @min(@max(width orelse 52, 52), 200) - 2;
+    // First emitted content line doubles as the page `<h1>` title (the
+    // skip link's `#content` target), mirroring `writeEscapedBodyH1`;
+    // later section headings render plain so the page keeps one `<h1>`.
+    var h1_done = false;
+    for (sections) |section| {
+        const board = section.board orelse {
+            const marker = try view.digestUnavailable(allocator, section.league.slug, day);
+            defer allocator.free(marker);
+            if (!h1_done) {
+                try w.writeAll(render.h1_open);
+                try render.escapeInto(w, marker);
+                try w.writeAll("</h1>\n");
+                h1_done = true;
+            } else {
+                try render.escapeInto(w, marker);
+                try w.writeByte('\n');
+            }
+            continue;
+        };
+        // Dated past view: an answered-but-empty board is an off-day —
+        // skip the section entirely, exactly like `textWithZoneArt`.
+        if (dated and board.games.len == 0) continue;
+        const capped = @min(per_league, board.games.len);
+        const slice: core.domain.Scoreboard = .{
+            .league = board.league,
+            .league_name = board.league_name,
+            .date = board.date,
+            .source = board.source,
+            .games = board.games[0..capped],
+        };
+        // Same bodies the text digest concatenates (uncolored mono plus
+        // the color twin only when a shown mark needs it), through the
+        // shared linkifier — never a second one.
+        const body = try render.textWithZoneArt(allocator, slice, false, width, null, zone, art);
+        defer allocator.free(body);
+        var color_owned: ?[]u8 = null;
+        defer if (color_owned) |b| allocator.free(b);
+        if (art and render.boardHasColorArt(slice, capped)) {
+            color_owned = try render.textWithZoneArt(allocator, slice, true, width, null, zone, art);
+        }
+        const color_body = color_owned orelse body;
+        try render.writeLinkedScoreboard(w, allocator, slice, body, color_body, inner, capped, !h1_done);
+        h1_done = true;
+        if (capped < board.games.len) {
+            const pointer = try std.fmt.allocPrint(allocator, "+{d} more -> /{s}?date={s}", .{ board.games.len - capped, board.league, day });
+            defer allocator.free(pointer);
+            try render.escapeInto(w, pointer);
+            try w.writeByte('\n');
+        }
+    }
     try w.writeAll("</pre><nav>");
     try w.print("<a href=\"/all?date={s}\">all</a>", .{day});
     try w.print("<a href=\"/api/v1/all?date={s}\">json</a>", .{day});
@@ -640,6 +698,103 @@ test "digest hostile fixture keeps text and HTML visible text equal" {
     _ = try std.unicode.Utf8View.init(page);
     // Visible `<pre>` text (tags stripped, entities decoded) matches
     // the text body line for line.
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+}
+
+test "digest html links every shown game and team like scoreboards" {
+    // Seven games pin the default cap at five: the five shown rows carry
+    // the shared linkifier's game + team anchors, the two hidden ones
+    // carry none, and the `+2 more` pointer escapes as plain text.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const games = try arena.alloc(core.domain.Game, 7);
+    for (games, 0..) |*game, i| {
+        game.* = .{
+            .id = try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .slug = try std.fmt.allocPrint(arena, "awy-hme-{d}", .{i}),
+            .name = "Away at Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{
+                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
+                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "80-63" },
+            },
+        };
+    }
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = games,
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = board },
+        .{ .league = core.leagues.find("nfl").?, .board = null },
+    };
+    const page = try html(arena, &sections, "2026-09-06", null, null, false, false);
+    // Shown rows: status cells link the game view (slug href, numeric
+    // anchor id), abbrevs link the team pages — the scoreboard shape.
+    for (0..5) |i| {
+        const game_anchor = try std.fmt.allocPrint(arena, "<a href=\"/mlb/2026-09-06/awy-hme-{d}\" id=\"game-{d}\">", .{ i, i });
+        defer arena.free(game_anchor);
+        try std.testing.expect(std.mem.indexOf(u8, page, game_anchor) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/AWY\">AWY</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/HME\">HME</a>") != null);
+    // Hidden rows stay unlinked; the cap pointer is plain escaped text.
+    try std.testing.expect(std.mem.indexOf(u8, page, "id=\"game-5\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "id=\"game-6\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "+2 more -&gt; /mlb?date=2026-09-06") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "/nfl?date=2026-09-06: unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    // The tags add no visible text: parity with the quiet text digest.
+    const body = try text(arena, &sections, "2026-09-06", false, null, null, true, false);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+}
+
+test "digest html empty-abbr rows emit no team link" {
+    // Athlete-style rows (tennis): no abbreviation, so no team page to
+    // point at — the shared linkifier keeps the game anchor alone and
+    // never emits a bare `/atp/` href, exactly like scoreboards (see the
+    // `team: /atp/` guard precedent in `render.zig`).
+    const board: core.domain.Scoreboard = .{
+        .league = "atp",
+        .league_name = "ATP",
+        .date = "2026-09-10",
+        .source = "test",
+        .games = &.{.{
+            .id = "182772",
+            .name = "US Open",
+            .starts_at = "2026-09-10T00:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{
+                .{ .id = "3310", .name = "Botic Van De Zandschulp", .abbreviation = "", .score = "0", .winner = false },
+                .{ .id = "2375", .name = "Alexander Zverev", .abbreviation = "", .score = "3", .winner = true },
+            },
+        }},
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("atp").?, .board = board },
+    };
+    const arena = std.testing.allocator;
+    const page = try html(arena, &sections, "2026-09-10", null, null, false, false);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/atp/182772\" id=\"game-182772\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "href=\"/atp/\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    const body = try text(arena, &sections, "2026-09-10", false, null, null, true, false);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "team: /atp/") == null);
     const seen = try view.expectVisibleParity(arena, page);
     defer arena.free(seen);
     try std.testing.expectEqualStrings(body, seen);
