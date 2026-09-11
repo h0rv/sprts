@@ -4,7 +4,7 @@ node = "24.15.0"
 "github:christianhelle/openapi2zig" = "0.5.6"
 
 [tasks.check]
-run = "zig build test && zig build && zig build -Doptimize=ReleaseSafe && cd packages/core && zig build test && cd ../../clients/espn && zig build test && cd ../sprts && zig build test && zig build && cd ../../apps/server && zig build test && zig build && (test -d ../cli && (cd ../cli && zig build test && zig build) || echo 'skip apps/cli: not landed yet')"
+run = "zig build test && zig build && zig build -Doptimize=ReleaseSafe && cd packages/core && zig build test && cd ../../clients/espn && zig build test && cd ../sprts && zig build test && zig build && cd ../../apps/server && zig build test && zig build && zig build wasm && (test -d ../cli && (cd ../cli && zig build test && zig build) || echo 'skip apps/cli: not landed yet')"
 
 [tasks.serve]
 run = "zig build run"

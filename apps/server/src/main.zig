@@ -1041,7 +1041,8 @@ fn sseBoardInitial(
 ) !SseInitial {
     const stream = server_app.stream;
     const slug = try core.cache.canonicalSlug(arena, league.slug);
-    var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day };
+    const today = try server_app.tz.resolveDay(arena, null, now_s, zone);
+    var fetch_ctx = BoardFetchCtx{ .adapter = adapter, .league = league, .day = day, .today = today };
     const cached = try cache.getOrFetchBoard(arena, slug, day, cache_now, &fetch_ctx, fetchBoardPayload);
     const board = cached.data.board;
     const text = try server_app.render.textWithZoneArt(arena, board, color, width, height, zone, art);
