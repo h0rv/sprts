@@ -519,6 +519,19 @@ test "digest art off strips section marks, keeps sections and pointers" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
+            // Scheduled tail keeps the board mixed so the section renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "10",
+                .name = "AWY at HME",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
+                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
+                },
+            },
         },
     };
     const sections = [_]DigestSection{
@@ -567,6 +580,19 @@ test "dated digest skips off-day leagues, keeps outage markers" {
                 .participants = &.{
                     .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "77-70" },
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "89-58" },
+                },
+            },
+            // Scheduled tail keeps the board mixed so the section renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2025-09-10T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "x", .name = "Later Away", .abbreviation = "LAW", .score = "", .winner = false },
+                    .{ .id = "y", .name = "Later Home", .abbreviation = "LHM", .score = "", .winner = false },
                 },
             },
         },
@@ -624,6 +650,19 @@ test "dated digest matches today render when every league played" {
                 .participants = &.{
                     .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                },
+            },
+            // Scheduled tail keeps the board mixed so the section renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "10",
+                .name = "AWY at HME",
+                .starts_at = "2025-09-10T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
+                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
                 },
             },
         },
@@ -717,9 +756,16 @@ test "digest html links every shown game and team like scoreboards" {
             .slug = try std.fmt.allocPrint(arena, "awy-hme-{d}", .{i}),
             .name = "Away at Home",
             .starts_at = "2026-09-06T17:00Z",
-            .state = "post",
-            .status = "Final",
-            .participants = &.{
+            // Scheduled lead keeps the shown slice mixed so it renders
+            // its rich card (an all-final board goes compact). The lead
+            // sits inside the cap, so seven games still pin the cap at
+            // five and the `+2 more` pointer is unchanged.
+            .state = if (i == 0) "pre" else "post",
+            .status = if (i == 0) "Scheduled" else "Final",
+            .participants = if (i == 0) &.{
+                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
+                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
+            } else &.{
                 .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
                 .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "80-63" },
             },
