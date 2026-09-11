@@ -110,6 +110,15 @@ test "scoreboard json carries both id and slug" {
 /// art rows — while scores, names, and rules align exactly as with art
 /// on minus the art rows. Text stays the single source of layout: the
 /// HTML renderer derives from this body, so visible text matches.
+///
+/// All-final boards (at least one game, every `state == "post"`) read as
+/// the home summary instead of full cards: one `view.homeGameLine` row
+/// per game — the same columns as the home rows — with no marks, no TV
+/// lines, and no `game:` pointers. Each row still closes with a
+/// separator rule so the HTML linkifier keys one game link per row.
+/// Empty boards keep their note; any live/scheduled game (or an unknown
+/// league slug, which has no home geometry to compose) keeps the rich
+/// card form.
 pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone, art: bool) ![]u8 {
     const cols: usize = @min(@max(width orelse 52, 52), 200);
     const shown: usize = @min(height orelse board.games.len, board.games.len);
@@ -125,7 +134,23 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
     if (board.games.len == 0) {
         try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
+    // All-final fast form (see the doc comment): one shared home row per
+    // game, decided once for the whole board — never per game — so mixed
+    // boards stay uniformly rich.
+    const compact = board.games.len > 0 and view.boardIsAllFinal(board) and leagues.find(board.league) != null;
+    const compact_widths = if (compact) view.scoreboardCompactWidths(board) else view.CompactWidths{ .slug_w = 3, .abbr_w = 2 };
+    const compact_league = if (compact) leagues.find(board.league) else null;
     for (board.games[0..shown]) |game| {
+        if (compact) {
+            // Nothing to show (nameless, participant-free) falls back to
+            // the bare status so every game still owns exactly one row.
+            const line = try view.homeGameLine(allocator, compact_league.?, game, compact_widths.slug_w, compact_widths.abbr_w) orelse
+                try std.fmt.allocPrint(allocator, "{s}", .{game.status});
+            defer allocator.free(line);
+            try table.writeLine(w, line, cols, view.statusAnsi(game.state), color);
+            try table.writeSeparator(w, cols);
+            continue;
+        }
         try table.writeLine(w, game.status, cols, view.statusAnsi(game.state), color);
         if (game.participants.len == 0) {
             try table.writeLine(w, game.name, cols, null, color);
@@ -1696,6 +1721,16 @@ test "text renderer draws a document and no HTML" {
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
             },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
     const output = try text(std.testing.allocator, board, false, null, null);
@@ -1730,6 +1765,16 @@ test "text renderer draws a document and no HTML" {
                     .{ .id = "a", .name = "Atlético Madrid Club de Fútbol with extra tail", .abbreviation = "ATM", .score = "2", .winner = false },
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -1811,6 +1856,16 @@ test "HTML pages link and never carry ANSI" {
                     .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -2172,6 +2227,16 @@ test "scoreHtml art rows stay pos-indexed and unlinked" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact, mark-free).
+            .{
+                .id = "10",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
     const page = try scoreHtml(std.testing.allocator, board, null, null);
@@ -2283,17 +2348,29 @@ test "empty abbreviations emit no team link, text and HTML" {
         .league_name = "ATP",
         .date = "2026-09-10",
         .source = "test",
-        .games = &.{.{
-            .id = "182772",
-            .name = "US Open",
-            .starts_at = "2026-09-10T00:00Z",
-            .state = "post",
-            .status = "Final",
-            .participants = &.{
-                .{ .id = "3310", .name = "Botic Van De Zandschulp", .abbreviation = "", .score = "0", .winner = false },
-                .{ .id = "2375", .name = "Alexander Zverev", .abbreviation = "", .score = "3", .winner = true },
+        .games = &.{
+            .{
+                .id = "182772",
+                .name = "US Open",
+                .starts_at = "2026-09-10T00:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "3310", .name = "Botic Van De Zandschulp", .abbreviation = "", .score = "0", .winner = false },
+                    .{ .id = "2375", .name = "Alexander Zverev", .abbreviation = "", .score = "3", .winner = true },
+                },
             },
-        }},
+            // Scheduled tail keeps the board mixed so the match renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "182773",
+                .name = "Later",
+                .starts_at = "2026-09-10T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
+        },
     };
     const body = try text(std.testing.allocator, board, false, null, null);
     defer std.testing.allocator.free(body);
@@ -2700,6 +2777,16 @@ test "text renderer prints both marks side by side" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact, mark-free).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
     const output = try text(std.testing.allocator, board, false, null, null);
@@ -2732,6 +2819,16 @@ test "text renderer colors marks and strips them with color=false" {
                     .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true },
                     .{ .id = "2", .name = "New York Yankees", .abbreviation = "NYY", .score = "3", .winner = false },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact, mark-free).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -2797,6 +2894,16 @@ test "text renderer prints no mark for teams without one" {
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
             },
+            // Markless scheduled tail keeps the board mixed so the duel
+            // renders its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
     const output = try text(std.testing.allocator, board, false, null, null);
@@ -2821,6 +2928,16 @@ test "athlete-style rows show the full name with an empty abbr cell" {
                     .{ .id = "5498", .name = "Charles Leclerc", .abbreviation = "", .score = "#1", .winner = false },
                     .{ .id = "868", .name = "Lewis Hamilton", .abbreviation = "", .score = "#2", .winner = true },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the race renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -2860,6 +2977,16 @@ test "records render after the score in team rows" {
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
             },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
     const output = try text(std.testing.allocator, board, false, null, null);
@@ -2884,6 +3011,16 @@ test "multibyte names keep the frame aligned" {
                 .participants = &.{
                     .{ .id = "27", .name = "Nico Hülkenberg", .abbreviation = "", .score = "#7", .winner = false },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the race renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -3399,6 +3536,16 @@ fn artDuelBoard() domain.Scoreboard {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact, mark-free).
+            .{
+                .id = "10",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
         },
     };
 }
@@ -3459,6 +3606,16 @@ test "art off drops stacked marks and their interior blanks too" {
                 .participants = &.{
                     .{ .id = "1", .name = "Austin FC", .abbreviation = "ATX", .score = "1", .winner = true },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the duel renders
+            // its rich card (an all-final board goes compact, mark-free).
+            .{
+                .id = "8",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -3693,10 +3850,11 @@ test "dated home matches today render when every league played" {
 }
 
 test "past scoreboard keeps records, winner colors, marks, and links" {
-    // Content contract for past dates: a final board from last season
-    // renders the full today treatment — records, winner tick + green,
-    // team marks, game/team links — because no renderer consults the
-    // request date, only the board in hand.
+    // Content contract for past dates: a mixed board from last season
+    // renders the full today treatment for its final game — records,
+    // winner tick + green, team marks, game/team links — because no
+    // renderer consults the request date, only the board in hand. (An
+    // all-final past board goes compact instead; see the all-final test.)
     const arena = std.testing.allocator;
     const board: domain.Scoreboard = .{
         .league = "mlb",
@@ -3715,6 +3873,16 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
                     .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
                 },
+            },
+            // Scheduled tail keeps the board mixed so the final renders
+            // its rich card (an all-final board goes compact).
+            .{
+                .id = "10",
+                .name = "Later",
+                .starts_at = "2025-09-10T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
             },
         },
     };
@@ -3735,6 +3903,140 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/NYM\">NYM</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try expectVisiblePreText(page, board, null, null);
+}
+
+test "all-final scoreboards render compact home-summary rows" {
+    // The compact rule: at least one game with every `state == "post"`
+    // renders one shared home row per game — the same columns as the
+    // home rows — with no marks, no TV lines, no records, and no `game:`
+    // pointers. The finals below ship marks, records, and a broadcaster
+    // precisely so their absence is meaningful, not vacuous.
+    const arena = std.testing.allocator;
+    try std.testing.expect(core.art.teamArt("mlb", "PHI", .xs) != null);
+    const board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .slug = "phi-nym",
+                .name = "PHI at NYM",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .network = "ESPN",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                },
+            },
+            .{
+                .id = "10",
+                .slug = "awy-hme",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T19:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+        },
+    };
+    try std.testing.expect(view.boardIsAllFinal(board));
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(!containsBraille(body));
+    for ([_][]const u8{ "TV:", "game:", "(83-61)", "(74-70)" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) == null);
+    }
+    // Rows match the home-row shape: the shared composer, same widths.
+    const widths = view.scoreboardCompactWidths(board);
+    const mlb = core.leagues.find("mlb").?;
+    for (board.games) |game| {
+        const want = try view.homeGameLine(arena, mlb, game, widths.slug_w, widths.abbr_w);
+        defer if (want) |r| arena.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, body, want.?) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    try expectNoBrokenLines(body, 52);
+    // Height slicing keeps one row plus the trailer.
+    const capped = try text(arena, board, false, null, 1);
+    defer arena.free(capped);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "AWY") == null);
+    // HTML parity: one game link per compact row, visible text equal.
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/phi-nym\" id=\"game-9\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/awy-hme\" id=\"game-10\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+    const capped_page = try scoreHtml(arena, board, null, 1);
+    defer arena.free(capped_page);
+    try expectVisiblePreText(capped_page, board, null, 1);
+}
+
+test "mixed and empty boards keep their existing forms" {
+    // Any live/scheduled game keeps the rich card; an empty board keeps
+    // its note. Both hold through text and HTML parity.
+    const arena = std.testing.allocator;
+    const mixed: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "awy-hme",
+                .name = "Away at Home",
+                .starts_at = "2026-09-06T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+                },
+            },
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-06T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{},
+            },
+        },
+    };
+    try std.testing.expect(!view.boardIsAllFinal(mixed));
+    const rich = try text(arena, mixed, false, null, null);
+    defer arena.free(rich);
+    for ([_][]const u8{ "Final", "AWY", "HME", "game: /mlb/2026-09-06/awy-hme", "Scheduled", "Later" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, rich, token) != null);
+    }
+    const rich_page = try scoreHtml(arena, mixed, null, null);
+    defer arena.free(rich_page);
+    try expectVisiblePreText(rich_page, mixed, null, null);
+    // Empty boards are untouched by the rule: the scheduled note stays,
+    // with no game rows and no trailer.
+    const empty: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    try std.testing.expect(!view.boardIsAllFinal(empty));
+    const note = try text(arena, empty, false, null, null);
+    defer arena.free(note);
+    try std.testing.expect(std.mem.indexOf(u8, note, "No games scheduled.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "more") == null);
+    const note_page = try scoreHtml(arena, empty, null, null);
+    defer arena.free(note_page);
+    try expectVisiblePreText(note_page, empty, null, null);
 }
 
 test "scoreboard hostile fixture keeps text and HTML visible text equal" {
@@ -3937,6 +4239,16 @@ test "family scoreboard per-league boards keep TV parity" {
                     .status = "Final",
                     .network = family.network,
                     .participants = &.{ family.away, family.home },
+                },
+                // Scheduled tail keeps the board mixed so the final
+                // renders its rich card (an all-final board goes compact).
+                .{
+                    .id = "2",
+                    .name = "Later",
+                    .starts_at = "2026-09-06T23:00Z",
+                    .state = "pre",
+                    .status = "Scheduled",
+                    .participants = &.{},
                 },
             },
         };
