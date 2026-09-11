@@ -124,7 +124,7 @@ pub const ApiSpec = z.Spec(.{
     // the digest `degraded` list.
     z.endpoint(.GET, "/api/v1/{league}/{id}", .{
         .operation_id = "getGame",
-        .summary = "One game with linescore and scoring plays",
+        .summary = "One game with linescore, full play-by-play (plays with period/clock), pitch-sequence lines, probable-starter stat lines, HR column in lineups, injuries, and win probability",
         .description = "The second segment is a game only when it is all digits (legacy numeric address, still resolves); anything else routes to the team view. " ++
             "The human slug form (/{league}/{date}/{slug}) is the canonical link and 302s here. " ++
             "Responses carry both: numeric id plus the additive slug day-unique human id.",
@@ -150,7 +150,7 @@ pub const ApiSpec = z.Spec(.{
     // both 404; upstream failure is 502.
     z.endpoint(.GET, "/api/v1/{league}/standings", .{
         .operation_id = "getStandings",
-        .summary = "Current standings table for one league",
+        .summary = "Current standings table for one league, with streak and games-behind when supplied",
         .path = ScoreboardPath,
         .responses = .{
             z.case(.ok, core.standings.LeagueStandings),
@@ -209,9 +209,9 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  GET /api/v1/leagues - List supported leagues. (listLeagues)\n" ++
             "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
             "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only, seasontype=T football-only with week. (getScoreboard)\n" ++
-            "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only (legacy numeric address, still resolves). Game and detail JSON carry the additive slug day-unique human id next to id. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
+            "  GET /api/v1/league/id - One game with linescore, full play-by-play (plays with period/clock), pitch-sequence lines, probable-starter stat lines, HR column in lineups, injuries, and win probability. id digits only (legacy numeric address, still resolves). Game and detail JSON carry the additive slug day-unique human id next to id. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
             "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. params: date=YYYY-MM-DD heads the page with that day (prev/next flip days). (getTeam)\n" ++
-            "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
+            "  GET /api/v1/league/standings - Current standings table for one league, with streak and games-behind when supplied. (getStandings)\n" ++
             "  GET /api/v1/league/teams - Team list: id, abbrev, name per team. JSON-only, same body on the human path. (listTeams)\n" ++
             "\n" ++
             "NETWORK\n" ++

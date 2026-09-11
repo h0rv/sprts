@@ -2285,6 +2285,42 @@ fn boxscoreProbableStats(arena: std.mem.Allocator, boxscore: ?SummaryBoxscore, n
     return null;
 }
 
+/// One compact pitch-sequence line from provisional pitch-level detail:
+/// type + velocity + free text + count, omitting parts the payload lacks.
+/// Null when the pitch carries nothing renderable (empty text, null type
+/// and velocity, no count) so callers skip it instead of emitting blanks.
+/// Every payload observed so far omits `pitches` entirely, so this only
+/// fires on future shapes — present+absent tests lock both arms.
+fn formatPitch(arena: std.mem.Allocator, pitch: SummaryPitch) !?[]const u8 {
+    const ptype = (try jsonText(arena, pitch.pitchType)) orelse "";
+    var velo = (try jsonText(arena, pitch.velocity)) orelse "";
+    var velo_buf: ?[]u8 = null;
+    if (velo.len > 0 and std.mem.indexOf(u8, velo, "mph") == null and std.mem.indexOf(u8, velo, "MPH") == null) {
+        var all_digits = true;
+        for (velo) |c| {
+            if ((c < '0' or c > '9') and c != '.') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            velo_buf = try std.fmt.allocPrint(arena, "{s}mph", .{velo});
+            velo = velo_buf.?;
+        }
+    }
+    var parts: std.ArrayList([]const u8) = .empty;
+    if (ptype.len > 0) try parts.append(arena, ptype);
+    if (velo.len > 0) try parts.append(arena, velo);
+    if (pitch.text.len > 0) try parts.append(arena, pitch.text);
+    if (pitch.balls != null or pitch.strikes != null) {
+        const balls: i64 = pitch.balls orelse 0;
+        const strikes: i64 = pitch.strikes orelse 0;
+        try parts.append(arena, try std.fmt.allocPrint(arena, "({d}-{d})", .{ balls, strikes }));
+    }
+    if (parts.items.len == 0) return null;
+    return try std.mem.join(arena, " ", parts.items);
+}
+
 /// "completions/passingAttempts" -> "Completions/passing attempts": a
 /// space before each camel hump (an uppercase following a lowercase or
 /// digit, lowercased), first letter capitalized. Acronym runs ("H-AB")
@@ -2655,6 +2691,8 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
         .situation = situation,
         .decisions = try decisions.toOwnedSlice(arena),
         .scoring_plays = try scoring_plays.toOwnedSlice(arena),
+        .plays = try all_plays.toOwnedSlice(arena),
+        .pitches = try pitches.toOwnedSlice(arena),
         .leaders = try leaders.toOwnedSlice(arena),
         .lineups = try lineups.toOwnedSlice(arena),
         // depth: box-score team totals (optional; empty when not supplied).
@@ -3769,6 +3807,8 @@ fn collectStandingsGroups(
                     .losses = try standingsStatText(arena, raw.stats, &.{"losses"}),
                     .ties = try standingsStatText(arena, raw.stats, &.{ "ties", "draws" }),
                     .points = try standingsStatText(arena, raw.stats, &.{ "points", "pts" }),
+                    .streak = try standingsStatText(arena, raw.stats, &.{ "streak", "winStreak", "form" }),
+                    .games_behind = try standingsStatText(arena, raw.stats, &.{ "gamesBehind", "games_behind", "gamesBack", "gb" }),
                 });
             }
             try out.append(arena, .{
@@ -6159,4 +6199,136 @@ test "detail win probability reads the last sample, absent stays null" {
     var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
     const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
     try std.testing.expect(bare.win_probability == null);
+}
+
+// --- Info-density wave-1 provider batteries (appended; existing tests above untouched) ---
+//
+// Each battery asserts present renders plus absent skips through the same
+// `DetailFake`/`StandingsFake` seams (no live ESPN): full plays vs
+// scoring-only compat, pitch detail (capped) vs empty, probable stat lines
+// vs null, the HR lineup column vs empty, and standings streak/GB vs null.
+
+test "detailFetch threads full plays with scoring-only compat" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"plays":[{"text":"Strike looking.","scoringPlay":false,"awayScore":0,"homeScore":0,"period":{"displayValue":"1st Inning"},"clock":{"displayValue":"0:12"}},{"text":"Homered to left.","scoringPlay":true,"awayScore":1,"homeScore":0,"period":{"displayValue":"1st Inning"},"clock":{"displayValue":"0:00"}}]}
+    ;
+    const board =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"9","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "9");
+    // Every feed play rides `plays` with period/clock; scoring-only stays compat.
+    try std.testing.expectEqual(@as(usize, 2), detail.plays.len);
+    try std.testing.expectEqualStrings("1st Inning", detail.plays[0].period);
+    try std.testing.expectEqualStrings("0:12", detail.plays[0].clock);
+    try std.testing.expectEqualStrings("Strike looking.", detail.plays[0].text);
+    try std.testing.expectEqualStrings("1st Inning", detail.plays[1].period);
+    try std.testing.expectEqual(@as(usize, 1), detail.scoring_plays.len);
+    try std.testing.expectEqualStrings("Homered to left.", detail.scoring_plays[0].text);
+    // Absent plays: both stay empty, never an error.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "7");
+    try std.testing.expectEqual(@as(usize, 0), bare.plays.len);
+    try std.testing.expectEqual(@as(usize, 0), bare.scoring_plays.len);
+}
+
+test "detailFetch threads pitch detail capped, absent stays empty" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"plays":[{"text":"At bat.","scoringPlay":false,"awayScore":0,"homeScore":0,"period":{"displayValue":"1st Inning"},"pitches":[{"text":"Ball outside","pitchType":"FF","velocity":94,"balls":1,"strikes":0},{"text":"Swinging strike","pitchType":"SL","velocity":"88","balls":1,"strikes":1}]}]}
+    ;
+    const board =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"9","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const detail = try detailAdapter(&fake).fetchDetail(arena, core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqual(@as(usize, 2), detail.pitches.len);
+    try std.testing.expectEqualStrings("FF 94mph Ball outside (1-0)", detail.pitches[0]);
+    try std.testing.expectEqualStrings("SL 88mph Swinging strike (1-1)", detail.pitches[1]);
+    // Cap: one long at-bat never grows past 12 lines.
+    var cap: std.Io.Writer.Allocating = .init(arena);
+    try cap.writer.writeAll("{\"header\":{\"competitions\":[{\"id\":\"9\",\"date\":\"2026-09-06T17:10Z\",\"status\":{\"type\":{\"state\":\"post\",\"shortDetail\":\"Final\"}},\"competitors\":[{\"id\":\"a\",\"homeAway\":\"away\",\"team\":{\"id\":\"a\",\"displayName\":\"Away\",\"abbreviation\":\"AWY\"}},{\"id\":\"h\",\"homeAway\":\"home\",\"team\":{\"id\":\"h\",\"displayName\":\"Home\",\"abbreviation\":\"HME\"}}]}]},\"plays\":[{\"text\":\"Marathon at bat.\",\"scoringPlay\":false,\"awayScore\":0,\"homeScore\":0,\"pitches\":[");
+    var i: usize = 0;
+    while (i < 13) : (i += 1) {
+        if (i > 0) try cap.writer.writeByte(',');
+        try cap.writer.print("{{\"text\":\"Pitch {d}\",\"pitchType\":\"FF\",\"velocity\":90,\"balls\":0,\"strikes\":0}}", .{i});
+    }
+    try cap.writer.writeAll("]}]}");
+    var cap_fake = DetailFake{ .summary_body = try cap.toOwnedSlice(), .board_body = board };
+    const capped = try detailAdapter(&cap_fake).fetchDetail(arena, core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqual(@as(usize, 12), capped.pitches.len);
+    // Absent pitch detail: empty, never an error.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
+    try std.testing.expectEqual(@as(usize, 0), bare.pitches.len);
+}
+
+test "detailFetch threads probable stat lines, absent stays null" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"},"probables":[{"athlete":{"displayName":"Test Arm","fullName":"Test Arm"}}]},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"boxscore":{"players":[{"team":{"id":"a","abbreviation":"AWY"},"statistics":[{"keys":["wins","losses","earnedRunAverage","inningsPitched","strikeouts"],"totals":["12","6","3.21","178.1","201"],"athletes":[{"athlete":{"id":"1","displayName":"Test Arm","fullName":"Test Arm"},"stats":["12","6","3.21","178.1","201"]}]}]}]}}
+    ;
+    const board =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"9","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const detail = try detailAdapter(&fake).fetchDetail(arena, core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqualStrings("Test Arm", detail.participants[0].probable.?);
+    try std.testing.expectEqualStrings("12-6, 3.21 ERA, 178.1 IP, 201 K", detail.participants[0].probable_stats.?);
+    try std.testing.expect(detail.participants[1].probable == null);
+    try std.testing.expect(detail.participants[1].probable_stats == null);
+    // No boxscore payload: bare probable name, null stat line.
+    var bare_fake = DetailFake{ .summary_body = detail_summary_minimal, .board_body = detail_board_minimal };
+    const bare = try detailAdapter(&bare_fake).fetchDetail(arena, core.leagues.find("mlb").?, "7");
+    try std.testing.expect(bare.participants[0].probable == null);
+    try std.testing.expect(bare.participants[0].probable_stats == null);
+}
+
+test "detailFetch threads the HR lineup column, absent stays empty" {
+    const summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"boxscore":{"players":[{"team":{"id":"a","abbreviation":"AWY"},"statistics":[{"names":["H-AB","AB","R","HR","RBI"],"keys":["hits-atBats","atBats","runs","homeRuns","RBIs"],"totals":["10-35","35","5","3","5"],"athletes":[{"athlete":{"id":"1","displayName":"Slugger","fullName":"Slugger"},"stats":["2-3","3","1","2","5"],"batOrder":1,"starter":true,"position":{"abbreviation":"RF"}}]}]}]}}
+    ;
+    const nohr_summary =
+        \\{"header":{"competitions":[{"id":"9","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"id":"h","homeAway":"home","winner":false,"score":4,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]},"boxscore":{"players":[{"team":{"id":"a","abbreviation":"AWY"},"statistics":[{"names":["H-AB","AB","R"],"keys":["hits-atBats","atBats","runs"],"totals":["10-35","35","5"],"athletes":[{"athlete":{"id":"1","displayName":"Contact Bat","fullName":"Contact Bat"},"stats":["2-3","3","1"],"batOrder":1,"starter":true,"position":{"abbreviation":"CF"}}]}]}]}}
+    ;
+    const board =
+        \\{"events":[{"id":"9","name":"Away at Home","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"9","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = summary, .board_body = board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const detail = try detailAdapter(&fake).fetchDetail(arena, core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqual(@as(usize, 1), detail.lineups.len);
+    try std.testing.expectEqualStrings("2", detail.lineups[0].entries[0].homeruns);
+    try std.testing.expectEqualStrings("5", detail.lineups[0].entries[0].rbis);
+    // Batting group without HR keys: empty column, never an error.
+    var nohr_fake = DetailFake{ .summary_body = nohr_summary, .board_body = board };
+    const nohr = try detailAdapter(&nohr_fake).fetchDetail(arena, core.leagues.find("mlb").?, "9");
+    try std.testing.expectEqual(@as(usize, 1), nohr.lineups.len);
+    try std.testing.expectEqualStrings("", nohr.lineups[0].entries[0].homeruns);
+}
+
+test "standings thread streak and games-behind, absent stays null" {
+    const body =
+        \\{"children":[{"name":"AL East","standings":{"entries":[{"team":{"id":"19","abbreviation":"NYY","displayName":"New York Yankees"},"stats":[{"name":"wins","value":80,"displayValue":"80"},{"name":"losses","value":63,"displayValue":"63"},{"name":"streak","value":3,"displayValue":"W3"},{"name":"gamesBehind","value":2.5,"displayValue":"2.5"}]}]}}]}
+    ;
+    var fake = StandingsFake{ .body = body };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const standings = try fetchStandings(standingsTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?);
+    try std.testing.expectEqual(@as(usize, 1), standings.groups.len);
+    try std.testing.expectEqualStrings("W3", standings.groups[0].entries[0].streak.?);
+    try std.testing.expectEqualStrings("2.5", standings.groups[0].entries[0].games_behind.?);
+    // Existing shapes without the new stats: null, never zero.
+    var legacy_fake = StandingsFake{ .body = standings_nfl_fixture };
+    const legacy = try fetchStandings(standingsTestAdapter(&legacy_fake), arena_state.allocator(), core.leagues.find("nfl").?);
+    try std.testing.expect(legacy.groups[0].entries[0].streak == null);
+    try std.testing.expect(legacy.groups[0].entries[0].games_behind == null);
 }

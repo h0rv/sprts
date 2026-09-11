@@ -25,6 +25,16 @@ pub fn json(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
     return render.validatedJson(detail.GameDetail, allocator, game);
 }
 
+/// Probable-starter line shared by text and HTML: `SP {ABBR}: {name}
+/// ({stats})` when the provider supplies a stat line, else the bare
+/// `SP {ABBR}: {name}`. One composer so the two can never drift.
+fn spLine(allocator: std.mem.Allocator, abbreviation: []const u8, name: []const u8, stats: ?[]const u8) ![]u8 {
+    if (stats) |s| {
+        if (s.len > 0) return std.fmt.allocPrint(allocator, "SP {s}: {s} ({s})", .{ abbreviation, name, s });
+    }
+    return std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ abbreviation, name });
+}
+
 /// `width` is total terminal columns of the document. Never shrinks below
 /// the classic 52-wide page. `height` caps the scoring plays listed
 /// (`+N more (?height=M)` trailer); null/0 = latest 5.
@@ -122,13 +132,29 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
         }
         for (game.participants) |entry| {
             if (entry.probable) |starter| {
-                const line = try std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ entry.abbreviation, starter });
+                const line = try spLine(allocator, entry.abbreviation, starter, entry.probable_stats);
                 defer allocator.free(line);
                 try table.writeLine(w, line, cols, null, color);
             }
         }
     }
-    if (game.scoring_plays.len > 0) {
+    if (game.plays.len > 0) {
+        try w.writeByte('\n');
+        const limit: usize = @min(height orelse 5, game.plays.len);
+        const start = game.plays.len - limit;
+        const plays = try vd.playsSection(allocator, game.plays[start..], cols);
+        defer vd.freeSection(allocator, plays);
+        try table.writeLine(w, plays.heading.?, cols, "2", color);
+        for (plays.rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
+        }
+        if (start > 0) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ start, game.plays.len });
+            defer allocator.free(more);
+            try table.writeLine(w, more, cols, "2", color);
+        }
+    } else if (game.scoring_plays.len > 0) {
         try w.writeByte('\n');
         const limit: usize = @min(height orelse 5, game.scoring_plays.len);
         const start = game.scoring_plays.len - limit;
@@ -143,6 +169,16 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
             const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ start, game.scoring_plays.len });
             defer allocator.free(more);
             try table.writeLine(w, more, cols, "2", color);
+        }
+    }
+    if (game.pitches.len > 0) {
+        try w.writeByte('\n');
+        try table.writeLine(w, "Pitches", cols, "2", color);
+        const rows = try vd.keyValueLines(allocator, game.pitches, cols, null);
+        defer vd.freeLines(allocator, rows);
+        for (rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
         }
     }
     // Lineups replace leaders when the provider ships a batting group:
@@ -188,6 +224,22 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
             try w.writeAll(line);
             try w.writeByte('\n');
         }
+    }
+    if (game.injuries.len > 0) {
+        try w.writeByte('\n');
+        try table.writeLine(w, "Injuries", cols, "2", color);
+        const rows = try vd.keyValueLines(allocator, game.injuries, cols, null);
+        defer vd.freeLines(allocator, rows);
+        for (rows) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
+        }
+    }
+    if (game.win_probability) |prob| {
+        try w.writeByte('\n');
+        const line = try std.fmt.allocPrint(allocator, "Win probability: {s}", .{prob});
+        defer allocator.free(line);
+        try table.writeLine(w, line, cols, null, color);
     }
     try w.writeByte('\n');
     const back = try std.fmt.allocPrint(allocator, "/{s}?date={s}\n", .{ game.league, game.date });
@@ -294,13 +346,26 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
         }
         for (game.participants) |entry| {
             if (entry.probable) |starter| {
-                const line = try std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ entry.abbreviation, starter });
+                const line = try spLine(allocator, entry.abbreviation, starter, entry.probable_stats);
                 defer allocator.free(line);
                 try render.writeHtmlLine(w, allocator, line, cols, null, null);
             }
         }
     }
-    if (game.scoring_plays.len > 0) {
+    if (game.plays.len > 0) {
+        try w.writeByte('\n');
+        const limit: usize = @min(height orelse 5, game.plays.len);
+        const start = game.plays.len - limit;
+        const plays = try vd.playsSection(allocator, game.plays[start..], cols);
+        defer vd.freeSection(allocator, plays);
+        try render.writeHtmlLine(w, allocator, plays.heading.?, cols, "dim", null);
+        for (plays.rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+        if (start > 0) {
+            const more = try std.fmt.allocPrint(allocator, "+{d} more (?height={d})", .{ start, game.plays.len });
+            defer allocator.free(more);
+            try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
+        }
+    } else if (game.scoring_plays.len > 0) {
         try w.writeByte('\n');
         const limit: usize = @min(height orelse 5, game.scoring_plays.len);
         const start = game.scoring_plays.len - limit;
@@ -313,6 +378,13 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
             defer allocator.free(more);
             try render.writeHtmlLine(w, allocator, more, cols, "dim", null);
         }
+    }
+    if (game.pitches.len > 0) {
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Pitches", cols, "dim", null);
+        const rows = try vd.keyValueLines(allocator, game.pitches, cols, null);
+        defer vd.freeLines(allocator, rows);
+        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
     if (game.lineups.len > 0) {
         try w.writeByte('\n');
@@ -345,6 +417,19 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
         defer vd.freeSection(allocator, tstats);
         try render.writeHtmlLine(w, allocator, tstats.heading.?, cols, "dim", null);
         for (tstats.rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+    }
+    if (game.injuries.len > 0) {
+        try w.writeByte('\n');
+        try render.writeHtmlLine(w, allocator, "Injuries", cols, "dim", null);
+        const rows = try vd.keyValueLines(allocator, game.injuries, cols, null);
+        defer vd.freeLines(allocator, rows);
+        for (rows) |line| try render.writeHtmlLine(w, allocator, line, cols, null, null);
+    }
+    if (game.win_probability) |prob| {
+        try w.writeByte('\n');
+        const line = try std.fmt.allocPrint(allocator, "Win probability: {s}", .{prob});
+        defer allocator.free(line);
+        try render.writeHtmlLine(w, allocator, line, cols, null, null);
     }
     try w.writeAll("</pre>");
     // Live games stream like scoreboards: freshness line plus the updater
@@ -2147,4 +2232,237 @@ test "scoreboard and team composers hold the same fixture without truncation" {
         try std.testing.expect(std.mem.indexOf(u8, fitted, "…") == null);
         try std.testing.expect(std.mem.indexOf(u8, fitted, "L 1-2") != null);
     }
+}
+
+// --- Info-density wave (detail-view half): SP stats, plays, pitches,
+// rich lineups, injuries, win probability. Each battery asserts present
+// renders, absent skips, text vs HTML visible parity, width fit, and no
+// ANSI when color is off. ---
+
+fn expectNoAnsiAndFit(body: []const u8, cols: usize) !void {
+    try std.testing.expect(std.mem.indexOf(u8, body, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(table.textCells(line) <= cols);
+    }
+}
+
+test "detail sp stat line renders parenthesized stats and bare fallback" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    var game = testDetail();
+    var parts = [_]detail.DetailParticipant{ game.participants[0], game.participants[1] };
+    parts[0].probable_stats = "12-6, 3.21 ERA";
+    parts[1].probable_stats = null;
+    game.participants = &parts;
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "SP ATL: Tyler Mahle (12-6, 3.21 ERA)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "SP PHI: Aaron Nola") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "SP ATL: Tyler Mahle (12-6, 3.21 ERA)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "SP PHI: Aaron Nola") != null);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "SP ATL: Tyler Mahle (12-6, 3.21 ERA)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "SP PHI: Aaron Nola") != null);
+    try expectNoAnsiAndFit(seen, cols);
+    // Empty stats string falls back to the bare name (no empty parens).
+    parts[0].probable_stats = "";
+    const bare = try renderText(arena, game, false, null, null);
+    defer arena.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "SP ATL: Tyler Mahle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Tyler Mahle (") == null);
+    // Absent probables skip the SP lines entirely (decisions-only game).
+    var nodec = testDetail();
+    var p2 = [_]detail.DetailParticipant{ nodec.participants[0], nodec.participants[1] };
+    p2[0].probable = null;
+    p2[0].probable_stats = null;
+    p2[1].probable = null;
+    p2[1].probable_stats = null;
+    nodec.participants = &p2;
+    nodec.decisions = &.{};
+    const skipped = try renderText(arena, nodec, false, null, null);
+    defer arena.free(skipped);
+    try std.testing.expect(std.mem.indexOf(u8, skipped, "SP ") == null);
+    const skipped_page = try detailHtml(arena, nodec, null, null);
+    defer arena.free(skipped_page);
+    try std.testing.expect(std.mem.indexOf(u8, skipped_page, "SP ") == null);
+}
+
+test "detail plays prefer over scoring with height trailer" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    var game = testDetail();
+    game.plays = &.{
+        .{ .period = "Q2", .clock = "0:00", .text = "Short pass complete.", .away_score = "7", .home_score = "0" },
+        .{ .period = "Q2", .clock = "0:00", .text = "Second play with a very long tail that must wrap onto a continuation line instead of truncating anything at all.", .away_score = "7", .home_score = "3" },
+        .{ .period = "Q3", .clock = "", .text = "No-clock play.", .away_score = "10", .home_score = "3" },
+    };
+    // Both present: Plays wins, Scoring plays skips to avoid duplication.
+    const body = try renderText(arena, game, false, null, 2);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Plays") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Scoring plays") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Q2 0:00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "No-clock play.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "+1 more (?height=3)") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, 2);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Plays") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Scoring plays") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "+1 more (?height=3)") != null);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Plays") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Q2 0:00") != null);
+    try expectNoAnsiAndFit(seen, cols);
+    // Composer level: clock rides the period label, rows fit the frame.
+    const rows = try vd.playsLines(arena, game.plays, cols);
+    defer vd.freeLines(arena, rows);
+    try std.testing.expect(rows.len >= 3);
+    for (rows) |row| {
+        _ = try std.unicode.Utf8View.init(row);
+        try std.testing.expect(table.textCells(row) <= cols);
+    }
+    // Absent: neither heading renders.
+    const bare = try renderText(arena, testDetail(), false, null, null);
+    defer arena.free(bare);
+    // Baseline fixture carries scoring plays only: Plays skips, Scoring stays.
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Plays") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Scoring plays") != null);
+    var neither = testDetail();
+    neither.scoring_plays = &.{};
+    neither.plays = &.{};
+    const skipped = try renderText(arena, neither, false, null, null);
+    defer arena.free(skipped);
+    try std.testing.expect(std.mem.indexOf(u8, skipped, "Plays") == null);
+    try std.testing.expect(std.mem.indexOf(u8, skipped, "Scoring plays") == null);
+    const skipped_page = try detailHtml(arena, neither, null, null);
+    defer arena.free(skipped_page);
+    try std.testing.expect(std.mem.indexOf(u8, skipped_page, "Plays") == null);
+    try std.testing.expect(std.mem.indexOf(u8, skipped_page, "Scoring plays") == null);
+}
+
+test "detail pitches render headed section and skip when absent" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    var game = testDetail();
+    game.pitches = &.{ "FF 94mph (0-1)", "SL 88mph swinging strike (0-2)" };
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Pitches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "94mph") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Pitches") != null);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Pitches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "94mph") != null);
+    try expectNoAnsiAndFit(seen, cols);
+    const bare = try renderText(arena, testDetail(), false, null, null);
+    defer arena.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Pitches") == null);
+    const bare_page = try detailHtml(arena, testDetail(), null, null);
+    defer arena.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "Pitches") == null);
+}
+
+test "detail rich lineups append stat suffixes byte-identical when empty" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    // Empty extras: byte-identical to the legacy `{order}. {pos} {name} {hitting}`.
+    const items = try vd.lineupItems(arena, .{
+        .team = "ATL",
+        .total = "10-35",
+        .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3" }},
+    });
+    defer vd.freeLines(arena, items);
+    try std.testing.expectEqualStrings("1. RF Ronald Acuna Jr. 2-3", items[0]);
+    // Non-empty extras append HR/RBI/BB/K/R suffixes.
+    const rich = try vd.lineupItems(arena, .{
+        .team = "ATL",
+        .total = "10-35",
+        .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3", .homeruns = "2", .rbis = "5", .walks = "1", .strikeouts = "3", .runs = "4" }},
+    });
+    defer vd.freeLines(arena, rich);
+    try std.testing.expectEqualStrings("1. RF Ronald Acuna Jr. 2-3 HR2 RBI5 BB1 K3 R4", rich[0]);
+    // Page level: the rich row renders in both surfaces with parity + fit.
+    var game = testDetail();
+    game.lineups = &.{
+        .{
+            .team = "ATL",
+            .total = "10-35",
+            .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3", .homeruns = "2", .rbis = "5" }},
+        },
+    };
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "HR2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "RBI5") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "HR2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "RBI5") != null);
+    try expectNoAnsiAndFit(seen, cols);
+}
+
+test "detail injuries render headed section and skip when absent" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    var game = testDetail();
+    game.injuries = &.{ "SEA Sam Darnold Doubtful (Hip)", "SEA No Detail Man Out" };
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Injuries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Sam Darnold Doubtful") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Injuries") != null);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Injuries") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Sam Darnold Doubtful") != null);
+    try expectNoAnsiAndFit(seen, cols);
+    const bare = try renderText(arena, testDetail(), false, null, null);
+    defer arena.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Injuries") == null);
+    const bare_page = try detailHtml(arena, testDetail(), null, null);
+    defer arena.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "Injuries") == null);
+}
+
+test "detail win probability renders line and skips when absent" {
+    const arena = std.testing.allocator;
+    const cols: usize = 52;
+    var game = testDetail();
+    game.win_probability = "PHI 61.3%";
+    const body = try renderText(arena, game, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Win probability: PHI 61.3%") != null);
+    try expectNoAnsiAndFit(body, cols);
+    const page = try detailHtml(arena, game, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Win probability: PHI 61.3%") != null);
+    const seen = try vd.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Win probability: PHI 61.3%") != null);
+    try expectNoAnsiAndFit(seen, cols);
+    const bare = try renderText(arena, testDetail(), false, null, null);
+    defer arena.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "Win probability:") == null);
+    const bare_page = try detailHtml(arena, testDetail(), null, null);
+    defer arena.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "Win probability:") == null);
 }

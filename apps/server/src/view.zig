@@ -55,6 +55,27 @@ pub fn hasPoints(st: standings.LeagueStandings) bool {
     return false;
 }
 
+/// A streak / games-behind half renders only when it carries signal:
+/// null, empty, dashes, or zero (`0`, `0.0` for GB) all mean absent and
+/// render nothing, never a `GB-` / `GB0` placeholder.
+fn showStreak(s: ?[]const u8) ?[]const u8 {
+    const v = s orelse return null;
+    if (v.len == 0) return null;
+    if (std.mem.eql(u8, v, "-") or std.mem.eql(u8, v, "--")) return null;
+    if (std.mem.eql(u8, v, "0")) return null;
+    return v;
+}
+
+/// Games-behind twin of `showStreak`: first-place `"-"`/`"--"` and
+/// numeric zero (`0`, `0.0`) render nothing.
+fn showGamesBehind(s: ?[]const u8) ?[]const u8 {
+    const v = s orelse return null;
+    if (v.len == 0) return null;
+    if (std.mem.eql(u8, v, "-") or std.mem.eql(u8, v, "--")) return null;
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "0.0") or std.mem.eql(u8, v, "0.00")) return null;
+    return v;
+}
+
 /// One composed standings entry row (`color = false`, trailing blanks
 /// trimmed, no newline); the caller writes the row plus `'\n'`.
 pub fn entryRow(
@@ -65,11 +86,33 @@ pub fn entryRow(
 ) ![]u8 {
     // Fixed cells around the name: abbr 4 + spaces + record 9 + points 4
     // when the column shows; the name absorbs the rest. Ragged, never
-    // padded.
+    // padded. Streak / games-behind suffix the record area additively
+    // (`80-63 W3 GB2.5`, absent halves omitted); the name shrinks by the
+    // suffix cells so the row still fits `cols`.
     const record_width: usize = 9;
     const points_width: usize = 4;
-    const fixed: usize = 4 + 2 + record_width + (if (points_col) 1 + points_width else 0);
-    const name_width: usize = cols -| fixed;
+    const streak = showStreak(entry.streak);
+    const gb = showGamesBehind(entry.games_behind);
+    var suffix: []const u8 = "";
+    var suffix_owned: ?[]u8 = null;
+    defer if (suffix_owned) |owned| allocator.free(owned);
+    if (streak != null and gb != null) {
+        suffix_owned = try std.fmt.allocPrint(allocator, " {s} GB{s}", .{ streak.?, gb.? });
+        suffix = suffix_owned.?;
+    } else if (streak) |st| {
+        suffix_owned = try std.fmt.allocPrint(allocator, " {s}", .{st});
+        suffix = suffix_owned.?;
+    } else if (gb) |behind| {
+        suffix_owned = try std.fmt.allocPrint(allocator, " GB{s}", .{behind});
+        suffix = suffix_owned.?;
+    }
+    const suffix_len: usize = table.textCells(suffix);
+    // The name yields to the suffix; the record area never exceeds what
+    // fits after the abbr cell and separators, so hostile streak/GB text
+    // truncates with an ellipsis instead of pushing the row past `cols`.
+    const leftover: usize = cols -| 4 -| 1 -| 1 -| (if (points_col) 1 + points_width else 0);
+    const record_area: usize = @min(record_width + suffix_len, leftover);
+    const name_width: usize = leftover -| record_area;
     var record_buf: [32]u8 = undefined;
     const wins = entry.wins orelse "-";
     const losses = entry.losses orelse "-";
@@ -77,6 +120,11 @@ pub fn entryRow(
         std.fmt.bufPrint(&record_buf, "{s}-{s}-{s}", .{ wins, losses, ties }) catch "-"
     else
         std.fmt.bufPrint(&record_buf, "{s}-{s}", .{ wins, losses }) catch "-";
+    const record_full = if (suffix_len == 0)
+        record
+    else
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ record, suffix });
+    defer if (suffix_len != 0) allocator.free(record_full);
     var buf: std.Io.Writer.Allocating = .init(allocator);
     errdefer buf.deinit();
     const b = &buf.writer;
@@ -84,7 +132,7 @@ pub fn entryRow(
     try b.writeByte(' ');
     try table.writeCell(b, entry.name, name_width, null, false);
     try b.writeByte(' ');
-    try table.writeCellRight(b, record, record_width, null, false);
+    try table.writeCellRight(b, record_full, record_area, null, false);
     if (points_col) {
         try b.writeByte(' ');
         try table.writeCellRight(b, entry.points orelse "-", points_width, null, false);
@@ -196,7 +244,9 @@ pub fn situationText(allocator: std.mem.Allocator, situation: detail.Situation) 
 }
 
 /// One side's lineup as `keyValueLines` items: `{order}. {pos} {name}
-/// {hitting}`, split on the last space so H-AB shares a right column.
+/// {hitting}[ HR{n} RBI{n} BB{n} K{n} R{n}]`, split on the last space so
+/// H-AB shares a right column. Stat suffixes append only when the field
+/// is non-empty, so entries without them render byte-identical to before.
 /// Shared by text and HTML.
 pub fn lineupItems(allocator: std.mem.Allocator, side: detail.LineupSide) ![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
@@ -205,7 +255,15 @@ pub fn lineupItems(allocator: std.mem.Allocator, side: detail.LineupSide) ![][]u
         out.deinit(allocator);
     }
     for (side.entries) |entry| {
-        try out.append(allocator, try std.fmt.allocPrint(allocator, "{d}. {s} {s} {s}", .{ entry.order, entry.position, entry.name, entry.hitting }));
+        var buf: std.Io.Writer.Allocating = .init(allocator);
+        defer buf.deinit();
+        try buf.writer.print("{d}. {s} {s} {s}", .{ entry.order, entry.position, entry.name, entry.hitting });
+        if (entry.homeruns.len > 0) try buf.writer.print(" HR{s}", .{entry.homeruns});
+        if (entry.rbis.len > 0) try buf.writer.print(" RBI{s}", .{entry.rbis});
+        if (entry.walks.len > 0) try buf.writer.print(" BB{s}", .{entry.walks});
+        if (entry.strikeouts.len > 0) try buf.writer.print(" K{s}", .{entry.strikeouts});
+        if (entry.runs.len > 0) try buf.writer.print(" R{s}", .{entry.runs});
+        try out.append(allocator, try buf.toOwnedSlice());
     }
     return out.toOwnedSlice(allocator);
 }
@@ -402,6 +460,60 @@ pub fn scoringLines(allocator: std.mem.Allocator, plays: []const detail.DetailSc
     return out.toOwnedSlice(allocator);
 }
 
+/// Aligned full play-by-play rows: period[/clock] | running score |
+/// description, wrapping exactly like `scoringLines`. The clock rides
+/// the period label (`Q2 0:00`, `7th Inning`) so football clocks and
+/// baseball periods share one column. Shared by text and HTML.
+pub fn playsLines(allocator: std.mem.Allocator, plays: []const detail.DetailPlay, total: usize) ![][]u8 {
+    var period_w: usize = 0;
+    var score_w: usize = 0;
+    for (plays) |play| {
+        const label_len = table.textCells(play.period) + (if (play.clock.len > 0) 1 + table.textCells(play.clock) else 0);
+        period_w = @max(period_w, label_len);
+        score_w = @max(score_w, table.textCells(play.away_score) + 1 + table.textCells(play.home_score));
+    }
+    period_w = @min(period_w, 18);
+    score_w = @min(score_w, 9);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |line| allocator.free(line);
+        out.deinit(allocator);
+    }
+    for (plays) |play| {
+        const label = if (play.clock.len > 0)
+            try std.fmt.allocPrint(allocator, "{s} {s}", .{ play.period, play.clock })
+        else
+            try allocator.dupe(u8, play.period);
+        defer allocator.free(label);
+        const score = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ play.away_score, play.home_score });
+        defer allocator.free(score);
+        var prefix: std.Io.Writer.Allocating = .init(allocator);
+        defer prefix.deinit();
+        try table.writeCell(&prefix.writer, label, period_w, null, false);
+        try prefix.writer.writeByte(' ');
+        try table.writeCell(&prefix.writer, score, score_w, null, false);
+        try prefix.writer.writeByte(' ');
+        const head = try prefix.toOwnedSlice();
+        defer allocator.free(head);
+        const text_w = total -| period_w -| 1 -| score_w -| 1;
+        const wrapped = try table.wrapLines(allocator, play.text, text_w);
+        defer freeLines(allocator, wrapped);
+        if (wrapped.len == 0) {
+            try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, head, " ")));
+            continue;
+        }
+        const indent = try allocator.alloc(u8, head.len);
+        defer allocator.free(indent);
+        @memset(indent, ' ');
+        for (wrapped, 0..) |row, i| {
+            const line = try std.fmt.allocPrint(allocator, "{s}{s}", .{ if (i == 0) head else indent, row });
+            defer allocator.free(line);
+            try out.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, line, " ")));
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Participant block rows: `ABBR name … score ✓ record`. The name flexes;
 /// abbreviation, score, and record ride fixed right-ish columns so
 /// multi-team blocks scan. Winner coloring wraps the whole line at emit
@@ -527,6 +639,20 @@ pub fn scoringSection(
     return .{
         .heading = try allocator.dupe(u8, "Scoring plays"),
         .rows = try scoringLines(allocator, plays, total),
+    };
+}
+
+/// Full play-by-play as a `Section` headed `Plays`. Same slicing/trailer
+/// contract as `scoringSection`; renderers prefer this when `plays` is
+/// present and skip `Scoring plays` to avoid duplication.
+pub fn playsSection(
+    allocator: std.mem.Allocator,
+    plays: []const detail.DetailPlay,
+    total: usize,
+) !Section {
+    return .{
+        .heading = try allocator.dupe(u8, "Plays"),
+        .rows = try playsLines(allocator, plays, total),
     };
 }
 
@@ -882,6 +1008,12 @@ test "situation, linescore, and section builders agree on hostile input" {
     defer freeLeadersSection(arena, gseq);
     try std.testing.expectEqualStrings("Leaders", gseq.heading);
     try std.testing.expect(gseq.block.is_header[0]);
+
+    const pseq2 = try playsSection(arena, &.{.{ .period = "Q2", .clock = "0:00", .text = "Run.", .away_score = "7", .home_score = "0" }}, 52);
+    defer freeSection(arena, pseq2);
+    try std.testing.expectEqualStrings("Plays", pseq2.heading.?);
+    try std.testing.expectEqual(@as(usize, 1), pseq2.rows.len);
+    try std.testing.expect(std.mem.indexOf(u8, pseq2.rows[0], "Q2 0:00") != null);
 }
 
 test "team composers keep record, game, and fit semantics" {
@@ -1481,4 +1613,46 @@ test "all-final predicate and compact widths" {
     defer if (row) |r| arena.free(r);
     try std.testing.expect(std.mem.indexOf(u8, row.?, "mlb AWY   2 @ HME   5") != null);
     try std.testing.expect(std.mem.indexOf(u8, row.?, "Final") != null);
+}
+
+test "playsLines carry clock and wrap like scoring" {
+    const arena = std.testing.allocator;
+    for ([2]usize{ 52, 200 }) |total| {
+        const rows = try playsLines(arena, &.{
+            .{ .period = "Q2", .clock = "0:00", .text = "Short pass complete with a very long tail that must wrap onto a continuation line 漢字.", .away_score = "7", .home_score = "0" },
+            .{ .period = "Q3", .clock = "", .text = "No-clock play.", .away_score = "10", .home_score = "3" },
+        }, total);
+        defer freeLines(arena, rows);
+        try std.testing.expect(rows.len >= 2);
+        try std.testing.expect(std.mem.indexOf(u8, rows[0], "Q2 0:00") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rows[rows.len - 1], "No-clock play.") != null);
+        for (rows) |r| {
+            _ = try std.unicode.Utf8View.init(r);
+            try std.testing.expect(table.textCells(r) <= total);
+            try std.testing.expect(std.mem.indexOf(u8, r, "\x1b") == null);
+            try std.testing.expect(std.mem.indexOf(u8, r, "\n") == null);
+        }
+        const sec = try playsSection(arena, &.{.{ .period = "Q2", .clock = "0:00", .text = "Run.", .away_score = "7", .home_score = "0" }}, total);
+        defer freeSection(arena, sec);
+        try std.testing.expectEqualStrings("Plays", sec.heading.?);
+    }
+}
+
+test "lineupItems stay byte-identical when stat fields are empty" {
+    const arena = std.testing.allocator;
+    const bare = try lineupItems(arena, .{
+        .team = "ATL",
+        .total = "10-35",
+        .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3" }},
+    });
+    defer freeLines(arena, bare);
+    try std.testing.expectEqualStrings("1. RF Ronald Acuna Jr. 2-3", bare[0]);
+    const rich = try lineupItems(arena, .{
+        .team = "ATL",
+        .total = "10-35",
+        .entries = &.{.{ .order = 1, .position = "RF", .name = "Ronald Acuna Jr.", .hitting = "2-3", .homeruns = "2", .rbis = "5", .walks = "1", .strikeouts = "3", .runs = "4" }},
+    });
+    defer freeLines(arena, rich);
+    try std.testing.expectEqualStrings("1. RF Ronald Acuna Jr. 2-3 HR2 RBI5 BB1 K3 R4", rich[0]);
+    _ = try std.unicode.Utf8View.init(rich[0]);
 }

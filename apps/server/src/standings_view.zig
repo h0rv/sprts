@@ -307,3 +307,145 @@ test "standings HTML visible text equals the text output" {
     defer std.testing.allocator.free(visible);
     try std.testing.expectEqualStrings(body, visible);
 }
+
+fn suffixStandings() standings.LeagueStandings {
+    return .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .season = "2026",
+        .source = "test",
+        .groups = &.{
+            .{ .name = "AL East", .entries = &.{
+                .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "W3", .games_behind = "2.5" },
+                .{ .team_id = "21", .abbrev = "BOS", .name = "Boston Red Sox", .wins = "78", .losses = "65", .streak = "L1", .games_behind = "4.5" },
+            } },
+        },
+    };
+}
+
+test "standings text suffixes the record with streak only" {
+    const st: standings.LeagueStandings = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .season = "2026",
+        .groups = &.{.{ .name = "AL East", .entries = &.{
+            .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "W3" },
+        } }},
+    };
+    const output = try text(std.testing.allocator, st, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "80-63 W3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "GB") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "standings text suffixes the record with games-behind only" {
+    const st: standings.LeagueStandings = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .season = "2026",
+        .groups = &.{.{ .name = "AL East", .entries = &.{
+            .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .games_behind = "2.5" },
+        } }},
+    };
+    const output = try text(std.testing.allocator, st, false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "80-63 GB2.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "standings text suffixes the record with streak and games-behind" {
+    const output = try text(std.testing.allocator, suffixStandings(), false, null, null);
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "80-63 W3 GB2.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "78-65 L1 GB4.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(output);
+}
+
+test "standings text omits absent streak and games-behind byte-identical" {
+    // Null, empty, dashes, and zero all render nothing: rows with
+    // placeholder halves read byte for byte like rows without them, so
+    // fixtures without streak/GB never change.
+    const arena = std.testing.allocator;
+    const plain = try view.entryRow(arena, .{
+        .team_id = "19",
+        .abbrev = "NYY",
+        .name = "New York Yankees",
+        .wins = "80",
+        .losses = "63",
+    }, 52, false);
+    defer arena.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "80-63") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "GB") == null);
+    const variants = [_]standings.StandingEntry{
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = null, .games_behind = null },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "", .games_behind = "" },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "-", .games_behind = "-" },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "--", .games_behind = "--" },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "0", .games_behind = "0" },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "W3", .games_behind = "0.0" },
+        .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .games_behind = "0.00" },
+    };
+    for (variants, 0..) |entry, i| {
+        const row = try view.entryRow(arena, entry, 52, false);
+        defer arena.free(row);
+        if (i < 5) {
+            try std.testing.expectEqualStrings(plain, row);
+        } else if (i == 5) {
+            // Zero GB drops while a live streak keeps its half.
+            try std.testing.expect(std.mem.indexOf(u8, row, "80-63 W3") != null);
+            try std.testing.expect(std.mem.indexOf(u8, row, "GB") == null);
+        } else {
+            try std.testing.expectEqualStrings(plain, row);
+        }
+    }
+}
+
+test "standings streak rows fit 52, 80, and 200 columns" {
+    for ([_]u16{ 52, 80, 200 }) |width| {
+        const output = try text(std.testing.allocator, suffixStandings(), false, width, null);
+        defer std.testing.allocator.free(output);
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (table.isRuleLine(line)) {
+                try std.testing.expectEqual(table.textCells(line), width);
+            } else {
+                try std.testing.expect(table.textCells(line) <= width);
+            }
+        }
+        try std.testing.expect(std.mem.indexOf(u8, output, "80-63 W3 GB2.5") != null);
+        _ = try std.unicode.Utf8View.init(output);
+    }
+}
+
+test "standings streak HTML visible text equals the text output" {
+    // Suffix rows ride the same `text()` composer `html()` escapes, so a
+    // streak/GB board (with one hostile name proving escaping survives
+    // the suffix) reads back byte for byte through the visible fold.
+    const st: standings.LeagueStandings = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .season = "2026",
+        .groups = &.{.{ .name = "AL East", .entries = &.{
+            .{ .team_id = "19", .abbrev = "NYY", .name = "New York Yankees", .wins = "80", .losses = "63", .streak = "W3", .games_behind = "2.5" },
+            .{ .team_id = "21", .abbrev = "BOS", .name = "Boston <Bruins> & co", .wins = "78", .losses = "65", .streak = "L1", .games_behind = "4.5" },
+        } }},
+    };
+    const body = try text(std.testing.allocator, st, false, null, null);
+    defer std.testing.allocator.free(body);
+    const page = try html(std.testing.allocator, st, null, null);
+    defer std.testing.allocator.free(page);
+    const visible = try view.expectVisibleParity(std.testing.allocator, page);
+    defer std.testing.allocator.free(visible);
+    try std.testing.expectEqualStrings(body, visible);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "80-63 W3 GB2.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "78-65 L1 GB4.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Boston &lt;Bruins&gt; &amp; co") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Boston <Bruins>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+}
