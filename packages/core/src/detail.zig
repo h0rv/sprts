@@ -55,6 +55,7 @@ pub const DetailLineupEntry = struct {
     name: []const u8 = "",
     hitting: []const u8 = "",
     runs: []const u8 = "",
+    homeruns: []const u8 = "",
     rbis: []const u8 = "",
     walks: []const u8 = "",
     strikeouts: []const u8 = "",
@@ -90,6 +91,23 @@ pub const DetailScoringPlay = struct {
     };
 };
 
+/// One play in the full play-by-play feed: same running-score shape as
+/// a scoring play plus the clock text (football `0:00`-style, empty when
+/// the provider ships none). Non-scoring plays ride here; `scoring_plays`
+/// stays scoring-only for wire compat.
+pub const DetailPlay = struct {
+    period: []const u8,
+    clock: []const u8 = "",
+    text: []const u8,
+    away_score: []const u8,
+    home_score: []const u8,
+
+    pub const jsonschema = .{
+        .name = "DetailPlay",
+        .description = "One play with period/clock text and the running score afterward.",
+    };
+};
+
 pub const DetailGame = struct {
     schema_version: []const u8 = "1",
     id: []const u8,
@@ -113,7 +131,16 @@ pub const DetailGame = struct {
     situation: ?DetailSituation = null,
     decisions: []const DetailDecision = &.{},
     scoring_plays: []const DetailScoringPlay = &.{},
+    /// Full play-by-play: every feed play (scoring or not) with
+    /// period/clock text, chronological. Empty when the provider
+    /// supplies no plays; renderers prefer this over `scoring_plays`
+    /// when present (`scoring_plays` stays scoring-only for wire compat).
+    plays: []const DetailPlay = &.{},
+    /// Compact pitch-sequence lines for the live area (e.g. current
+    /// at-bat type/velo/count); empty when the provider ships no
+    /// pitch-level detail, which renderers skip.
     leaders: []const []const u8 = &.{},
+    pitches: []const []const u8 = &.{},
     // depth: starting lineups in batting order, one side per entry.
     // Empty when the provider supplies no batting group; renderers
     // prefer this over leaders for baseball and skip it otherwise.
@@ -141,6 +168,8 @@ pub const DetailGame = struct {
             .series = .{ .description = "Series summary supplied by the provider; absent when not derivable." },
             .network = .{ .description = "TV broadcaster when the provider supplies one." },
             .leaders = .{ .description = "Short statistical leader strings, e.g. team totals and top performers." },
+            .plays = .{ .description = "Full play-by-play with period/clock text when the provider supplies plays; empty otherwise." },
+            .pitches = .{ .description = "Compact pitch-sequence lines for the live area when the provider supplies pitch detail; empty otherwise." },
             .injuries = .{ .description = "Injury report lines when the provider supplies them; absent otherwise." },
             .win_probability = .{ .description = "Home-team win probability when the provider supplies it." },
             .lineups = .{ .description = "Starting lineups in batting order when the provider supplies a batting group; absent otherwise." },
@@ -155,6 +184,7 @@ test "detail structs carry jsonschema names" {
     try std.testing.expectEqualStrings("DetailSituation", DetailSituation.jsonschema.name);
     try std.testing.expectEqualStrings("DetailDecision", DetailDecision.jsonschema.name);
     try std.testing.expectEqualStrings("DetailScoringPlay", DetailScoringPlay.jsonschema.name);
+    try std.testing.expectEqualStrings("DetailPlay", DetailPlay.jsonschema.name);
     try std.testing.expectEqualStrings("DetailLineupEntry", DetailLineupEntry.jsonschema.name);
     try std.testing.expectEqualStrings("DetailLineup", DetailLineup.jsonschema.name);
     try std.testing.expectEqualStrings("DetailGame", DetailGame.jsonschema.name);
@@ -176,6 +206,8 @@ test "game detail defaults to empty collections" {
     try std.testing.expect(game_detail.situation == null);
     try std.testing.expectEqual(@as(usize, 0), game_detail.decisions.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.scoring_plays.len);
+    try std.testing.expectEqual(@as(usize, 0), game_detail.plays.len);
+    try std.testing.expectEqual(@as(usize, 0), game_detail.pitches.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.leaders.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.lineups.len);
     try std.testing.expectEqual(@as(usize, 0), game_detail.injuries.len);
@@ -188,4 +220,47 @@ pub const LineScore = DetailLineScore;
 pub const Situation = DetailSituation;
 pub const Decision = DetailDecision;
 pub const ScoringPlay = DetailScoringPlay;
+pub const Play = DetailPlay;
 pub const GameDetail = DetailGame;
+
+test "detail plays and pitches default empty and round-trip additively" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const game_detail: DetailGame = .{
+        .id = "1",
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
+        .plays = &.{.{
+            .period = "7th Inning",
+            .clock = "",
+            .text = "Hill homered to left.",
+            .away_score = "1",
+            .home_score = "3",
+        }},
+        .pitches = &.{"FF 94mph (0-1)"},
+    };
+    const raw = try std.json.Stringify.valueAlloc(arena, game_detail, .{});
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"plays\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"pitches\":") != null);
+    const parsed = try std.json.parseFromSliceLeaky(DetailGame, arena, raw, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.plays.len);
+    try std.testing.expectEqualStrings("7th Inning", parsed.plays[0].period);
+    try std.testing.expectEqual(@as(usize, 1), parsed.pitches.len);
+    // Legacy payloads without the new keys still parse (additive defaults).
+    const legacy = try std.json.parseFromSliceLeaky(
+        DetailGame,
+        arena,
+        "{\"id\":\"1\",\"league\":\"mlb\",\"league_name\":\"MLB\",\"date\":\"2026-09-06\",\"state\":\"post\",\"status\":\"Final\",\"participants\":[]}",
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 0), legacy.plays.len);
+    try std.testing.expectEqual(@as(usize, 0), legacy.pitches.len);
+    // Lineup entries carry the new homeruns column defaulted empty.
+    const entry: DetailLineupEntry = .{ .order = 1, .position = "CF", .name = "Test", .hitting = "2-4" };
+    try std.testing.expectEqualStrings("", entry.homeruns);
+}

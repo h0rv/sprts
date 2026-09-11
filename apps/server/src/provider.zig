@@ -1427,6 +1427,7 @@ const SummaryPlay = struct {
     awayScore: std.json.Value = .null,
     homeScore: std.json.Value = .null,
     period: ?SummaryPeriod = null,
+    clock: ?SummaryClock = null,
     pitchCount: ?SummaryCount = null,
     resultCount: ?SummaryCount = null,
     outs: ?i64 = null,
@@ -1434,6 +1435,23 @@ const SummaryPlay = struct {
     onSecond: ?std.json.Value = null,
     onThird: ?std.json.Value = null,
     participants: []const SummaryPlayParticipant = &.{},
+    /// Provisional pitch-level detail (no fixture or schema carries it
+    /// yet — every payload observed so far omits it, so the parser
+    /// skips with a debug log). When present, free text plus optional
+    /// type/velocity/count leaves per pitch.
+    pitches: ?[]const SummaryPitch = null,
+};
+
+const SummaryClock = struct {
+    displayValue: []const u8 = "",
+};
+
+const SummaryPitch = struct {
+    text: []const u8 = "",
+    pitchType: std.json.Value = .null,
+    velocity: std.json.Value = .null,
+    balls: ?i64 = null,
+    strikes: ?i64 = null,
 };
 
 const SummaryPeriod = struct {
@@ -2176,6 +2194,7 @@ fn boxscoreLineups(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *st
         } else continue;
         const hab = statKeyIndex(batting.keys, "hits-atBats") orelse 0;
         const runs = statKeyIndex(batting.keys, "runs");
+        const homeruns = statKeyIndex(batting.keys, "homeRuns") orelse statKeyIndex(batting.keys, "HR");
         const rbis = statKeyIndex(batting.keys, "RBIs");
         const walks = statKeyIndex(batting.keys, "walks");
         const strikeouts = statKeyIndex(batting.keys, "strikeouts");
@@ -2198,6 +2217,7 @@ fn boxscoreLineups(arena: std.mem.Allocator, boxscore: SummaryBoxscore, out: *st
                 .name = name,
                 .hitting = (if (hab < entry.stats.len) try jsonText(arena, entry.stats[hab]) else null) orelse "",
                 .runs = statText(arena, entry.stats, runs) catch "",
+                .homeruns = statText(arena, entry.stats, homeruns) catch "",
                 .rbis = statText(arena, entry.stats, rbis) catch "",
                 .walks = statText(arena, entry.stats, walks) catch "",
                 .strikeouts = statText(arena, entry.stats, strikeouts) catch "",
@@ -2222,6 +2242,47 @@ fn statText(arena: std.mem.Allocator, stats: []const std.json.Value, index: ?usi
     const i = index orelse return "";
     if (i >= stats.len) return "";
     return (try jsonText(arena, stats[i])) orelse "";
+}
+
+/// Probable-pitcher stat line from the boxscore pitching group: the row
+/// matching the probable name formats as "W-L, ERA, IP, K", omitting
+/// parts the payload lacks. The pitching group is the statistics entry
+/// keyed by innings (batting groups carry atBats instead), so football
+/// shapes and bat-only payloads contribute nothing. Null when no
+/// pitching group, no matching row, or no usable numbers — renderers
+/// fall back to the bare probable name.
+fn boxscoreProbableStats(arena: std.mem.Allocator, boxscore: ?SummaryBoxscore, name: []const u8) !?[]const u8 {
+    const box = boxscore orelse return null;
+    if (name.len == 0) return null;
+    for (box.players) |group| {
+        for (group.statistics) |stats| {
+            if (statKeyIndex(stats.keys, "inningsPitched") == null and
+                statKeyIndex(stats.keys, "earnedRunAverage") == null and
+                statKeyIndex(stats.keys, "earnedRuns") == null) continue;
+            const row = for (stats.athletes) |entry| {
+                const reference = entry.athlete orelse continue;
+                if (std.mem.eql(u8, reference.displayName, name) or
+                    std.mem.eql(u8, reference.fullName, name)) break entry;
+            } else continue;
+            const wins = try statText(arena, row.stats, statKeyIndex(stats.keys, "wins"));
+            const losses = try statText(arena, row.stats, statKeyIndex(stats.keys, "losses"));
+            const era = try statText(arena, row.stats, statKeyIndex(stats.keys, "earnedRunAverage") orelse
+                statKeyIndex(stats.keys, "ERA"));
+            const innings = try statText(arena, row.stats, statKeyIndex(stats.keys, "inningsPitched") orelse
+                statKeyIndex(stats.keys, "IP"));
+            const strikeouts = try statText(arena, row.stats, statKeyIndex(stats.keys, "strikeouts"));
+            var parts: std.ArrayList([]const u8) = .empty;
+            if (wins.len > 0 and losses.len > 0) {
+                try parts.append(arena, try std.fmt.allocPrint(arena, "{s}-{s}", .{ wins, losses }));
+            }
+            if (era.len > 0) try parts.append(arena, try std.fmt.allocPrint(arena, "{s} ERA", .{era}));
+            if (innings.len > 0) try parts.append(arena, try std.fmt.allocPrint(arena, "{s} IP", .{innings}));
+            if (strikeouts.len > 0) try parts.append(arena, try std.fmt.allocPrint(arena, "{s} K", .{strikeouts}));
+            if (parts.items.len == 0) return null;
+            return try std.mem.join(arena, ", ", parts.items);
+        }
+    }
+    return null;
 }
 
 /// "completions/passingAttempts" -> "Completions/passing attempts": a
@@ -2391,6 +2452,8 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
             record = summaryRecord(competitor.record) orelse participant.record;
             if (competitor.probables.len > 0) probable = athleteName(competitor.probables[0].athlete);
         }
+        var probable_stats: ?[]const u8 = null;
+        if (probable) |starter| probable_stats = try boxscoreProbableStats(arena, response.boxscore, starter);
         try participants.append(arena, .{
             .id = participant.id,
             .name = participant.name,
@@ -2403,6 +2466,7 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
             .errors = errors,
             .record = record,
             .probable = probable,
+            .probable_stats = probable_stats,
         });
     }
 
@@ -2421,18 +2485,46 @@ pub fn detailFetch(self: EspnAdapter, arena: std.mem.Allocator, league: *const c
     };
 
     var scoring_plays: std.ArrayList(core.detail.ScoringPlay) = .empty;
+    // Full play-by-play: every feed play (scoring or not) with
+    // period/clock text, chronological. `scoring_plays` stays
+    // scoring-only for wire compat; renderers prefer `plays` when present.
+    var all_plays: std.ArrayList(core.detail.Play) = .empty;
+    // Compact pitch-sequence lines for the live area, in feed order
+    // (capped: one long at-bat, not a full-game log). Empty when no play
+    // carries pitch-level detail (every payload observed so far) —
+    // renderers skip the section rather than erroring.
+    var pitches: std.ArrayList([]const u8) = .empty;
     const plays = response.plays orelse &[0]SummaryPlay{};
     for (plays) |play| {
-        if (!play.scoringPlay) continue;
         const period = if (play.period) |p| p.displayValue else "";
+        const clock = if (play.clock) |c| c.displayValue else "";
         const away_score = (try jsonText(arena, play.awayScore)) orelse "";
         const home_score = (try jsonText(arena, play.homeScore)) orelse "";
+        if (play.text.len > 0) {
+            try all_plays.append(arena, .{
+                .period = period,
+                .clock = clock,
+                .text = play.text,
+                .away_score = away_score,
+                .home_score = home_score,
+            });
+        }
+        if (pitches.items.len < 12) {
+            if (play.pitches) |list| for (list) |pitch| {
+                if (pitches.items.len >= 12) break;
+                if (try formatPitch(arena, pitch)) |line| try pitches.append(arena, line);
+            };
+        }
+        if (!play.scoringPlay) continue;
         try scoring_plays.append(arena, .{
             .period = period,
             .text = play.text,
             .away_score = away_score,
             .home_score = home_score,
         });
+    }
+    if (pitches.items.len == 0 and plays.len > 0) {
+        std.log.debug("no pitch-level detail in summary payload for {s}; skipping", .{game.id});
     }
     // Football payloads carry scoring plays here instead (every entry
     // scores; `period` is a bare quarter number). Appended after any

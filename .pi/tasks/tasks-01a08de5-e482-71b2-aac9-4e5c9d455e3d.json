@@ -1,0 +1,49 @@
+{
+  "nextId": 5,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Extend core models additively",
+      "description": "Add DetailPlay/plays/pitches/HR to core.detail, streak/GB to standings, probable_stats to domain; unit tests for defaults and JSON round-trip",
+      "status": "completed",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789087215249,
+      "updatedAt": 1789087414761
+    },
+    {
+      "id": "2",
+      "subject": "Provider parsing for plays, pitches, probables, standings",
+      "description": "Provider: thread all plays with period/clock, defensive pitch parsing with log+skip, pitching groups to probable stats, HR column, standings streak/GB; present+absent tests",
+      "status": "in_progress",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789087217380,
+      "updatedAt": 1789087420872
+    },
+    {
+      "id": "3",
+      "subject": "Render new sections in detail/standings views",
+      "description": "Views: Plays section, Pitches live block, SP stat lines, richer lineups, injuries section, standings streak/GB rows in text+HTML lockstep with tests",
+      "status": "pending",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789087219039,
+      "updatedAt": 1789087219039
+    },
+    {
+      "id": "4",
+      "subject": "Spec/llms lines, tests, commit",
+      "description": "Update spec operation summary + llms getGame/getStandings lines; run touched package tests and full check; commit in worktree and report SHA + per-item results",
+      "status": "pending",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1789087222293,
+      "updatedAt": 1789087222293
+    }
+  ]
+}

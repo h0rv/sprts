@@ -31,6 +31,10 @@ pub const Participant = struct {
     hits: ?[]const u8 = null,
     errors: ?[]const u8 = null,
     probable: ?[]const u8 = null,
+    /// Probable-starter stat line (e.g. "12-6, 3.21 ERA, 178.1 IP, 201 K")
+    /// when the provider's boxscore carries the pitcher's numbers; null
+    /// otherwise (renderers fall back to the bare name).
+    probable_stats: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "Participant",
@@ -43,6 +47,7 @@ pub const Participant = struct {
             .hits = .{ .description = "Total hits (or sport equivalent) when the provider supplies them." },
             .errors = .{ .description = "Total errors (or sport equivalent) when the provider supplies them." },
             .probable = .{ .description = "Probable starter name when the provider supplies one." },
+            .probable_stats = .{ .description = "Probable starter stat line (W-L, ERA, IP, K) when the provider supplies it." },
         },
     };
 };

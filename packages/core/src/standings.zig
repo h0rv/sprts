@@ -23,6 +23,12 @@ pub const StandingEntry = struct {
     losses: ?[]const u8 = null,
     ties: ?[]const u8 = null,
     points: ?[]const u8 = null,
+    /// Current streak display (e.g. "W3") when the provider ships it;
+    /// null otherwise (renders nothing, never zero).
+    streak: ?[]const u8 = null,
+    /// Games-behind display (e.g. "2.5") when the provider ships it;
+    /// null otherwise.
+    games_behind: ?[]const u8 = null,
 
     pub const jsonschema = .{
         .name = "StandingEntry",
@@ -86,4 +92,35 @@ test "standings wire shape round-trips with the schema marker" {
     try std.testing.expectEqualStrings("AFC East", parsed.groups[0].name);
     try std.testing.expect(parsed.groups[0].entries[0].ties == null);
     try std.testing.expectEqualStrings("11", parsed.groups[0].entries[0].wins.?);
+}
+
+test "standings streak and games-behind default null and round-trip" {
+    const entry: StandingEntry = .{
+        .team_id = "19",
+        .abbrev = "NYY",
+        .name = "New York Yankees",
+        .wins = "80",
+        .losses = "63",
+        .streak = "W3",
+        .games_behind = "2.5",
+    };
+    try std.testing.expectEqualStrings("W3", entry.streak.?);
+    try std.testing.expectEqualStrings("2.5", entry.games_behind.?);
+    // Absent stays absent (renders nothing, never zero).
+    const bare: StandingEntry = .{ .team_id = "2", .abbrev = "BUF", .name = "Buffalo Bills" };
+    try std.testing.expect(bare.streak == null);
+    try std.testing.expect(bare.games_behind == null);
+    var tmp = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer tmp.deinit();
+    const raw = try std.json.Stringify.valueAlloc(tmp.allocator(), entry, .{});
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"streak\":\"W3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"games_behind\":\"2.5\"") != null);
+    const legacy = try std.json.parseFromSliceLeaky(
+        StandingEntry,
+        tmp.allocator(),
+        "{\"team_id\":\"2\",\"abbrev\":\"BUF\",\"name\":\"Buffalo Bills\"}",
+        .{},
+    );
+    try std.testing.expect(legacy.streak == null);
+    try std.testing.expect(legacy.games_behind == null);
 }
