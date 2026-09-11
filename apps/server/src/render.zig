@@ -207,37 +207,42 @@ fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !
 }
 
 /// Compact `sprts` wordmark for terminal home pages: the same 13
-/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated row
-/// for row at one cell per pixel — s stays the notched block (`██_`/`███`/`_██`), p the bowl with
-/// its descender stem, r stem+flag, t the ascender with crossbar and
-/// right foot, s again. Letters sit on 3-cell columns with a 2-cell gap:
-/// five rows (ascender, three x-height rows, descender) by ~23 columns,
-/// ragged right, never ANSI: the heading below keeps its dim color while
-/// the banner stays plaintext. Shown on both text homes above the heading
-/// (quiet mode skips it with the rest of the header chrome); HTML and
-/// JSON never see it.
+/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated with
+/// half-block characters so each logo pixel renders ~square — terminal
+/// cells are ~2:1 tall, so full blocks stretched the mark vertically.
+/// Pixel rows pair up (ascender+x-height, two mid rows, descender
+/// alone): 5 pixel rows → 3 terminal rows, one char per pixel column.
+/// `▀` = upper pixel only, `▄` = lower only, `█` = both, space = none.
+/// s stays the notched block (`▄▄`/`▀██`), p the bowl with its
+/// descender stem (`▀` below), r stem+flag, t the ascender with crossbar
+/// (`▄█▄`) and right foot, s again. Letters sit on 3-pixel columns with
+/// a 1-pixel gap: ~19 columns, ragged right, never ANSI: the heading
+/// below keeps its dim color while the banner stays plaintext. Shown on
+/// both text homes above the heading (quiet mode skips it with the rest
+/// of the header chrome); HTML and JSON never see it.
 pub const text_home_banner_small: []const u8 =
-    \\                █
-    \\██   ███  ███  ███  ██
-    \\███  █ █  █     █   ███
-    \\ ██  ███  █     ██   ██
-    \\     █
+    \\▄▄  ▄▄▄ ▄▄▄ ▄█▄ ▄▄
+    \\▀██ █▄█ █    █▄ ▀██
+    \\    ▀
 ++ "\n";
 
 test "text homes show the block sprts wordmark above the heading" {
-    // The compact banner itself: block rows, ragged within 26 cells,
-    // at most 6 rows, valid UTF-8, zero ANSI on its own.
+    // The compact banner itself: half-block rows, ragged within 26 cells,
+    // at most 6 rows, valid UTF-8, zero ANSI on its own. Every row
+    // carries ink (`█`, `▀`, or `▄`); the descender-only last row has no
+    // full blocks, so the check accepts any of the three.
     var rows: usize = 0;
     var banner_lines = std.mem.splitScalar(u8, text_home_banner_small, '\n');
     while (banner_lines.next()) |line| {
         if (line.len == 0) continue;
         rows += 1;
-        try std.testing.expect(std.mem.indexOf(u8, line, "█") != null);
+        const has_ink = std.mem.indexOf(u8, line, "█") != null or std.mem.indexOf(u8, line, "▀") != null or std.mem.indexOf(u8, line, "▄") != null;
+        try std.testing.expect(has_ink);
         try std.testing.expect(table.textCells(line) <= 26);
         try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
     }
     try std.testing.expect(rows <= 6);
-    try std.testing.expectEqual(@as(usize, 5), rows);
+    try std.testing.expectEqual(@as(usize, 3), rows);
     _ = try std.unicode.Utf8View.init(text_home_banner_small);
 
     // Static home: banner opens the page, `sprts` heading unchanged.
@@ -278,6 +283,8 @@ test "text homes show the block sprts wordmark above the heading" {
     const quiet = try homeLive(std.testing.allocator, false, "example.test", &results, "2026-09-06", true, false);
     defer std.testing.allocator.free(quiet);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "█") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "▀") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet, "▄") == null);
     try std.testing.expect(std.mem.indexOf(u8, quiet, "sprts") == null);
 }
 
