@@ -229,6 +229,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .game => |route| return serveDetail(env, alloc, route, format, zone),
         .team => |route| return serveTeam(env, alloc, route, format, zone),
         .today => |route| return serveToday(env, alloc, route, format),
+        .team_game => |route| return serveTeamGame(env, alloc, route, format),
         .date_alias => |route| return serveDateAlias(env, alloc, route, format, zone),
         .week_alias => |route| return serveWeekAlias(env, alloc, route, format),
         .date_event => |route| return serveDateEvent(env, alloc, route, format, zone),
@@ -689,7 +690,7 @@ fn serveToday(
         .transport = transport_state.asTransport(),
         .clock = workerClock,
     };
-    const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr, try tz.resolveDay(alloc, null, epochSecondsNow(), .et)) catch |err| {
         if (core.isNotFound(err)) {
             return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
         }
@@ -713,6 +714,57 @@ fn serveToday(
     resp.setHeader("x-content-type-options", "nosniff");
     resp.setBody(body);
     return resp;
+}
+
+/// Most-relevant-game shortcut `/{league}/{abbr}/game`: the live
+/// in-progress game first, else today's game (scheduled or final), else the
+/// most-recent completed game, else the team page itself — so an existing
+/// team never 404s here (unknown teams 404 like `serveToday`). The
+/// `/api/v1/` twin keeps the numeric id (JSON keeps ids). Fresh-only,
+/// no-store.
+fn serveTeamGame(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TeamGameRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const day = try tz.resolveDay(alloc, null, epochSecondsNow(), .et);
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr, day) catch |err| {
+        if (core.isNotFound(err)) {
+            return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN team fetch failed for {s} {s}", .{ league.slug, route.abbr });
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const target = if (core.schedule.findFeaturedGame(alloc, view, day)) |game|
+        if (route.api)
+            try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+        else
+            try vd.scheduleGameHref(alloc, league.slug, route.abbr, game)
+    else if (route.api)
+        try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, route.abbr })
+    else
+        try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, route.abbr });
+    const game_body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var game_resp = workers.Response.new();
+    game_resp.setStatus(.found);
+    game_resp.setHeader("location", target);
+    game_resp.setHeader("cache-control", "no-store");
+    game_resp.setHeader("x-content-type-options", "nosniff");
+    game_resp.setBody(game_body);
+    return game_resp;
 }
 
 /// Human game alias, date form `/{league}/{date}/{away}-{home}[-N]`: resolve
@@ -926,8 +978,12 @@ fn serveTeam(
     const epoch_s = epochSecondsNow();
     const slug = try core.cache.canonicalSlug(alloc, league.slug);
     const abbr = try core.cache.canonicalAbbr(alloc, route.abbr);
+    // Request day, ET-anchored: team renderers tag, flag, and flip in ET
+    // only (explicit ?date wins verbatim via tz.resolveDay either way).
+    // The day joins the edge key: dated pages are different payloads.
+    const day = try tz.resolveDay(alloc, route.date, epoch_s, .et);
     const tag = try variantTag(alloc, format, route.width, route.height, color, format == .text and route.oneline, zone, route.art, false);
-    const key = try edge.teamKey(alloc, slug, abbr, tag);
+    const key = try edge.teamKey(alloc, slug, abbr, day, tag);
     const fresh_key = try edge.teamFreshKey(alloc, key, epoch_s);
     const stale_key = try edge.teamStaleKey(alloc, key, epoch_s);
 
@@ -950,7 +1006,7 @@ fn serveTeam(
         .clock = workerClock,
     };
 
-    const view = provider.fetchTeam(adapter, alloc, league, route.abbr) catch |err| {
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr, day) catch |err| {
         if (core.isNotFound(err)) {
             return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
         }
@@ -1395,9 +1451,9 @@ test "edge variant tags split ET and UTC zones in one bucket" {
     const utc_detail_fresh = try edge.detailFreshKey(arena, utc_detail, bucket, false);
     defer arena.free(utc_detail_fresh);
     try std.testing.expect(!std.mem.eql(u8, et_detail_fresh, utc_detail_fresh));
-    const et_team = try edge.teamKey(arena, "mlb", "phi", et_tag);
+    const et_team = try edge.teamKey(arena, "mlb", "phi", "2026-09-06", et_tag);
     defer arena.free(et_team);
-    const utc_team = try edge.teamKey(arena, "mlb", "phi", utc_tag);
+    const utc_team = try edge.teamKey(arena, "mlb", "phi", "2026-09-06", utc_tag);
     defer arena.free(utc_team);
     const et_team_fresh = try edge.teamFreshKey(arena, et_team, bucket);
     defer arena.free(et_team_fresh);

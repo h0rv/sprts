@@ -141,6 +141,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  /{league}?week=N               football week only, ignored elsewhere
         \\  /{league}/{id}                 one game, legacy numeric (all digits = game, else team; the human forms below are canonical links)
         \\  /{league}/{abbr}               one team, e.g. /mlb/phi
+        \\  /{league}/{abbr}?date=YYYY-MM-DD team page for one day (prev/next flip days; footer links)
         \\  /{league}/{date}/{away}-{home}[-N] game by date+teams, e.g. /mlb/2026-09-09/min-det (-2 = doubleheader game 2; curl -L follows the 302 to the numeric address)
         \\  /{league}/{date}/event[-N] Nth game on the day board, e.g. /ufc/2026-09-05/event-14 (bare event = 1; every game: bouts, sessions, fields, name-only duels; curl -L)
         \\  /{league}/{YYYY}/week{N}/{a}-{h}[-N] football week game, e.g. /nfl/2026/week1/ne-sea (curl -L)
@@ -148,6 +149,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  every game link uses these human forms; numeric /{league}/{id} still resolves (legacy)
         \\  duel aliases match two team abbreviations only: cards, races, tournaments, name-only duels use event-N (browse the day board for the list)
         \\  /{league}/{abbr}/today        today's game, redirects to it
+        \\  /{league}/{abbr}/game         most relevant game (live, today, else most recent), redirects to it (curl -L; team page fallback, never 404)
         \\  /{league}/standings            current table, no date
         \\  /{league}/teams                 team list as JSON (no text twin: picker payload)
         \\  /{league}/tour                  live terminal tour in the browser (xterm.js + SSE, read-only)
@@ -166,7 +168,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
     try w.writeAll(
         \\  color=0|1  width=N (52..200)  height=N (max games)
         \\  quiet=0|1 (no header/footer)  oneline=0|1 (?0, text only)  format=text|html
-        \\  date=YYYY-MM-DD|today|tomorrow|yesterday, default today in ET (scoreboard, all)  week=N (football only)
+        \\  date=YYYY-MM-DD|today|tomorrow|yesterday, default today in ET (scoreboard, all, team)  week=N (football only)
         \\  stream=sse (scoreboard text only, curl -N)  tz=utc (default et)
         \\  art=off strips team-mark art (tofu terminals); anything else art on
         \\
@@ -181,6 +183,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
     try w.writeAll(
         \\  text rows print human game:/team: links (/{league}/{date}/{slug}); HTML makes them clickable
         \\  numeric ids still resolve (legacy); boards end with prev/next ?date= links
+        \\  team pages end with prev/next ?date= day-flip links too
         \\
     );
     try section(w, "LEAGUES", color);
@@ -211,6 +214,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
         \\  curl 'localhost:8080/mlb/401816828?0'   (legacy numeric address still renders)
         \\  curl localhost:8080/all
         \\  curl localhost:8080/nfl/standings
+        \\  curl -L localhost:8080/mlb/PHI/game
         \\  curl -N 'localhost:8080/mlb?stream=sse'
         \\
     );
@@ -220,7 +224,7 @@ fn textHelp(arena: std.mem.Allocator, route: router.HelpRoute, color: bool) ![]u
 
 /// `?0` on the help page itself: the whole page as one line per topic.
 fn writeCompactHelp(w: *std.Io.Writer) !void {
-    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(legacy numeric: digits=game,else team; human slugs below are canonical) /{league}/{abbr} /{league}/{date}/{away}-{home}[-N](curl -L) /{league}/{date}/event[-N](Nth game, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football, curl -L) /{league}/{YYYY}/week{N}/event[-N](football, curl -L) /{league}/standings /{league}/teams(JSON only) /{league}/tour /tour /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
+    try w.writeAll("sprts: / /all /{league} /{league}?date=YYYY-MM-DD /{league}?week=N(football) /{league}/{id}(legacy numeric: digits=game,else team; human slugs below are canonical) /{league}/{abbr} /{league}/{abbr}?date=YYYY-MM-DD /{league}/{abbr}/game(curl -L) /{league}/{date}/{away}-{home}[-N](curl -L) /{league}/{date}/event[-N](Nth game, curl -L) /{league}/{YYYY}/week{N}/{away}-{home}[-N](football, curl -L) /{league}/{YYYY}/week{N}/event[-N](football, curl -L) /{league}/standings /{league}/teams(JSON only) /{league}/tour /tour /api/v1/... /openapi.json /docs /llms.txt /healthz /:help\n");
     try w.writeAll("flags: color=0|1 width=N height=N quiet oneline(?0 text only) stream=sse format=text|html date=YYYY-MM-DD|today|tomorrow|yesterday week=N tz=utc art=off | aliases T A q 0 (long wins; later alias wins)\n");
     try w.writeAll("install: install -m755 tools/sprts ~/.local/bin/sprts\n");
     try w.writeAll("try: curl localhost:8080/mlb\n");
@@ -269,6 +273,8 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "/{league}?week=N", .description = "Football week only, ignored elsewhere" },
             .{ .name = "/{league}/{id}", .description = "One game, legacy numeric address (all digits = game, else team); the human slug forms above are the canonical links and still resolve here" },
             .{ .name = "/{league}/{abbr}", .description = "One team, e.g. /mlb/phi" },
+            .{ .name = "/{league}/{abbr}?date=YYYY-MM-DD", .description = "Team page for one day (prev/next flip days; footer links)" },
+            .{ .name = "/{league}/{abbr}/game", .description = "Most relevant game (live, today, else most recent), 302 to the human address (curl -L; team page fallback, never 404)" },
             .{ .name = "/{league}/{date}/{away}-{home}", .description = "One game by date and teams, canonical human address, 302 to the numeric game (date or today|tomorrow|yesterday; -N = doubleheader game N, 1 = first; curl -L; duel-only, cards/races 404 with the day board)" },
             .{ .name = "/{league}/{date}/event[-N]", .description = "Nth game on the day board, canonical human address, 302 to the numeric game (bare event = 1; every game: bouts, sessions, fields, name-only duels; curl -L)" },
             .{ .name = "/{league}/{YYYY}/week{N}/{away}-{home}", .description = "Football week game by teams, canonical human address, 302 to the numeric game (-N = doubleheader game N; curl -L)" },
@@ -293,14 +299,14 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             .{ .name = "quiet=0|1", .description = "No header/footer (alias q)" },
             .{ .name = "oneline=0|1", .description = "One game per line, text only (alias 0)" },
             .{ .name = "format=text|html", .description = "Explicit response format" },
-            .{ .name = "date=YYYY-MM-DD", .description = "Scoreboard and digest day" },
+            .{ .name = "date=YYYY-MM-DD", .description = "Scoreboard, digest, and team day" },
             .{ .name = "week=N", .description = "Football week only, ignored elsewhere" },
             .{ .name = "stream=sse", .description = "Scoreboard text-only live feed" },
             .{ .name = "tz=utc", .description = "Day zone, default et" },
             .{ .name = "art=off", .description = "Strip team-mark art for tofu terminals; anything else art on" },
             .{ .name = "precedence", .description = "Long flags win over aliases; later alias wins" },
         },
-        .links = "Text rows print human game:/team: links (/{league}/{date}/{slug}); HTML makes them clickable; numeric ids still resolve (legacy). Boards end with prev/next ?date= links. NFL history/offseason via nflverse games.csv (CC-BY-4.0, github.com/nflverse/nflverse-data): snapshot boards name their source.",
+        .links = "Text rows print human game:/team: links (/{league}/{date}/{slug}); HTML makes them clickable; numeric ids still resolve (legacy). Boards end with prev/next ?date= links; team pages too. NFL history/offseason via nflverse games.csv (CC-BY-4.0, github.com/nflverse/nflverse-data): snapshot boards name their source.",
         .install = "install -m755 tools/sprts ~/.local/bin/sprts",
         .examples = &[_][]const u8{
             "curl localhost:8080/mlb",
@@ -313,6 +319,7 @@ fn jsonHelp(arena: std.mem.Allocator) ![]u8 {
             "curl 'localhost:8080/mlb/401816828?0'",
             "curl localhost:8080/all",
             "curl localhost:8080/nfl/standings",
+            "curl -L localhost:8080/mlb/PHI/game",
             "curl -N 'localhost:8080/mlb?stream=sse'",
         },
     });
@@ -462,6 +469,9 @@ test "help text documents every route, flag, alias, install, and example" {
         "all digits",
         "else team",
         "/{league}/{abbr}",
+        "day-flip",
+        "/{league}/{abbr}/game",
+        "most relevant",
         "standings",
         "/{league}/teams",
         "no text twin",

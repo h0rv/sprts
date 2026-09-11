@@ -359,11 +359,13 @@ pub fn scheduleStaleKey(arena: std.mem.Allocator, schedule_key: []const u8, epoc
     return std.fmt.allocPrint(arena, "{s}/s{d}", .{ schedule_key, @divFloor(epoch_s, schedule_stale_ttl_s) });
 }
 
-/// Team render namespace: `sprts/v1/team/<slug>/<abbr>/<format>`.
-/// Render flags stay out of the key (`?color`/`?width`/`?height` apply after
-/// the fetch); non-JSON formats share the normalized fetch modulo format.
-pub fn teamKey(arena: std.mem.Allocator, slug: []const u8, abbr: []const u8, tag: []const u8) ![]u8 {
-    return std.fmt.allocPrint(arena, "sprts/v1/team/{s}/{s}/{s}", .{ slug, abbr, tag });
+/// Team render namespace: `sprts/v1/team/<slug>/<abbr>/<day>/<format>`.
+/// The page day joins the key (dated pages are different payloads, not
+/// variants). Render flags stay out of the key (`?color`/`?width`/`?height`
+/// apply after the fetch); non-JSON formats share the normalized fetch
+/// modulo format.
+pub fn teamKey(arena: std.mem.Allocator, slug: []const u8, abbr: []const u8, day: []const u8, tag: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "sprts/v1/team/{s}/{s}/{s}/{s}", .{ slug, abbr, day, tag });
 }
 
 /// Team fresh key: same 60s window as the schedule (renders track it).
@@ -400,9 +402,13 @@ test "team keys canonicalize slug and abbrev" {
     defer arena.free(slug);
     const abbr = try canonicalAbbr(arena, "PHI");
     defer arena.free(abbr);
-    const key = try teamKey(arena, slug, abbr, "json");
+    const key = try teamKey(arena, slug, abbr, "2026-09-06", "json");
     defer arena.free(key);
-    try std.testing.expectEqualStrings("sprts/v1/team/mlb/phi/json", key);
+    try std.testing.expectEqualStrings("sprts/v1/team/mlb/phi/2026-09-06/json", key);
+    // Day-flip pages key apart: same team, different day, different entry.
+    const other = try teamKey(arena, slug, abbr, "2026-09-07", "json");
+    defer arena.free(other);
+    try std.testing.expect(!std.mem.eql(u8, key, other));
 
     const teams = try teamsKey(arena, slug);
     defer arena.free(teams);

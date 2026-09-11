@@ -350,21 +350,49 @@ const ScoreboardGeoBroadcast = struct {
 const ScoreboardGeoMedia = struct {
     shortName: ?[]const u8 = null,
 };
-/// Broadcaster for one competition: the first non-empty
-/// `broadcasts[].names` entry in order, else the first non-empty
-/// geo-feed media short name, else null (absent stays absent).
+/// Broadcaster for one competition: the first non-empty, non-vendor
+/// `broadcasts[].names` entry in order, else the first non-empty,
+/// non-vendor geo-feed media short name, else null (absent stays absent).
+/// ESPN mixes ticket vendors into the broadcast slots (verified live:
+/// `TV: Fandango` on team-linked game pages), so obvious vendors are
+/// denylisted rather than rendered as networks; blank entries are skipped
+/// so no bare `TV: ` line ever renders.
 fn competitionNetwork(competition: Competition) ?[]const u8 {
     for (competition.broadcasts) |broadcast| {
         for (broadcast.names) |name| {
-            if (name.len > 0) return name;
+            const trimmed = std.mem.trim(u8, name, " \t");
+            if (trimmed.len == 0) continue;
+            if (isTicketVendor(trimmed)) continue;
+            return trimmed;
         }
     }
     for (competition.geoBroadcasts) |geo| {
         const media = geo.media orelse continue;
         const short = media.shortName orelse continue;
-        if (short.len > 0) return short;
+        const trimmed = std.mem.trim(u8, short, " \t");
+        if (trimmed.len == 0) continue;
+        if (isTicketVendor(trimmed)) continue;
+        return trimmed;
     }
     return null;
+}
+
+/// Ticket vendors ESPN files alongside real broadcasters: never networks.
+/// Case-insensitive; matches the bare vendor name only (a network merely
+/// containing one of these words still renders).
+fn isTicketVendor(name: []const u8) bool {
+    for ([_][]const u8{
+        "fandango",
+        "ticketmaster",
+        "stubhub",
+        "seatgeek",
+        "vivid seats",
+        "tickpick",
+        "ticket city",
+    }) |vendor| {
+        if (std.ascii.eqlIgnoreCase(name, vendor)) return true;
+    }
+    return false;
 }
 const Competitor = struct {
     id: []const u8 = "",
@@ -712,6 +740,26 @@ test "game network is null without broadcasts and falls back to geo feeds" {
     ;
     const fallback = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", geo);
     try std.testing.expectEqualStrings("MASN", fallback.games[0].network.?);
+}
+
+test "game network skips ticket vendors and blank entries" {
+    // Live shape: ESPN files ticket vendors (Fandango) in the broadcast
+    // slots. Vendors are never networks: a real broadcaster later in the
+    // list wins, and a vendor-only slate yields no network (no `TV: `).
+    const vendor_first =
+        \\{"events":[{"id":"401","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"broadcasts":[{"names":["Fandango"]},{"names":["ESPN"]}],"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const skipped = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", vendor_first);
+    try std.testing.expectEqualStrings("ESPN", skipped.games[0].network.?);
+    // Vendor-only (any casing) plus blank/whitespace entries: null, so
+    // renderers emit no TV line at all.
+    const vendor_only =
+        \\{"events":[{"id":"402","name":"Away at Home","date":"2026-09-06T17:00Z","competitions":[{"broadcasts":[{"names":["","  ","FANDANGO"]}],"geoBroadcasts":[{"media":{"shortName":"Ticketmaster"}}],"competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Away","abbreviation":"AWY"}},{"homeAway":"home","team":{"id":"h","displayName":"Home","abbreviation":"HME"}}]}]}]}
+    ;
+    const dropped = try parseAndNormalize(arena_state.allocator(), core.leagues.find("mlb").?, "2026-09-06", vendor_only);
+    try std.testing.expect(dropped.games[0].network == null);
 }
 
 const FakeTransportState = struct {
@@ -1732,7 +1780,7 @@ fn summarySeries(arena: std.mem.Allocator, response: SummaryResponse, game_id: [
     // stays single; mid-string wording ("X leads series ...") is untouched.
     const summary = stripSeriesPrefix(series.summary);
     const cleaned: []const u8 = if (from_season)
-        try seasonSeriesText(arena, summary)
+        try seasonSeriesDecided(arena, summary, total)
     else if (std.mem.indexOf(u8, summary, " leads series ")) |at|
         try std.fmt.allocPrint(arena, "{s} leads {s}", .{
             summary[0..at],
@@ -1778,6 +1826,14 @@ fn seasonSeriesText(arena: std.mem.Allocator, summary: []const u8) ![]const u8 {
             summary[at + " leads series ".len ..],
         });
     }
+    // Live ESPN shape (verified 2026-09-10: "NYY lead series 2-0"): the
+    // bare present-tense verb reads the same as "leads".
+    if (std.mem.indexOf(u8, summary, " lead series ")) |at| {
+        return std.fmt.allocPrint(arena, "{s} leads season series {s}", .{
+            summary[0..at],
+            summary[at + " lead series ".len ..],
+        });
+    }
     if (std.mem.indexOf(u8, summary, " wins series ")) |at| {
         return std.fmt.allocPrint(arena, "{s} won season series {s}", .{
             summary[0..at],
@@ -1791,6 +1847,48 @@ fn seasonSeriesText(arena: std.mem.Allocator, summary: []const u8) ![]const u8 {
         });
     }
     return summary;
+}
+
+/// Decided-ness from the completed/total count, not ESPN's verb: a series
+/// is decided only once wins+losses reach the scheduled total, so "X wins
+/// series 2-1" with one game left reads "leads" (never the contradictory
+/// "X won ... (game 3 of 4)"). Completed sets keep "won"; ties stay
+/// tied; unparseable shapes keep ESPN's verb.
+fn seasonSeriesDecided(arena: std.mem.Allocator, summary: []const u8, total: i64) ![]const u8 {
+    const text = try seasonSeriesText(arena, summary);
+    const record = parseSeriesRecord(text) orelse return text;
+    const decided = record.w + record.l >= total;
+    if (decided) {
+        if (std.mem.indexOf(u8, text, " leads season series ")) |at| {
+            return std.fmt.allocPrint(arena, "{s} won season series {s}", .{
+                text[0..at],
+                text[at + " leads season series ".len ..],
+            });
+        }
+        return text;
+    }
+    if (std.mem.indexOf(u8, text, " won season series ")) |at| {
+        return std.fmt.allocPrint(arena, "{s} leads season series {s}", .{
+            text[0..at],
+            text[at + " won season series ".len ..],
+        });
+    }
+    return text;
+}
+
+/// Trailing `W-L` record of a canonical series line ("... season series
+/// 2-1"). Null unless the tail parses as two non-negative ints, so prose
+/// without a record never invents one.
+fn parseSeriesRecord(text: []const u8) ?struct { w: i64, l: i64 } {
+    if (std.mem.indexOf(u8, text, "season series ") == null) return null;
+    const tail = std.mem.trimEnd(u8, text, " ");
+    const space = std.mem.lastIndexOfScalar(u8, tail, ' ') orelse return null;
+    const record = tail[space + 1 ..];
+    const dash = std.mem.indexOfScalar(u8, record, '-') orelse return null;
+    const w = std.fmt.parseInt(i64, record[0..dash], 10) catch return null;
+    const l = std.fmt.parseInt(i64, record[dash + 1 ..], 10) catch return null;
+    if (w < 0 or l < 0) return null;
+    return .{ .w = w, .l = l };
 }
 
 fn scheduleOpponentIds(event: SeriesScheduleEvent, team_id: []const u8) ?[]const u8 {
@@ -1890,10 +1988,14 @@ fn seriesFromSchedules(
         if (self_wins == other_wins) {
             return try std.fmt.allocPrint(arena, "Season series tied {d}-{d} (game {d} of {d})", .{ self_wins, other_wins, n, total });
         }
+        // Decided-ness follows the summary path (completed/total count):
+        // only a fully-decided block reads "won", a live one "leads".
+        const decided = self_wins + other_wins >= total;
+        const verb: []const u8 = if (decided) "won" else "leads";
         const leader = if (self_wins > other_wins) team_abbrs[side] else team_abbrs[1 - side];
         const wins = @max(self_wins, other_wins);
         const losses = @min(self_wins, other_wins);
-        return try std.fmt.allocPrint(arena, "{s} leads season series {d}-{d} (game {d} of {d})", .{ leader, wins, losses, n, total });
+        return try std.fmt.allocPrint(arena, "{s} {s} season series {d}-{d} (game {d} of {d})", .{ leader, verb, wins, losses, n, total });
     }
     return null;
 }
@@ -2709,9 +2811,15 @@ test "fetchDetail derives live situation from the last play" {
 
 // ---- Per-team view (additive; existing fns above are untouched) ----
 
-/// Season rule: the schedule season is the current calendar year from the
-/// adapter clock. Around the December/January wrap (early January, before
-/// ESPN publishes the new schedule) the current-year schedule comes back
+/// Day rule: the page is headed with the request day (`?date=`, ET
+/// calendar like the team renderers; explicit dates ride through,
+/// missing means today). The schedule season follows the page day, with
+/// the same previous-year fallback below; the flagged-day section, header
+/// tag, and footer day-flip links all read it. The live join always reads
+/// clock-today's board (live games only exist now).
+///
+/// Season rule: around the December/January wrap (early January, before
+/// ESPN publishes the new schedule) the page-day season comes back
 /// empty, so `fetchTeam` falls back to the previous year once. An empty
 /// fallback yields a view with no games rather than an error.
 ///
@@ -2719,8 +2827,8 @@ test "fetchDetail derives live situation from the last play" {
 /// still reads `pre`), so schedule event ids are intersected with that
 /// date's scoreboard `state == in` games via `fetch`. The board fetch is
 /// enrichment only: on failure `live` is null instead of an error.
-pub fn fetchTeam(adapter: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, abbrev: []const u8) !core.schedule.TeamView {
-    return fetchTeamImpl(adapter, arena, league, abbrev);
+pub fn fetchTeam(adapter: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, abbrev: []const u8, day: []const u8) !core.schedule.TeamView {
+    return fetchTeamImpl(adapter, arena, league, abbrev, day);
 }
 
 const TeamListResponse = struct {
@@ -2915,12 +3023,64 @@ fn parseSchedule(arena: std.mem.Allocator, body: []const u8, abbrev: []const u8)
             .id = ours_id,
             .abbrev = header.abbreviation,
             .name = header.displayName,
-            .record_summary = header.recordSummary,
-            .standing_summary = header.standingSummary,
+            // Basketball schedules ship no header record (verified live:
+            // NBA/NCAAM carry no recordSummary and no competitor records;
+            // only scoreboard rows do). Count W-L[-T] from the completed
+            // games in hand instead of leaving the header blank; leagues
+            // whose header ships a record keep it verbatim.
+            .record_summary = header.recordSummary orelse try countRecord(arena, events.items),
+            // ESPN files conferences as divisions on some leagues (verified
+            // live: WNBA "7th in Eastern Conference Division").
+            // Conferences are not divisions; fold the wording.
+            .standing_summary = try normalizeStanding(arena, header.standingSummary),
         },
         .events = try events.toOwnedSlice(arena),
         .unknown_time = try unknown_time.toOwnedSlice(arena),
     };
+}
+
+/// Record fallback for schedule headers that ship none (basketball):
+/// count completed games as `W-L` (`W-L-T` with draws), the same
+/// tie/winner/score precedence `finalResult` renders per row. Null when
+/// nothing decisive completed, so preseason pages stay blank rather than
+/// inventing an `0-0`.
+fn countRecord(arena: std.mem.Allocator, events: []const core.schedule.ScheduleEvent) !?[]const u8 {
+    var wins: u32 = 0;
+    var losses: u32 = 0;
+    var ties: u32 = 0;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.state, "post")) continue;
+        const ours = std.fmt.parseInt(i64, event.our_score, 10) catch null;
+        const theirs = std.fmt.parseInt(i64, event.opp_score, 10) catch null;
+        if (ours) |o| if (theirs) |t| {
+            if (o == t) {
+                ties += 1;
+                continue;
+            }
+            if (event.won) |won| {
+                if (won) wins += 1 else losses += 1;
+                continue;
+            }
+            if (o > t) wins += 1 else losses += 1;
+            continue;
+        };
+        if (event.won) |won| {
+            if (won) wins += 1 else losses += 1;
+        }
+    }
+    if (wins + losses + ties == 0) return null;
+    if (ties > 0) return try std.fmt.allocPrint(arena, "{d}-{d}-{d}", .{ wins, losses, ties });
+    return try std.fmt.allocPrint(arena, "{d}-{d}", .{ wins, losses });
+}
+
+/// Standing-summary wording fix: ESPN files some conferences as divisions
+/// (`"7th in Eastern Conference Division"`). Conferences are not
+/// divisions, so fold `Conference Division` to `Conference`; every other
+/// shape (real divisions like `AFC West`, `NL East`) passes through.
+fn normalizeStanding(arena: std.mem.Allocator, summary: ?[]const u8) !?[]const u8 {
+    const text = summary orelse return null;
+    if (std.mem.indexOf(u8, text, " Conference Division") == null) return text;
+    return try std.mem.replaceOwned(u8, arena, text, " Conference Division", " Conference");
 }
 
 /// Upcoming display: `"vs ATL 5:05 PM"` / `"at NYM 7:15 PM"` (US Eastern,
@@ -3069,10 +3229,13 @@ fn liveRefFromBoardGame(arena: std.mem.Allocator, game: core.domain.Game, abbrev
     };
 }
 
-fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, abbrev: []const u8) !core.schedule.TeamView {
+fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const core.leagues.League, abbrev: []const u8, day: []const u8) !core.schedule.TeamView {
     const endpoint = endpointFor(league.slug) orelse return error.UnsupportedLeague;
     const today = try self.today(arena);
-    const season = today[0..4];
+    // Season follows the page day (dateless pages: today, as before); a
+    // short/relative day can never arrive (dispatch resolves `?date=`
+    // first), but the clock year covers any caller that skips validation.
+    const season = if (day.len >= 4) day[0..4] else today[0..4];
 
     // The default teams endpoint pages at 50 entries (verified live:
     // NCAAF's list omits Ohio State), so college lookups 404. A large
@@ -3097,7 +3260,7 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         ), abbrev);
     }
 
-    const split = try core.schedule.splitSchedule(arena, parsed.events, today);
+    const split = try core.schedule.splitSchedule(arena, parsed.events, day);
     var next: std.ArrayList(core.schedule.GameRef) = .empty;
     for (split.upcoming[0..@min(split.upcoming.len, 5)]) |event| {
         try next.append(arena, try gameRefFromEvent(arena, event, parsed.unknown_time));
@@ -3143,14 +3306,16 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
             try extra_next.append(arena, try gameRefFromEvent(arena, event, parsed.unknown_time));
         }
     }
-    // Flag today's upcoming rows top-center: Eastern calendar day derived
-    // from each event's timestamp (evening UTC stamps land on the played
-    // day), `pre` only so finals stay in Last and live rows under LIVE
-    // NOW. Renderers surface flagged rows in a Today section and skip
+    // Flag the page day's upcoming rows top-center: Eastern calendar day
+    // derived from each event's timestamp (evening UTC stamps land on the
+    // played day), `pre` only so finals stay in Last and live rows under
+    // LIVE NOW. Renderers surface flagged rows in a Today section and skip
     // them in Next/Later below; arrays keep schedule order regardless.
+    // The page day defaults to today, so dateless pages flag exactly like
+    // before; an explicit `?date=` surfaces that day's games instead.
+    try markTodayGames(arena, next.items, day);
+    try markTodayGames(arena, extra_next.items, day);
     const today_et = try core.date.todayET(arena, self.clock(self.io));
-    try markTodayGames(arena, next.items, today_et);
-    try markTodayGames(arena, extra_next.items, today_et);
 
     return .{
         .league = league.slug,
@@ -3162,6 +3327,8 @@ fn fetchTeamImpl(self: EspnAdapter, arena: std.mem.Allocator, league: *const cor
         // depth: full-season overflow (optional; empty when within the window).
         .extra_past = try extra_past.toOwnedSlice(arena),
         .extra_next = try extra_next.toOwnedSlice(arena),
+        .date = try arena.dupe(u8, day),
+        .date_is_today = std.mem.eql(u8, day, today_et),
     };
 }
 
@@ -3235,7 +3402,7 @@ test "fetchTeam resolves abbrev case-insensitively and joins live" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const adapter = teamTestAdapter(&fake);
-    const view = try fetchTeam(adapter, arena, core.leagues.find("mlb").?, "phi");
+    const view = try fetchTeam(adapter, arena, core.leagues.find("mlb").?, "phi", "2026-09-06");
     try std.testing.expectEqualStrings("PHI", view.team.abbrev);
     try std.testing.expectEqualStrings("Philadelphia Phillies", view.team.name);
     try std.testing.expectEqualStrings("80-63", view.team.record_summary.?);
@@ -3261,7 +3428,7 @@ test "fetchTeam returns TeamNotFound for unknown abbrev" {
     const adapter = teamTestAdapter(&fake);
     try std.testing.expectError(
         error.TeamNotFound,
-        fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "zzz"),
+        fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "zzz", "2026-09-06"),
     );
 }
 
@@ -3274,7 +3441,7 @@ test "fetchTeam falls back to the previous season when the schedule is empty" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const adapter = teamTestAdapter(&fake);
-    const view = try fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expectEqual(@as(usize, 2), fake.schedule_calls);
     try std.testing.expect(std.mem.indexOf(u8, fake.first_schedule_url.?, "season=2026") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.last_schedule_url.?, "season=2025") != null);
@@ -3292,7 +3459,7 @@ test "fetchTeam still renders when the live board fetch fails" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const adapter = teamTestAdapter(&fake);
-    const view = try fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(adapter, arena_state.allocator(), core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expect(view.live == null);
     try std.testing.expectEqual(@as(usize, 1), view.last.len);
 }
@@ -3785,7 +3952,7 @@ test "depth fetchTeam threads overflow beyond the last/next five" {
         .fail_board = true, // live join off; overflow is schedule-only.
     };
     const adapter = teamTestAdapter(&fake);
-    const view = try fetchTeam(adapter, arena, core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(adapter, arena, core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expect(view.live == null);
     try std.testing.expectEqual(@as(usize, 5), view.last.len);
     try std.testing.expectEqualStrings("p7", view.last[0].id);
@@ -3808,7 +3975,7 @@ test "depth fetchTeam leaves overflow empty within the window" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expectEqual(@as(usize, 0), view.extra_past.len);
     try std.testing.expectEqual(@as(usize, 0), view.extra_next.len);
 }
@@ -3943,7 +4110,7 @@ test "fetchTeam partitions by completion across interleaved dates" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     // fakeClock today is 2026-09-07: the 09-06 live game is cross-midnight.
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expect(view.live == null);
     try std.testing.expectEqual(@as(usize, 1), view.last.len);
     try std.testing.expectEqualStrings("draw1", view.last[0].id);
@@ -3995,7 +4162,7 @@ test "fetchTeam resolves college abbrevs past the 50-team page" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU", "2026-09-06");
     // Full membership in one fetch, first abbrev match wins.
     try std.testing.expect(std.mem.indexOf(u8, fake.teams_url.?, "limit=1000") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.first_schedule_url.?, "/teams/194/") != null);
@@ -4020,11 +4187,11 @@ test "fetchTeam resolves numeric ids with abbrev fallback" {
         .board_body = team_fixture_board,
         .fail_board = true,
     };
-    const by_id = try fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "194");
+    const by_id = try fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "194", "2026-09-06");
     try std.testing.expectEqualStrings("OSU", by_id.team.abbrev);
     try std.testing.expectError(
         error.TeamNotFound,
-        fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "9999"),
+        fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("ncaaf").?, "9999", "2026-09-06"),
     );
 }
 
@@ -4037,7 +4204,7 @@ test "fetchTeam keeps ids linkable for pre-summary games" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU", "2026-09-06");
     // Completed game keeps its link; the scheduled future keeps its id too:
     // detail renders board-backed previews for games without a summary
     // yet and 404s gracefully only for truly unknown ids, so upcoming
@@ -4065,7 +4232,7 @@ test "fetchTeam flags today's upcoming rows Eastern" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("mlb").?, "PHI", "2026-09-06");
     try std.testing.expectEqual(@as(usize, 1), view.last.len);
     try std.testing.expect(!view.last[0].today);
     try std.testing.expectEqual(@as(usize, 3), view.next.len);
@@ -4115,6 +4282,39 @@ test "seasonseries wins phrasing stays modest" {
     try std.testing.expectEqualStrings("BOS won season series 3-1 (game 4 of 4)", detail.series.?);
     // Answered from the summary: no schedule derivation fetches.
     try std.testing.expectEqual(@as(usize, 0), fake.sched_calls);
+}
+
+test "seasonseries verb follows the completed count, not ESPN's" {
+    // Contradictory shape: ESPN says "wins" while one game is still
+    // unplayed (2-1 of 4). The completed/total count decides, so the line
+    // reads "leads" until the set is clinched. The board carries the
+    // fetched game id (g3); the suffix position comes from series events.
+    const g3_board =
+        \\{"events":[{"id":"g3","name":"Boston at Someone","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"g3","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"homeAway":"home","score":"1","winner":false,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]}]}
+    ;
+    const early =
+        \\{"header":{"competitions":[{"id":"g3","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Boston","abbreviation":"BOS"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]},"seasonseries":[{"summary":"BOS wins series 2-1","completed":false,"totalCompetitions":4,"events":[{"id":"g1"},{"id":"g2"},{"id":"g3"},{"id":"g4"}]}]}
+    ;
+    var fake = DetailFake{ .summary_body = early, .board_body = g3_board };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const undecided = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g3");
+    try std.testing.expectEqualStrings("BOS leads season series 2-1 (game 3 of 4)", undecided.series.?);
+    // And the reverse: a completed set ESPN still calls "leads" reads won.
+    const clinched =
+        \\{"header":{"competitions":[{"id":"g3","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","homeAway":"away","winner":true,"score":5,"team":{"id":"a","displayName":"Atlanta","abbreviation":"ATL"}},{"id":"h","homeAway":"home","winner":false,"score":1,"team":{"id":"h","displayName":"Someone","abbreviation":"SOM"}}]}]},"seasonseries":[{"summary":"ATL leads series 2-1","completed":true,"totalCompetitions":3,"events":[{"id":"g1"},{"id":"g2"},{"id":"g3"}]}]}
+    ;
+    var fake2 = DetailFake{ .summary_body = clinched, .board_body = g3_board };
+    const won = try detailAdapter(&fake2).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g3");
+    try std.testing.expectEqualStrings("ATL won season series 2-1 (game 3 of 3)", won.series.?);
+    // Live ESPN present-tense shape ("NYY lead series 2-0") normalizes to
+    // the same leads phrasing with its suffix.
+    const live_shape =
+        \\{"header":{"competitions":[{"id":"g3","date":"2026-09-10T23:05Z","status":{"type":{"state":"in","shortDetail":"Top 3rd"}},"competitors":[{"id":"a","homeAway":"away","score":2,"team":{"id":"a","displayName":"NY Yankees","abbreviation":"NYY"}},{"id":"h","homeAway":"home","score":0,"team":{"id":"h","displayName":"Colorado","abbreviation":"COL"}}]}]},"seasonseries":[{"summary":"NYY lead series 2-0","completed":false,"totalCompetitions":3,"events":[{"id":"g1"},{"id":"g2"},{"id":"g3"}]}]}
+    ;
+    var fake3 = DetailFake{ .summary_body = live_shape, .board_body = g3_board };
+    const live = try detailAdapter(&fake3).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "g3");
+    try std.testing.expectEqualStrings("NYY leads season series 2-0 (game 3 of 3)", live.series.?);
 }
 
 test "trivial series suppress to null in both builders" {
@@ -4183,6 +4383,31 @@ test "schedule-derived series uses season phrasing" {
     try std.testing.expectEqualStrings("ATL leads season series 2-1 (game 3 of 4)", detail.series.?);
 }
 
+test "schedule-derived series reads won once the block is fully decided" {
+    // Same builder, finale completed (2-1 of 3, all with winners): the
+    // count agrees with the summary path, so the verb does too.
+    const summary =
+        \\{"header":{"competitions":[{"id":"e3","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"22","homeAway":"home","winner":false,"score":4,"team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}},{"id":"15","homeAway":"away","winner":true,"score":5,"team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}}]}]},"plays":null}
+    ;
+    const decided_sched =
+        \\{"events":[{"id":"e1","competitions":[{"competitors":[{"winner":false,"team":{"id":"22","abbreviation":"PHI"}},{"winner":true,"team":{"id":"15","abbreviation":"ATL"}}]}]},{"id":"e2","competitions":[{"competitors":[{"winner":true,"team":{"id":"22","abbreviation":"PHI"}},{"winner":false,"team":{"id":"15","abbreviation":"ATL"}}]}]},{"id":"e3","competitions":[{"competitors":[{"winner":false,"team":{"id":"22","abbreviation":"PHI"}},{"winner":true,"team":{"id":"15","abbreviation":"ATL"}}]}]}]}
+    ;
+    const decided_board =
+        \\{"events":[{"id":"e3","name":"Atlanta Braves at Philadelphia Phillies","date":"2026-09-06T17:10Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"e3","date":"2026-09-06T17:10Z","competitors":[{"homeAway":"away","score":"5","winner":true,"team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}},{"homeAway":"home","score":"4","winner":false,"team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}}]}]}]}
+    ;
+    var fake = DetailFake{
+        .summary_body = summary,
+        .board_body = decided_board,
+        .sched_a_id = "/teams/22/",
+        .sched_a_body = decided_sched,
+        .sched_b_body = decided_sched,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const detail = try detailAdapter(&fake).fetchDetail(arena_state.allocator(), core.leagues.find("mlb").?, "e3");
+    try std.testing.expectEqualStrings("ATL won season series 2-1 (game 3 of 3)", detail.series.?);
+}
+
 const nba_thin_schedule =
     \\{"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"},"events":[
     \\{"id":"401809936","date":"2025-10-22T23:30Z","competitions":[{"id":"401809936","date":"2025-10-22T23:30Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"home","winner":false,"score":{"value":116,"displayValue":"116"},"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"},"probables":[]},{"homeAway":"away","winner":true,"score":{"value":117,"displayValue":"117"},"team":{"id":"23","abbreviation":"PHI","displayName":"Philadelphia 76ers"},"probables":[]}]}]}
@@ -4193,11 +4418,12 @@ const nba_thin_teams =
     \\{"sports":[{"leagues":[{"teams":[{"team":{"id":"2","abbreviation":"BOS","displayName":"Boston Celtics"}}]}]}]}
 ;
 
-test "fetchTeam renders ESPN-thin NBA payloads without record or standing" {
+test "fetchTeam counts the record when ESPN ships no header summary" {
     // Live 2026-09-09 shape: the NBA schedule header carries no
-    // recordSummary/standingSummary and competitors carry no records, so
-    // the view builds with nulls rather than failing. ESPN-thin, not a
-    // mapping gap: there is no record field to map.
+    // recordSummary/standingSummary and competitors carry no records.
+    // The record counts from the completed games in hand (one L here)
+    // instead of leaving the header blank; the standing stays null
+    // (no upstream source for it).
     var fake = TeamFixtureState{
         .teams_body = nba_thin_teams,
         .schedule_body = nba_thin_schedule,
@@ -4206,11 +4432,108 @@ test "fetchTeam renders ESPN-thin NBA payloads without record or standing" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nba").?, "BOS");
-    try std.testing.expect(view.team.record_summary == null);
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("nba").?, "BOS", "2026-09-06");
+    try std.testing.expectEqualStrings("0-1", view.team.record_summary.?);
     try std.testing.expect(view.team.standing_summary == null);
     try std.testing.expectEqual(@as(usize, 1), view.last.len);
     try std.testing.expectEqualStrings("L 116-117", view.last[0].result);
+}
+
+test "fetchTeam counts ties and skips undecided preseason slates" {
+    // A draw counts T (soccer parity with finalResult), and a slate with
+    // no completed games yields no record rather than an invented 0-0.
+    const teams =
+        \\{"sports":[{"leagues":[{"teams":[{"team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"}}]}]}]}
+    ;
+    const schedule =
+        \\{"team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"},"events":[
+        \\{"id":"g1","date":"2026-04-15T19:00Z","competitions":[{"id":"g1","date":"2026-04-15T19:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"home","winner":false,"score":"2","team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"}},{"homeAway":"away","winner":false,"score":"2","team":{"id":"110","abbreviation":"INT","displayName":"Inter Milan"}}]}]},
+        \\{"id":"g2","date":"2026-04-22T19:00Z","competitions":[{"id":"g2","date":"2026-04-22T19:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","winner":true,"score":"3","team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"}},{"homeAway":"home","winner":false,"score":"1","team":{"id":"110","abbreviation":"INT","displayName":"Inter Milan"}}]}]},
+        \\{"id":"g3","date":"2026-09-06T19:00Z","competitions":[{"id":"g3","date":"2026-09-06T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"}},{"homeAway":"away","team":{"id":"110","abbreviation":"INT","displayName":"Inter Milan"}}]}]}
+        \\]}
+    ;
+    var fake = TeamFixtureState{
+        .teams_body = teams,
+        .schedule_body = schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ucl").?, "BAR", "2026-09-06");
+    try std.testing.expectEqualStrings("1-0-1", view.team.record_summary.?);
+    // Preseason slate (nothing completed): no record, no invention.
+    const empty_schedule =
+        \\{"team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"},"events":[
+        \\{"id":"g9","date":"2026-09-06T19:00Z","competitions":[{"id":"g9","date":"2026-09-06T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"home","team":{"id":"83","abbreviation":"BAR","displayName":"FC Barcelona"}},{"homeAway":"away","team":{"id":"110","abbreviation":"INT","displayName":"Inter Milan"}}]}]}
+        \\]}
+    ;
+    var fake2 = TeamFixtureState{
+        .teams_body = teams,
+        .schedule_body = empty_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    const bare = try fetchTeam(teamTestAdapter(&fake2), arena_state.allocator(), core.leagues.find("ucl").?, "BAR", "2026-09-06");
+    try std.testing.expect(bare.team.record_summary == null);
+}
+
+test "fetchTeam folds Conference Division to Conference, keeps divisions" {
+    // Live WNBA shape: ESPN files the conference as a division
+    // ("7th in Eastern Conference Division"); conferences are not
+    // divisions. Real divisions ("2nd in NL East") pass through.
+    const teams =
+        \\{"sports":[{"leagues":[{"teams":[{"team":{"id":"18","abbreviation":"CON","displayName":"Connecticut Sun"}}]}]}]}
+    ;
+    const schedule =
+        \\{"team":{"id":"18","abbreviation":"CON","displayName":"Connecticut Sun","recordSummary":"10-30","standingSummary":"7th in Eastern Conference Division"},"events":[]}
+    ;
+    var fake = TeamFixtureState{
+        .teams_body = teams,
+        .schedule_body = schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Empty schedule falls back to the previous season (same empty body):
+    // the header assertions below read the fallback parse, same shape.
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("wnba").?, "CON", "2026-09-06");
+    try std.testing.expectEqualStrings("10-30", view.team.record_summary.?);
+    try std.testing.expectEqualStrings("7th in Eastern Conference", view.team.standing_summary.?);
+}
+
+test "fetchTeam heads the view with the request day" {
+    // The page day rides the view: renderers tag the header with it and
+    // build the footer day-flip links from it. Dateless-equivalent day
+    // (clock ET today) flags like before and reads date_is_today.
+    var fake = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = team_fixture_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // fakeClock is 2026-09-07T00:00Z: ET today is 2026-09-06.
+    const today_view = try fetchTeam(teamTestAdapter(&fake), arena, core.leagues.find("mlb").?, "PHI", "2026-09-06");
+    try std.testing.expectEqualStrings("2026-09-06", today_view.date);
+    try std.testing.expect(today_view.date_is_today);
+    for (today_view.next) |game| try std.testing.expect(!game.today);
+    // An explicit ?date= surfaces that day's upcoming game top-center.
+    var fake2 = TeamFixtureState{
+        .teams_body = team_fixture_teams,
+        .schedule_body = team_fixture_schedule,
+        .board_body = team_fixture_board,
+        .fail_board = true,
+    };
+    const dated = try fetchTeam(teamTestAdapter(&fake2), arena, core.leagues.find("mlb").?, "PHI", "2026-09-07");
+    try std.testing.expectEqualStrings("2026-09-07", dated.date);
+    try std.testing.expect(!dated.date_is_today);
+    // live1 (2026-09-07T17:05Z, pre in the schedule) flags on its ET day.
+    try std.testing.expect(dated.next[0].today);
+    try std.testing.expect(!dated.next[1].today);
 }
 
 const ncaaf_detail_summary =
@@ -4321,7 +4644,7 @@ test "fetchTeam renders TBD for timeValid-false kickoffs" {
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU");
+    const view = try fetchTeam(teamTestAdapter(&fake), arena_state.allocator(), core.leagues.find("ncaaf").?, "OSU", "2026-09-06");
     try std.testing.expectEqual(@as(usize, 2), view.next.len);
     try std.testing.expectEqualStrings("vs ILL TBD", view.next[0].result);
     try std.testing.expectEqualStrings("at XYZ 12:00 AM", view.next[1].result);

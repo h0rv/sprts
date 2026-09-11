@@ -110,7 +110,7 @@ fn freshWindowFor(kind: Kind, data: Data) i64 {
 pub const Key = union(enum) {
     board: struct { slug: []const u8, day: []const u8, live: bool },
     detail: struct { slug: []const u8, id: []const u8, live: bool },
-    team: struct { slug: []const u8, abbr: []const u8 },
+    team: struct { slug: []const u8, abbr: []const u8, day: []const u8 },
     standings: struct { slug: []const u8 },
     teams: struct { slug: []const u8 },
 };
@@ -133,6 +133,7 @@ const KeyContext = struct {
             .team => |t| {
                 h.update(t.slug);
                 h.update(t.abbr);
+                h.update(t.day);
             },
             .standings => |s| {
                 h.update(s.slug);
@@ -149,7 +150,7 @@ const KeyContext = struct {
         return switch (a) {
             .board => |x| std.mem.eql(u8, x.slug, b.board.slug) and std.mem.eql(u8, x.day, b.board.day) and x.live == b.board.live,
             .detail => |x| std.mem.eql(u8, x.slug, b.detail.slug) and std.mem.eql(u8, x.id, b.detail.id) and x.live == b.detail.live,
-            .team => |x| std.mem.eql(u8, x.slug, b.team.slug) and std.mem.eql(u8, x.abbr, b.team.abbr),
+            .team => |x| std.mem.eql(u8, x.slug, b.team.slug) and std.mem.eql(u8, x.abbr, b.team.abbr) and std.mem.eql(u8, x.day, b.team.day),
             .standings => |x| std.mem.eql(u8, x.slug, b.standings.slug),
             .teams => |x| std.mem.eql(u8, x.slug, b.teams.slug),
         };
@@ -200,7 +201,8 @@ pub fn clone(comptime T: type, a: std.mem.Allocator, value: T) !T {
                 for (out, value) |*dst, src| dst.* = try clone(p.child, a, src);
                 return out;
             },
-            else => @compileError("clone: non-slice pointers unsupported (" ++ @typeName(T) ++ ")"),        },
+            else => @compileError("clone: non-slice pointers unsupported (" ++ @typeName(T) ++ ")"),
+        },
         .array => |arr| {
             var out: T = undefined;
             for (&out, value) |*dst, src| dst.* = try clone(arr.child, a, src);
@@ -602,7 +604,7 @@ test "team entries use the 60s fresh / 600s stale schedule windows" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const t0: i64 = 1_000_000;
-    const team_key: Key = .{ .team = .{ .slug = "mlb", .abbr = "phi" } };
+    const team_key: Key = .{ .team = .{ .slug = "mlb", .abbr = "phi", .day = "2026-09-06" } };
 
     const TeamFake = struct {
         calls: usize = 0,
@@ -674,8 +676,13 @@ test "keys are case-sensitive: callers canonicalize like the edge" {
     const upper: Key = .{ .board = .{ .slug = "MLB", .day = "2026-09-06", .live = false } };
     try std.testing.expect((try cache.getFresh(arena, upper, 1_000_000)) == null);
     // Same components in different namespaces never collide.
-    const team_key: Key = .{ .team = .{ .slug = "mlb", .abbr = "2026-09-06" } };
+    const team_key: Key = .{ .team = .{ .slug = "mlb", .abbr = "2026-09-06", .day = "2026-09-06" } };
     try std.testing.expect((try cache.getFresh(arena, team_key, 1_000_000)) == null);
+    // Same team on different days never collides: day-flip pages are
+    // different payloads, not variants.
+    const other_day: Key = .{ .team = .{ .slug = "mlb", .abbr = "2026-09-06", .day = "2026-09-07" } };
+    const ctx: KeyContext = .{};
+    try std.testing.expect(!ctx.eql(team_key, other_day));
 }
 
 test "capacity bounds the map, reaping expired entries first" {

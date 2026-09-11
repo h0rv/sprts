@@ -340,7 +340,8 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
                 return;
             };
-            const view = server_app.provider.fetchTeam(adapter, arena, league, today_route.abbr) catch |err| {
+            const day = try server_app.tz.resolveDay(arena, null, now_s, .et);
+            const view = server_app.provider.fetchTeam(adapter, arena, league, today_route.abbr, day) catch |err| {
                 if (core.isNotFound(err)) {
                     status = .not_found;
                     try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
@@ -360,6 +361,49 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
                 try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, today_route.abbr })
             else
                 try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, today_route.abbr });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
+        .team_game => |game_route| {
+            // Most-relevant-game shortcut: the live in-progress game first,
+            // else today's game (scheduled or final), else the most-recent
+            // completed game, else the team page itself — so an existing
+            // team never 404s here (unknown teams 404 like `/today`).
+            // Fresh-only, no-store, no query carried over (today-arm parity).
+            const league = core.leagues.find(game_route.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const day = try server_app.tz.resolveDay(arena, null, now_s, .et);
+            const view = server_app.provider.fetchTeam(adapter, arena, league, game_route.abbr, day) catch |err| {
+                if (core.isNotFound(err)) {
+                    status = .not_found;
+                    try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
+                    return;
+                }
+                status = .bad_gateway;
+                std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, game_route.abbr, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            const dest = if (core.schedule.findFeaturedGame(arena, view, day)) |game|
+                if (game_route.api)
+                    try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+                else
+                    try server_app.view.scheduleGameHref(arena, league.slug, game_route.abbr, game)
+            else if (game_route.api)
+                try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game_route.abbr })
+            else
+                try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game_route.abbr });
             defer arena.free(dest);
             status = .found;
             const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
@@ -560,8 +604,13 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             const slug = try core.cache.canonicalSlug(arena, league.slug);
             const abbr = try core.cache.canonicalAbbr(arena, team_route.abbr);
-            const key: server_app.native_cache.Key = .{ .team = .{ .slug = slug, .abbr = abbr } };
-            var fetch_ctx = TeamFetchCtx{ .adapter = adapter, .league = league, .abbr = team_route.abbr };
+            // Request day, ET-anchored: team renderers tag, flag, and flip
+            // in ET only (explicit ?date wins verbatim via tz.resolveDay
+            // either way). The day joins the cache key: dated pages are
+            // different payloads, not variants.
+            const day = try server_app.tz.resolveDay(arena, team_route.date, now_s, .et);
+            const key: server_app.native_cache.Key = .{ .team = .{ .slug = slug, .abbr = abbr, .day = day } };
+            var fetch_ctx = TeamFetchCtx{ .adapter = adapter, .league = league, .abbr = team_route.abbr, .day = day };
             const start = std.Io.Clock.Timestamp.now(io, .awake);
             const cached = cache.getOrFetch(arena, key, cache.now(), &fetch_ctx, fetchTeamPayload) catch |err| {
                 if (core.isNotFound(err)) {
@@ -730,8 +779,9 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .scoreboard => |r| std.fmt.allocPrint(arena, "board/{s}/{s}", .{ r.league, r.date orelse "today" }),
         .all => |r| std.fmt.allocPrint(arena, "all/{s}", .{r.date orelse "today"}),
         .game => |r| std.fmt.allocPrint(arena, "detail/{s}/{s}", .{ r.league, r.id }),
-        .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}", .{ r.league, r.abbr }),
+        .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}/{s}", .{ r.league, r.abbr, r.date orelse "today" }),
         .today => |r| std.fmt.allocPrint(arena, "today/{s}/{s}", .{ r.league, r.abbr }),
+        .team_game => |r| std.fmt.allocPrint(arena, "team-game/{s}/{s}", .{ r.league, r.abbr }),
         .date_alias => |r| std.fmt.allocPrint(arena, "date-alias/{s}/{s}", .{ r.league, r.date }),
         .week_alias => |r| std.fmt.allocPrint(arena, "week-alias/{s}/{s}", .{ r.league, r.season }),
         .date_event => |r| std.fmt.allocPrint(arena, "date-event/{s}/{s}", .{ r.league, r.date }),
@@ -752,7 +802,7 @@ fn elapsedMs(start: std.Io.Clock.Timestamp, io: std.Io) i64 {
 /// after the lookup, so they never enter the key.
 const BoardFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, day: []const u8, today: []const u8 };
 const DetailFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, id: []const u8 };
-const TeamFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, abbr: []const u8 };
+const TeamFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League, abbr: []const u8, day: []const u8 };
 const StandingsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League };
 const TeamsFetchCtx = struct { adapter: server_app.provider.EspnAdapter, league: *const core.leagues.League };
 
@@ -768,7 +818,7 @@ fn fetchDetailPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server
 
 fn fetchTeamPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {
     const c: *TeamFetchCtx = @ptrCast(@alignCast(ctx));
-    return .{ .team = try server_app.provider.fetchTeam(c.adapter, arena, c.league, c.abbr) };
+    return .{ .team = try server_app.provider.fetchTeam(c.adapter, arena, c.league, c.abbr, c.day) };
 }
 
 fn fetchStandingsPayload(ctx: *anyopaque, arena: std.mem.Allocator) anyerror!server_app.native_cache.Data {

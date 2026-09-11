@@ -1,4 +1,5 @@
 const std = @import("std");
+const dates = @import("date.zig");
 
 /// Provider-neutral per-team schedule types plus the pure helpers shared by
 /// the team stream (`/{league}/{abbr}`) and the game-detail stream.
@@ -66,6 +67,15 @@ pub const TeamView = struct {
     // window; renderers skip the sections rather than erroring.
     extra_past: []const GameRef = &.{},
     extra_next: []const GameRef = &.{},
+    /// Request day (`YYYY-MM-DD`) the page is headed with: renderers tag
+    /// the header with it and build the prev/next `?date=` day-flip links
+    /// from it. Empty on hand-built views, which keep the legacy
+    /// first-listed-game header date and no day-flip links.
+    date: []const u8 = "",
+    /// False when `date` is an explicit `?date=` day rather than today:
+    /// renderers title the flagged-day section `On M/D` instead of
+    /// `Today:`. Defaults true so legacy payloads keep reading `Today:`.
+    date_is_today: bool = true,
 
     pub const jsonschema = .{
         .name = "ScheduleTeamView",
@@ -74,6 +84,8 @@ pub const TeamView = struct {
             .schema_version = .{ .@"const" = "1" },
             .extra_past = .{ .description = "Older past games beyond the last window, newest-first; empty when none." },
             .extra_next = .{ .description = "Later upcoming games beyond the next window, chronological; empty when none." },
+            .date = .{ .description = "Request day the page is headed with (YYYY-MM-DD); empty on legacy views." },
+            .date_is_today = .{ .description = "False when date is an explicit ?date= day rather than today." },
         },
     };
 };
@@ -141,6 +153,34 @@ pub fn findTodayGame(view: TeamView) ?GameRef {
     for (view.next) |game| if (game.today) return game;
     for (view.extra_next) |game| if (game.today) return game;
     return null;
+}
+
+/// Most relevant game for `/{league}/{abbr}/game`: the live in-progress
+/// game first, else today's game (flagged upcoming rows, then finals
+/// played today, newest first), else the most-recent completed game, else
+/// null (the caller falls back to the team page itself, so an existing
+/// team never 404s). Pure scan like `findTodayGame`; `today_et` is the
+/// Eastern calendar day (`YYYY-MM-DD`).
+pub fn findFeaturedGame(arena: std.mem.Allocator, view: TeamView, today_et: []const u8) ?GameRef {
+    if (view.live) |live| return live;
+    for (view.next) |game| if (game.today) return game;
+    for (view.extra_next) |game| if (game.today) return game;
+    for (view.last) |game| if (playedOnDay(arena, game.date, today_et)) return game;
+    for (view.extra_past) |game| if (playedOnDay(arena, game.date, today_et)) return game;
+    if (view.last.len > 0) return view.last[0];
+    if (view.extra_past.len > 0) return view.extra_past[0];
+    return null;
+}
+
+/// True when an ESPN game instant falls on the given Eastern calendar
+/// day. Full timestamps shift to the Eastern day (an 8:20 PM ET kickoff
+/// reads as the next UTC day without this); date-only strings compare by
+/// prefix; unknown shapes never match.
+fn playedOnDay(arena: std.mem.Allocator, iso: []const u8, today_et: []const u8) bool {
+    const epoch = dates.parseTimestampUTC(iso) orelse return std.mem.eql(u8, datePrefix(iso), today_et);
+    const et_day = dates.todayInTz(arena, epoch, dates.etOffsetMinutes(epoch)) catch return false;
+    defer arena.free(et_day);
+    return std.mem.eql(u8, et_day, today_et);
 }
 
 fn datePrefix(date: []const u8) []const u8 {
@@ -360,4 +400,39 @@ test "findTodayGame prefers live, then flagged upcoming" {
     var bare = base;
     bare.next = &.{base.next[1]};
     try std.testing.expect(findTodayGame(bare) == null);
+}
+
+test "findFeaturedGame prefers live, today, then most-recent completed" {
+    const arena = std.testing.allocator;
+    const live = GameRef{ .id = "l", .date = "2026-09-06T19:05Z", .opponent_abbrev = "A", .opponent_name = "A", .home_away = "home", .status = "Top 7th", .state = "in", .result = "1-0 Top 7th" };
+    // 2026-09-06T23:10Z is 7:10 PM ET Sep 6: a final played today.
+    const final_today = GameRef{ .id = "ft", .date = "2026-09-06T23:10Z", .opponent_abbrev = "B", .opponent_name = "B", .home_away = "away", .status = "Final", .state = "post", .result = "W 5-3" };
+    const final_old = GameRef{ .id = "fo", .date = "2026-09-04T19:05Z", .opponent_abbrev = "C", .opponent_name = "C", .home_away = "home", .status = "Final", .state = "post", .result = "L 1-2" };
+    const upcoming_today = GameRef{ .id = "t", .date = "2026-09-07T00:30Z", .opponent_abbrev = "D", .opponent_name = "D", .home_away = "home", .status = "Scheduled", .state = "pre", .result = "vs D", .today = true };
+    const base = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .last = &.{ final_today, final_old },
+        .next = &.{upcoming_today},
+    };
+    // Live outranks everything.
+    var with_live = base;
+    with_live.live = live;
+    try std.testing.expectEqualStrings("l", findFeaturedGame(arena, with_live, "2026-09-06").?.id);
+    // Flagged upcoming outranks finals played today.
+    try std.testing.expectEqualStrings("t", findFeaturedGame(arena, base, "2026-09-06").?.id);
+    // Without flagged rows, the final played today wins over older ones.
+    var no_flag = base;
+    no_flag.next = &.{};
+    try std.testing.expectEqualStrings("ft", findFeaturedGame(arena, no_flag, "2026-09-06").?.id);
+    // On another day the most-recent completed game wins (last[0]).
+    try std.testing.expectEqualStrings("ft", findFeaturedGame(arena, no_flag, "2026-09-08").?.id);
+    // Nothing at all yields null: the caller falls back to the team page.
+    const empty = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+    };
+    try std.testing.expect(findFeaturedGame(arena, empty, "2026-09-06") == null);
 }
