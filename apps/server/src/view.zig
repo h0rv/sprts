@@ -977,6 +977,19 @@ test "team composers keep record, game, and fit semantics" {
 // home, and digest sections. Renderers own emit; composers stay plain
 // (`color = false`) so text and HTML can never drift. ---
 
+/// True when the board carries at least one game and every game is final
+/// (`state == "post"`): nothing live, nothing scheduled. Scoreboard
+/// composers render these boards as compact home-summary rows; any other
+/// board (a live/scheduled game anywhere, or no games at all) keeps the
+/// rich card form.
+pub fn boardIsAllFinal(board: domain.Scoreboard) bool {
+    if (board.games.len == 0) return false;
+    for (board.games) |game| {
+        if (!std.mem.eql(u8, game.state, "post")) return false;
+    }
+    return true;
+}
+
 /// Scoreboard heading: `{League}  {date} {zone}`. Shared by text and
 /// HTML (via the text body the linkifier post-passes).
 /// Kept out of the one-line `?0` renderers, which stay bare by design.
@@ -1069,6 +1082,25 @@ pub fn homeColumnWidths(comptime T: type, boards: []const T) struct { slug_w: us
         const board = result.board orelse continue;
         if (board.games.len == 0) continue;
         slug_w = @max(slug_w, table.textCells(result.league.slug));
+        for (board.games) |game| {
+            for (game.participants) |p| abbr_w = @max(abbr_w, table.textCells(p.abbreviation));
+        }
+    }
+    return .{ .slug_w = @min(slug_w, 10), .abbr_w = @min(abbr_w, 5) };
+}
+
+/// Page-wide compact widths for one all-final scoreboard: same floors
+/// (slug 3, abbr 2), measuring (`table.textCells`), and caps (10, 5) as
+/// `homeColumnWidths`, but over the board's own games with the board slug
+/// as the only league head. Keeps the summary rows in the same columns
+/// as the home rows.
+pub const CompactWidths = struct { slug_w: usize, abbr_w: usize };
+
+pub fn scoreboardCompactWidths(board: domain.Scoreboard) CompactWidths {
+    var slug_w: usize = 3;
+    var abbr_w: usize = 2;
+    if (board.games.len > 0) {
+        slug_w = @max(slug_w, table.textCells(board.league));
         for (board.games) |game| {
             for (game.participants) |p| abbr_w = @max(abbr_w, table.textCells(p.abbreviation));
         }
@@ -1404,4 +1436,49 @@ test "home composers keep duel, athlete, and header semantics" {
     try std.testing.expectEqualStrings("/nfl?date=2026-09-06: unavailable", down);
     _ = try std.unicode.Utf8View.init(line.?);
     _ = try std.unicode.Utf8View.init(aline.?);
+}
+
+test "all-final predicate and compact widths" {
+    const arena = std.testing.allocator;
+    const final_game: domain.Game = .{
+        .id = "1",
+        .name = "",
+        .starts_at = "2026-09-06T17:00Z",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{
+            .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+            .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+        },
+    };
+    const live_game: domain.Game = .{
+        .id = "2",
+        .name = "",
+        .starts_at = "2026-09-06T19:00Z",
+        .state = "in",
+        .status = "Top 7th",
+        .participants = &.{
+            .{ .id = "c", .name = "Second", .abbreviation = "SEC", .score = "0", .winner = false },
+            .{ .id = "d", .name = "Third", .abbreviation = "THI", .score = "3", .winner = false },
+        },
+    };
+    const all_final: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{final_game} };
+    try std.testing.expect(boardIsAllFinal(all_final));
+    const mixed: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{ final_game, live_game } };
+    try std.testing.expect(!boardIsAllFinal(mixed));
+    const empty: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    try std.testing.expect(!boardIsAllFinal(empty));
+    // Widths mirror the home floors/caps over the board's own games.
+    const widths = scoreboardCompactWidths(all_final);
+    try std.testing.expectEqual(@as(usize, 3), widths.slug_w);
+    try std.testing.expectEqual(@as(usize, 3), widths.abbr_w);
+    const wide_widths = scoreboardCompactWidths(empty);
+    try std.testing.expectEqual(@as(usize, 3), wide_widths.slug_w);
+    try std.testing.expectEqual(@as(usize, 2), wide_widths.abbr_w);
+    // The compact row composes through the home duel line.
+    const mlb = core.leagues.find("mlb").?;
+    const row = try homeGameLine(arena, mlb, final_game, widths.slug_w, widths.abbr_w);
+    defer if (row) |r| arena.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, row.?, "mlb AWY   2 @ HME   5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.?, "Final") != null);
 }
