@@ -41,6 +41,10 @@ pub const GameRoute = struct {
 pub const TeamRoute = struct {
     league: []const u8,
     abbr: []const u8,
+    /// Request day (`?date=`, strict date or relative token): the page is
+    /// headed with it and the flagged-day section + footer day-flip links
+    /// read it. Null (the default) means today.
+    date: ?[]const u8 = null,
     color: ?bool,
     width: ?u16,
     height: ?u16,
@@ -58,6 +62,19 @@ pub const TeamRoute = struct {
 /// redirect (`/api/v1/` twins stay numeric API addresses). Display flags
 /// are meaningless on a redirect and stay unset.
 pub const TodayRoute = struct {
+    league: []const u8,
+    abbr: []const u8,
+    api: bool,
+};
+
+/// Human shortcut: `/{league}/{abbr}/game` jumps to the team's most
+/// relevant game — live in-progress first, else today's game (scheduled or
+/// final), else the most-recent completed game — or falls back to the team
+/// page itself when the team has no games at all (never 404s for an
+/// existing team). Same redirect mechanics as `TodayRoute` (302,
+/// no-store, numeric id resolution, `/api/v1/` twin keeps the id).
+/// Display flags are meaningless on a redirect and stay unset.
+pub const TeamGameRoute = struct {
     league: []const u8,
     abbr: []const u8,
     api: bool,
@@ -202,6 +219,7 @@ pub const Route = union(enum) {
     team: TeamRoute,
     teams: TeamsRoute,
     today: TodayRoute,
+    team_game: TeamGameRoute,
     date_alias: DateAliasRoute,
     week_alias: WeekAliasRoute,
     date_event: DateEventRoute,
@@ -273,10 +291,12 @@ pub fn parse(target: []const u8) Route {
     else
         return .not_found;
     if (slug.len == 0) return .not_found;
-    // Human shortcut: /{league}/{abbr}/today redirects to the team's game
-    // today (team page fallback when none). Caught before the game/team
-    // split, which only sees two segments; anything deeper or different
-    // stays not_found.
+    // Human shortcuts: /{league}/{abbr}/today redirects to the team's
+    // game today (team page fallback when none); /{league}/{abbr}/game
+    // redirects to the team's most relevant game (live, today, else most
+    // recent; team page fallback, never 404 for an existing team). Caught
+    // before the game/team split, which only sees two segments; anything
+    // deeper or different stays not_found.
     if (std.mem.indexOfScalar(u8, slug, '/')) |slash| {
         const league = slug[0..slash];
         const segment = slug[slash + 1 ..];
@@ -291,6 +311,20 @@ pub fn parse(target: []const u8) Route {
                 !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
             {
                 return .{ .today = .{
+                    .league = league,
+                    .abbr = seg2,
+                    .api = api,
+                } };
+            }
+            // Most-relevant-game shortcut (see TeamGameRoute): same
+            // reserved-word guard as `today`, so no tab or help page is
+            // shadowed. A date in seg2 parses like `today` (dispatch 404s
+            // it as an unknown team); `game` is no duel or ordinal, so
+            // date-alias days still fall through below.
+            if (seg2.len > 0 and std.mem.eql(u8, seg3, "game") and
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
+            {
+                return .{ .team_game = .{
                     .league = league,
                     .abbr = seg2,
                     .api = api,
@@ -403,9 +437,16 @@ pub fn parse(target: []const u8) Route {
             .quiet = sized.quiet,
             .oneline = sized.oneline,
         } };
+        // Team day-flip (`?date=`): strict dates and relative tokens ride
+        // through verbatim (dispatch resolves them); junk is bad_date like
+        // the scoreboard. Game ids ignore the param (digits branch above),
+        // so validation lives on the team path only.
+        const team_day = queryValue(query, "date");
+        if (team_day) |value| if (!dates.validate(value) and !dates.isRelativeToken(value)) return .bad_date;
         return .{ .team = .{
             .league = league,
             .abbr = segment,
+            .date = team_day,
             .color = sized.color,
             .width = sized.width,
             .height = sized.height,
@@ -998,6 +1039,52 @@ test "second segment splits game ids from team abbrevs" {
     try std.testing.expect(parse("//phi") == .not_found);
 }
 
+test "team route carries the day-flip date" {
+    // Dateless team pages are unchanged (null day).
+    try std.testing.expect(parse("/mlb/phi").team.date == null);
+    const dated = parse("/mlb/phi?date=2026-09-05").team;
+    try std.testing.expectEqualStrings("2026-09-05", dated.date.?);
+    try std.testing.expectEqualStrings("phi", dated.abbr);
+    // Relative tokens ride verbatim like the scoreboard; the API twin
+    // parses the same way.
+    try std.testing.expectEqualStrings("today", parse("/mlb/phi?date=today").team.date.?);
+    try std.testing.expectEqualStrings("tomorrow", parse("/api/v1/mlb/phi?date=tomorrow").team.date.?);
+    // Date composes with the display params.
+    const composed = parse("/mlb/phi?date=2026-09-05&width=90").team;
+    try std.testing.expectEqualStrings("2026-09-05", composed.date.?);
+    try std.testing.expect(composed.width.? == 90);
+    // Junk dates miss exactly like the scoreboard.
+    try std.testing.expect(parse("/mlb/phi?date=2026-13-40") == .bad_date);
+    try std.testing.expect(parse("/mlb/phi?date=Tomorrow") == .bad_date);
+    try std.testing.expect(parse("/api/v1/mlb/phi?date=nope") == .bad_date);
+    // Game ids keep ignoring the param (digits branch, no validation).
+    try std.testing.expect(parse("/mlb/401816828?date=nope") == .game);
+}
+
+test "game shortcut parses team scope with address family" {
+    const short = parse("/mlb/PHI/game").team_game;
+    try std.testing.expectEqualStrings("mlb", short.league);
+    try std.testing.expectEqualStrings("PHI", short.abbr);
+    try std.testing.expect(!short.api);
+    const api = parse("/api/v1/mlb/PHI/game").team_game;
+    try std.testing.expect(api.api);
+    try std.testing.expectEqualStrings("PHI", api.abbr);
+    // Deeper paths, wrong tails, and reserved words stay not_found.
+    try std.testing.expect(parse("/mlb/PHI/game/x") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/GAME") == .not_found);
+    try std.testing.expect(parse("/mlb//game") == .not_found);
+    try std.testing.expect(parse("/mlb/help/game") == .not_found);
+    try std.testing.expect(parse("/mlb/standings/game") == .not_found);
+    try std.testing.expect(parse("/mlb/teams/game") == .not_found);
+    try std.testing.expect(parse("/mlb/tour/game") == .not_found);
+    // A date in the middle is not a reserved word: like `/today` it parses
+    // (dispatch 404s it as an unknown team).
+    try std.testing.expect(parse("/mlb/2026-09-09/game") == .team_game);
+    // The today shortcut is untouched by its sibling.
+    try std.testing.expect(parse("/mlb/PHI/today") == .today);
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/game?color=0").team_game.abbr);
+}
+
 test "today shortcut parses team scope with address family" {
     const short = parse("/mlb/PHI/today").today;
     try std.testing.expectEqualStrings("mlb", short.league);
@@ -1400,6 +1487,7 @@ test "art kill-switch parses off case-insensitively, anything else is on" {
     try std.testing.expect(composed.color.? == false);
     // Redirects and mark-free pages carry no art flag.
     try std.testing.expect(@TypeOf(parse("/mlb/PHI/today").today) == TodayRoute);
+    try std.testing.expect(@TypeOf(parse("/mlb/PHI/game").team_game) == TeamGameRoute);
     try std.testing.expect(@TypeOf(parse("/").home) == HomeRoute);
 }
 

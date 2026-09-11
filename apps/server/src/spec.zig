@@ -210,12 +210,12 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  GET /api/v1/all - Scores for all leagues and date. params: date=YYYY-MM-DD. degraded lists outage slugs. (getAll)\n" ++
             "  GET /api/v1/league - Scores for one league and date. params: date=YYYY-MM-DD, week=N football-only, seasontype=T football-only with week. (getScoreboard)\n" ++
             "  GET /api/v1/league/id - One game with linescore and scoring plays. id digits only (legacy numeric address, still resolves). Game and detail JSON carry the additive slug day-unique human id next to id. network names the TV broadcaster when ESPN supplies one. (getGame)\n" ++
-            "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. (getTeam)\n" ++
+            "  GET /api/v1/league/abbr - One team: last result, live game, upcoming schedule. params: date=YYYY-MM-DD heads the page with that day (prev/next flip days). (getTeam)\n" ++
             "  GET /api/v1/league/standings - Current standings table for one league. (getStandings)\n" ++
             "  GET /api/v1/league/teams - Team list: id, abbrev, name per team. JSON-only, same body on the human path. (listTeams)\n" ++
             "\n" ++
             "NETWORK\n" ++
-            "  Scoreboard games and game detail carry network when ESPN lists broadcasts (first broadcasts[].names entry, geo-feed fallback); null/absent otherwise.\n" ++
+            "  Scoreboard games and game detail carry network when ESPN lists broadcasts (first broadcasts[].names entry, geo-feed fallback); null/absent otherwise. Ticket vendors (Fandango etc.) and blanks never count as networks.\n" ++
             "\n" ++
             "DIGITS RULE\n" ++
             "  Game links everywhere use the human slug: /{league}/{date}/{slug} (duel {away}-{home}[-N], else event-N), e.g. /mlb/2026-09-09/min-det.\n" ++
@@ -228,6 +228,8 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  /{league}/YYYY-MM-DD/event[-N] Nth game on the day board: /ufc/2026-09-05/event-14 (bare event = 1; every game: bouts, sessions, fields, name-only duels)\n" ++
             "  /{league}/YYYY/weekN/{away}-{home}[-N] football-only week game: /nfl/2026/week1/ne-sea\n" ++
             "  /{league}/YYYY/weekN/event[-N] Nth game of the football week: /nfl/2026/week1/event-3\n" ++
+            "  /{league}/{abbr}/today today's game, 302 to it (team page fallback; curl -L)\n" ++
+            "  /{league}/{abbr}/game most relevant game (live, today, else most recent), 302 to it (team page fallback, never 404; curl -L)\n" ++
             "  duel-only: no abbr pair matches cards, races, tournaments, or name-only duels - those use event-N; that 404 names the ordinal form plus the day board\n" ++
             "\n" ++
             "TEXT HTML JSON\n" ++
@@ -236,7 +238,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  JSON: curl localhost:8080/api/v1/mlb\n" ++
             "\n" ++
             "FLAGS text and HTML only, JSON ignores display flags\n" ++
-            "  ?date=YYYY-MM-DD scoreboard day, default today in ET (today/tomorrow/yesterday also work)\n" ++
+            "  ?date=YYYY-MM-DD scoreboard day, default today in ET (today/tomorrow/yesterday also work; team pages too: /{league}/{abbr}?date=YYYY-MM-DD flips days)\n" ++
             "  ?week=N football-only week selector, ignored elsewhere\n" ++
             "  ?seasontype=T football-only season type with ?week=N (1=preseason, 2=regular, 3=postseason), ignored elsewhere\n" ++
             "  ?color=0 color off, ?color=1 color on\n" ++
@@ -275,6 +277,7 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl -L localhost:8080/ufc/2026-09-05/event-14\n" ++
             "  curl -L localhost:8080/nfl/2026/week1/ne-sea\n" ++
             "  curl -L localhost:8080/mlb/PHI/today\n" ++
+            "  curl -L localhost:8080/mlb/PHI/game\n" ++
             "  curl localhost:8080/openapi.json\n" ++
             "\n" ++
             "LEAGUES\n" ++

@@ -26,6 +26,10 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    // Flagged-day section title (`Today:` on today's page, `On M/D:` on
+    // an explicit `?date=` page).
+    const day_title = try flaggedTitle(allocator, view);
+    defer allocator.free(day_title);
     // Team logo mark above the header when the generator has one: raw
     // braille lines, no box, no padding (color sidecar when asked).
     const art_mark = if (art) core.art.teamArt(view.league, view.team.abbrev, .xs) else null;
@@ -72,7 +76,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
         if (!game.today) continue;
         if (!today_open) {
             try w.writeByte('\n');
-            try table.writeLine(w, "Today:", cols, null, color);
+            try table.writeLine(w, day_title, cols, null, color);
             today_open = true;
         }
         try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
@@ -81,7 +85,7 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
         if (!game.today) continue;
         if (!today_open) {
             try w.writeByte('\n');
-            try table.writeLine(w, "Today:", cols, null, color);
+            try table.writeLine(w, day_title, cols, null, color);
             today_open = true;
         }
         try writeTeamGameFull(allocator, w, view.league, view.team.abbrev, game, cols, color);
@@ -160,11 +164,18 @@ pub fn renderTextArt(allocator: std.mem.Allocator, view: schedule.TeamView, colo
         try w.writeByte('\n');
         try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
-    // Back link plus a query-param expansion link whenever overflow rows
-    // stay hidden (replaces the old Earlier/Later sections: previous and
-    // next history stay one click away without the wall of rows).
+    // Back link plus day-flip prev/next `?date=` links (dated pages only;
+    // legacy views keep the bare back-link), plus a query-param expansion
+    // link whenever overflow rows stay hidden (replaces the old
+    // Earlier/Later sections: previous and next history stay one click
+    // away without the wall of rows).
     try w.writeByte('\n');
     try w.print("/{s}\n", .{view.league});
+    if (teamNavDates(allocator, view.date)) |nav| {
+        defer allocator.free(nav.prev);
+        defer allocator.free(nav.next);
+        try w.print("/{s}/{s}?date={s}    /{s}/{s}?date={s}\n", .{ view.league, view.team.abbrev, nav.prev, view.league, view.team.abbrev, nav.next });
+    }
     {
         const shown_past_extra = @min(view.extra_past.len, height orelse 0);
         const shown_next_extra = @min(view.extra_next.len, height orelse 0);
@@ -204,6 +215,10 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    // Flagged-day section title (`Today:` on today's page, `On M/D:` on
+    // an explicit `?date=` page).
+    const day_title = try flaggedTitle(allocator, view);
+    defer allocator.free(day_title);
     const title = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ view.team.name, view.team.abbrev });
     defer allocator.free(title);
     try render.pageHead(w, title);
@@ -254,7 +269,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
         if (!game.today) continue;
         if (!today_open) {
             try w.writeByte('\n');
-            try render.writeHtmlLine(w, allocator, "Today:", cols, null, null);
+            try render.writeHtmlLine(w, allocator, day_title, cols, null, null);
             today_open = true;
         }
         try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
@@ -263,7 +278,7 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
         if (!game.today) continue;
         if (!today_open) {
             try w.writeByte('\n');
-            try render.writeHtmlLine(w, allocator, "Today:", cols, null, null);
+            try render.writeHtmlLine(w, allocator, day_title, cols, null, null);
             today_open = true;
         }
         try writeTeamGameFullHtml(allocator, w, league_slug, view.team.abbrev, game, null, cols);
@@ -347,6 +362,15 @@ pub fn teamHtmlArt(allocator: std.mem.Allocator, view: schedule.TeamView, league
     // inside Last/Next above, and the footer query link below reaches
     // anything still hidden.
     try w.writeAll("</pre><nav>");
+    // Day-flip prev/next `?date=` links (dated pages only; legacy views
+    // keep the bare scores/json nav), mirroring the scoreboard nav.
+    if (teamNavDates(allocator, view.date)) |nav| {
+        defer allocator.free(nav.prev);
+        defer allocator.free(nav.next);
+        try w.print("<a href=\"/{s}/{s}?date={s}\">earlier</a>", .{ league_slug, view.team.abbrev, nav.prev });
+        try w.print("<a href=\"/{s}/{s}\">today</a>", .{ league_slug, view.team.abbrev });
+        try w.print("<a href=\"/{s}/{s}?date={s}\">later</a>", .{ league_slug, view.team.abbrev, nav.next });
+    }
     try w.print("<a href=\"/{s}\">scores</a>", .{league_slug});
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ league_slug, view.team.abbrev });
     {
@@ -414,6 +438,26 @@ fn escapeByte(w: *std.Io.Writer, b: u8) !void {
         '\'' => try w.writeAll("&#39;"),
         else => try w.writeByte(b),
     }
+}
+
+/// Flagged-day section title: `Today:` on today's page, `On M/D:` on an
+/// explicit `?date=` page so a flipped day never mislabels its games.
+fn flaggedTitle(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
+    if (view.date_is_today) return allocator.dupe(u8, "Today:");
+    const short = if (view.date.len >= 10) vd.shortDate(view.date) else view.date;
+    return std.fmt.allocPrint(allocator, "On {s}:", .{short});
+}
+
+/// Prev/next page days for the footer day-flip links, via the same
+/// `core.date.shift` the scoreboard footers use. Null when the view
+/// carries no page day (legacy views) or the day won't shift, so those
+/// pages keep their bare back-link with no links invented.
+fn teamNavDates(allocator: std.mem.Allocator, day: []const u8) ?struct { prev: []u8, next: []u8 } {
+    if (day.len == 0) return null;
+    const prev = core.date.shift(allocator, day, -1) catch return null;
+    errdefer allocator.free(prev);
+    const next = core.date.shift(allocator, day, 1) catch return null;
+    return .{ .prev = prev, .next = next };
 }
 
 /// JSON view. Validated through the shared `render.validatedJson` gate —
@@ -685,11 +729,11 @@ fn zoneDayFor(view: schedule.TeamView) ?[]const u8 {
 }
 
 // one-line: `M/D ZONE` header tag via `tz.labelFor` (ET default), or "" when dateless.
-// The hook day is an ESPN UTC instant; shift to the Eastern calendar day
-// first so evening games tag the day they were played, not the next UTC
-// morning (same shift as `gameLine`).
+// The hook day is the request day when the provider set one (the `?date=`
+// page day, today by default); legacy views without a day fall back to the
+// first-listed-game instant so their headers read exactly as before.
 fn zoneTag(allocator: std.mem.Allocator, view: schedule.TeamView) ![]u8 {
-    const day = zoneDayFor(view) orelse return allocator.dupe(u8, "");
+    const day = if (view.date.len > 0) view.date else zoneDayFor(view) orelse return allocator.dupe(u8, "");
     const et = try vd.gameDay(allocator, day);
     defer allocator.free(et);
     return tz.labelFor(allocator, et, .et);
@@ -774,6 +818,44 @@ test "team box headers carry the zone label" {
     defer std.testing.allocator.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "9/7 ET") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+}
+
+test "dated team pages head with the request day and flip days" {
+    // The header tags the request day (not the first-listed game), the
+    // flagged section reads `On M/D:` (never a stale `Today:`), and the
+    // footer carries prev/next `?date=` links in both formats.
+    var view = testView();
+    view.date = "2026-09-05";
+    view.date_is_today = false;
+    var next = [_]schedule.GameRef{ view.next[0], view.next[1] };
+    next[0].today = true;
+    view.next = &next;
+    const text = try renderText(std.testing.allocator, view, false, null, null);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Philadelphia Phillies (PHI)  9/5 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "9/7 ET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "On 09-05:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Today:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/mlb/PHI?date=2026-09-04    /mlb/PHI?date=2026-09-06") != null);
+    _ = try std.unicode.Utf8View.init(text);
+    const page = try teamHtml(std.testing.allocator, view, "mlb", null, null);
+    defer std.testing.allocator.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "9/5 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "On 09-05:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI?date=2026-09-04\">earlier</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI\">today</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/PHI?date=2026-09-06\">later</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    // Legacy views (no page day) keep the bare back-link: no day-flip
+    // links invented, `Today:` title intact.
+    const bare = try renderText(std.testing.allocator, testView(), false, null, null);
+    defer std.testing.allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "?date=") == null);
+    const bare_page = try teamHtml(std.testing.allocator, testView(), "mlb", null, null);
+    defer std.testing.allocator.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "earlier</a>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "later</a>") == null);
 }
 // depth: full-season overflow sections (appended; existing tests above untouched).
 fn depthOverflowView() schedule.TeamView {
