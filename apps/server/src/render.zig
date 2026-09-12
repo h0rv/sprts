@@ -3849,6 +3849,217 @@ test "dated home matches today render when every league played" {
     _ = try std.unicode.Utf8View.init(dated_html);
 }
 
+test "dated home parity holds for all-final past and scheduled future days" {
+    // Layout lock for the two shapes the live/mixed byte-parity test never
+    // exercises: a past day of nothing but finals and a future day of
+    // nothing but scheduled games. Recap content differs from today by
+    // data only — the dated flag must not change spelling: same heading,
+    // same nav, same footer, same row composer (`homeGameLine`), same
+    // team links, same game hrefs, same span styles, and never logos or
+    // marks (home rows never call `writeGameMarks`). Raw-HTML assertions
+    // throughout: `expectVisibleParity` strips tags, so href/class drift
+    // would pass unnoticed there.
+    const arena = std.testing.allocator;
+
+    // Past: every game final.
+    const past_mlb: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "awy-hme",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const past_nba: domain.Scoreboard = .{
+        .league = "nba",
+        .league_name = "NBA",
+        .date = "2025-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "2",
+                .slug = "bos-lal",
+                .name = "Boston at LA",
+                .starts_at = "2025-09-10T19:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "c", .name = "Boston Celtics", .abbreviation = "BOS", .score = "112", .winner = true, .home_away = "away" },
+                    .{ .id = "d", .name = "Los Angeles Lakers", .abbreviation = "LAL", .score = "108", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const past_results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = past_mlb },
+        .{ .league = core.leagues.find("nba").?, .board = past_nba },
+    };
+    const past_dated = try homeLive(arena, false, "example.test", &past_results, "2025-09-10", false, true);
+    defer arena.free(past_dated);
+    const past_today = try homeLive(arena, false, "example.test", &past_results, "2025-09-10", false, false);
+    defer arena.free(past_today);
+    try std.testing.expectEqualStrings(past_today, past_dated);
+    // Same heading shape, same nav under it, same footer.
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "sprts  2025-09-10 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "/all?date=2025-09-09    /all?date=2025-09-11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "MLB  09-10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "NBA  09-10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "example.test/mlb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, "example.test/docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated, repo_url) != null);
+    _ = try std.unicode.Utf8View.init(past_dated);
+
+    const past_dated_html = try homeHtmlLive(arena, "example.test", &past_results, "2025-09-10", false, true);
+    defer arena.free(past_dated_html);
+    const past_today_html = try homeHtmlLive(arena, "example.test", &past_results, "2025-09-10", false, false);
+    defer arena.free(past_today_html);
+    try std.testing.expectEqualStrings(past_today_html, past_dated_html);
+    // Same game hrefs and team links as the today view, raw.
+    for ([_][]const u8{
+        "<a href=\"/mlb/2025-09-10/awy-hme\">",
+        "<a href=\"/mlb/AWY\">AWY</a>",
+        "<a href=\"/mlb/HME\">HME</a>",
+        "<a href=\"/nba/2025-09-10/bos-lal\">",
+        "<a href=\"/nba/BOS\">BOS</a>",
+        "<a href=\"/nba/LAL\">LAL</a>",
+    }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, past_dated_html, token) != null);
+    }
+    // Home rows carry no scoreboard anchor ids; finals carry no
+    // live/upcoming color spans (headers keep their dim spans).
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "id=\"game-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "class=\"live\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "class=\"upcoming\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "class=\"dim\"") != null);
+    // Never logos or marks on home rows: no braille, no rgb spans.
+    try std.testing.expect(!containsBraille(past_dated_html));
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "rgb(") == null);
+    // Nav and footer ride the dated page too.
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "<a href=\"/all?date=2025-09-09\">/all?date=2025-09-09</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "<a href=\"/all?date=2025-09-11\">/all?date=2025-09-11</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "<a href=\"/docs\">docs</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "<a href=\"/openapi.json\">spec</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, repo_url) != null);
+    // Logo stack (`<main>` .. `<pre>`) matches the today render byte for
+    // byte: dated pages share the same composer, no extra blank row.
+    {
+        const d_main = std.mem.indexOf(u8, past_dated_html, "<main>").?;
+        const d_pre = std.mem.indexOf(u8, past_dated_html, "<pre>").?;
+        const t_main = std.mem.indexOf(u8, past_today_html, "<main>").?;
+        const t_pre = std.mem.indexOf(u8, past_today_html, "<pre>").?;
+        try std.testing.expectEqualStrings(past_today_html[t_main .. t_pre + "<pre>".len], past_dated_html[d_main .. d_pre + "<pre>".len]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, past_dated_html, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(past_dated_html);
+
+    // Future: every game scheduled.
+    const future_mlb: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-10-05",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "3",
+                .slug = "nyy-bos",
+                .name = "New York at Boston",
+                .starts_at = "2026-10-05T17:00Z",
+                .state = "pre",
+                .status = "7:05 PM ET",
+                .participants = &.{
+                    .{ .id = "e", .name = "New York Yankees", .abbreviation = "NYY", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "f", .name = "Boston Red Sox", .abbreviation = "BOS", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const future_nba: domain.Scoreboard = .{
+        .league = "nba",
+        .league_name = "NBA",
+        .date = "2026-10-05",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "4",
+                .slug = "chi-det",
+                .name = "Chicago at Detroit",
+                .starts_at = "2026-10-05T19:00Z",
+                .state = "pre",
+                .status = "8:05 PM ET",
+                .participants = &.{
+                    .{ .id = "g", .name = "Chicago Bulls", .abbreviation = "CHI", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Detroit Pistons", .abbreviation = "DET", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const future_results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = future_mlb },
+        .{ .league = core.leagues.find("nba").?, .board = future_nba },
+    };
+    const future_dated = try homeLive(arena, false, "example.test", &future_results, "2026-10-05", false, true);
+    defer arena.free(future_dated);
+    const future_today = try homeLive(arena, false, "example.test", &future_results, "2026-10-05", false, false);
+    defer arena.free(future_today);
+    try std.testing.expectEqualStrings(future_today, future_dated);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, "sprts  2026-10-05 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, "/all?date=2026-10-04    /all?date=2026-10-06") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, "MLB  10-05") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, "NBA  10-05") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, "example.test/mlb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated, repo_url) != null);
+    _ = try std.unicode.Utf8View.init(future_dated);
+
+    const future_dated_html = try homeHtmlLive(arena, "example.test", &future_results, "2026-10-05", false, true);
+    defer arena.free(future_dated_html);
+    const future_today_html = try homeHtmlLive(arena, "example.test", &future_results, "2026-10-05", false, false);
+    defer arena.free(future_today_html);
+    try std.testing.expectEqualStrings(future_today_html, future_dated_html);
+    for ([_][]const u8{
+        "<a href=\"/mlb/2026-10-05/nyy-bos\">",
+        "<a href=\"/mlb/NYY\">NYY</a>",
+        "<a href=\"/mlb/BOS\">BOS</a>",
+        "<a href=\"/nba/2026-10-05/chi-det\">",
+        "<a href=\"/nba/CHI\">CHI</a>",
+        "<a href=\"/nba/DET\">DET</a>",
+    }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, future_dated_html, token) != null);
+    }
+    // Scheduled rows keep the upcoming color span (the linkifier +
+    // `statusCssClass` path runs identically when dated); still no live
+    // spans, no scoreboard anchor ids, and never marks.
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "<span class=\"upcoming\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "class=\"live\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "id=\"game-") == null);
+    try std.testing.expect(!containsBraille(future_dated_html));
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "<a href=\"/all?date=2026-10-04\">/all?date=2026-10-04</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "<a href=\"/all?date=2026-10-06\">/all?date=2026-10-06</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "<a href=\"/docs\">docs</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, repo_url) != null);
+    {
+        const d_main = std.mem.indexOf(u8, future_dated_html, "<main>").?;
+        const d_pre = std.mem.indexOf(u8, future_dated_html, "<pre>").?;
+        const t_main = std.mem.indexOf(u8, future_today_html, "<main>").?;
+        const t_pre = std.mem.indexOf(u8, future_today_html, "<pre>").?;
+        try std.testing.expectEqualStrings(future_today_html[t_main .. t_pre + "<pre>".len], future_dated_html[d_main .. d_pre + "<pre>".len]);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, future_dated_html, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(future_dated_html);
+}
+
 test "past scoreboard keeps records, winner colors, marks, and links" {
     // Content contract for past dates: a mixed board from last season
     // renders the full today treatment for its final game — records,

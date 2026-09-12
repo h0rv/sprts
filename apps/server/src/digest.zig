@@ -21,6 +21,7 @@
 const std = @import("std");
 const core = @import("sprts_core");
 const render = @import("render.zig");
+const table = @import("table.zig");
 const view = @import("view.zig");
 const tz = @import("tz.zig");
 
@@ -67,6 +68,18 @@ pub const DigestJson = struct {
 /// scheduled` noise — while missing boards (upstream failure) keep their
 /// `unavailable` degraded markers and the JSON `degraded` list (see
 /// `DigestJson`) still tells outage apart from off-day.
+///
+/// When `dated` the sections stop concatenating scoreboard cards and reuse
+/// the home recap shape instead (see `datedText`): same row composer,
+/// same widths, same heading/nav spelling as the dated home, so a past
+/// `/all?date=` reads as the same exact recap view.
+///
+/// Delegate, not a 302 to `/?date=`: the redirect is byte-identical for
+/// text/HTML/?0 but drops dated digest JSON — `/api/v1/all?date=` carries
+/// per-day scoreboards plus the `degraded` outage list (see `DigestJson`),
+/// while `/?date=` and `/api/v1/` serve the bare league list (see
+/// `render.leaguesJson`), so JSON clients would lose every score. The
+/// delegate keeps all three formats on one route with no extra hop.
 pub fn textWithZoneArt(
     allocator: std.mem.Allocator,
     sections: []const DigestSection,
@@ -80,6 +93,10 @@ pub fn textWithZoneArt(
     dated: bool,
 ) ![]u8 {
     const per_league = height orelse default_games_per_league;
+    // Dated past view delegates to the home-shaped composer (rows, widths,
+    // heading, and nav all match the dated home); `width`/`art` are no-ops
+    // there (home is fixed 50 columns and never carries marks).
+    if (dated) return datedText(allocator, sections, day, color, per_league, quiet, zone);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -150,6 +167,110 @@ pub fn text(
     return textWithZone(allocator, sections, day, color, width, height, quiet, .et, dated);
 }
 
+/// Dated digest text: the explicit-`?date` past view reads as the same
+/// recap as the dated home. Section bodies delegate to the home row
+/// composer (`view.homeGameLine` over page-wide `view.homeColumnWidths`,
+/// emitted with `view.statusAnsi` like the home emitter), so rows carry no
+/// marks, no TV lines, no records, and no `game:` pointers — whatever the
+/// board mix, even all-final past boards that already took the compact
+/// branch. The heading and top nav use the home spelling (`sprts  {day}
+/// {zone}`, `/all?date=` prev/next plus the separator), so the per-league
+/// `/{slug}?date=` footers vanish with the scoreboard cards.
+///
+/// Intentional differences from the dated home (kept, not drift):
+/// - one bounded section per league in digest order with the `+N more`
+///   pointer (the digest display bound; home shows every game and regroups
+///   live games under `LIVE NOW`, which the digest never emits);
+/// - null boards keep the `/<slug>?date=<day>: unavailable` degraded
+///   marker inline instead of home's `ALL LEAGUES` idle regrouping (the
+///   outage signal; off-day empties are still skipped entirely);
+/// - the footer stays `more: /<league>?date=<day>`: the digest signature
+///   carries no host, so home's `Try:/Docs:/Code:` footer cannot render;
+/// - no wordmark banner (the `/` home chrome above its heading).
+fn datedText(
+    allocator: std.mem.Allocator,
+    sections: []const DigestSection,
+    day: []const u8,
+    color: bool,
+    per_league: u16,
+    quiet: bool,
+    zone: tz.Zone,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    if (!quiet) {
+        const tag = try tz.zoneTag(allocator, zone);
+        defer allocator.free(tag);
+        // Home heading spelling (`sprts  {day} {zone}`), same dim gating.
+        const heading = try std.fmt.allocPrint(allocator, "sprts  {s} {s}", .{ day, tag });
+        defer allocator.free(heading);
+        if (color) try w.print("\x1b[2m{s}\x1b[0m\n", .{heading}) else try w.print("{s}\n", .{heading});
+    }
+    // Date nav sits directly under the heading (and tops quiet mode, which
+    // drops the heading): the home spelling, unconditional like home's.
+    if (try datedNavDates(allocator, day)) |nav| {
+        defer allocator.free(nav.prev);
+        defer allocator.free(nav.next);
+        try w.print("/all?date={s}    /all?date={s}\n", .{ nav.prev, nav.next });
+    }
+    try table.writeSeparator(w, 50);
+    // Page-wide widths like the home page so rows align down the whole
+    // digest exactly as they do down the home.
+    const widths = view.homeColumnWidths(DigestSection, sections);
+    var emitted = false;
+    for (sections) |section| {
+        const board = section.board orelse {
+            const marker = try view.digestUnavailable(allocator, section.league.slug, day);
+            defer allocator.free(marker);
+            try w.print("{s}\n", .{marker});
+            emitted = true;
+            continue;
+        };
+        // Answered-but-empty is an off-day: skip the section entirely.
+        if (board.games.len == 0) continue;
+        const capped = @min(per_league, board.games.len);
+        if (emitted) try w.writeByte('\n');
+        emitted = true;
+        const header = try view.homeLeagueHeader(allocator, section.league.name, day);
+        defer allocator.free(header);
+        try table.writeLine(w, header, 50, "2", color);
+        for (board.games[0..capped]) |game| {
+            // Nothing to show falls back to no row, like the home emitter.
+            const line = try view.homeGameLine(allocator, section.league, game, widths.slug_w, widths.abbr_w) orelse continue;
+            defer allocator.free(line);
+            try table.writeLine(w, line, 50, view.statusAnsi(game.state), color);
+        }
+        if (capped < board.games.len) {
+            try w.print("+{d} more -> /{s}?date={s}\n", .{ board.games.len - capped, board.league, day });
+        }
+    }
+    // Blank air before the footer, like the home page.
+    try w.writeByte('\n');
+    if (!quiet) try w.writeAll("more: /<league>?date=<day>\n");
+    return out.toOwnedSlice();
+}
+
+/// Prev/next dates for a dated digest day, via the same `core.date.shift`
+/// the scoreboard footer and the home nav use. Null unless `day` is a
+/// strict calendar date: serve paths resolve relative tokens first, so
+/// renderers see strict days in practice; hostile text renders no nav
+/// instead of failing the page (the home `homeNavDates` precedent).
+fn datedNavDates(allocator: std.mem.Allocator, day: []const u8) !?struct { prev: []u8, next: []u8 } {
+    if (!core.date.validate(day)) return null;
+    const prev = try core.date.shift(allocator, day, -1);
+    errdefer allocator.free(prev);
+    const next = try core.date.shift(allocator, day, 1);
+    return .{ .prev = prev, .next = next };
+}
+
+/// Per-league dated link for digest HTML headers: `/{slug}?date={day}`,
+/// the home league-href spelling (the home helper is private to render,
+/// so the one line is repeated here instead of drifting).
+fn datedLeagueHref(allocator: std.mem.Allocator, slug: []const u8, day: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ slug, day });
+}
+
 /// JSON digest: one `domain.Scoreboard` per league in `core.leagues.all`
 /// order; missing boards become zero-game boards so the league set is
 /// stable, and their slugs land in `DigestJson.degraded` (see `json`).
@@ -215,8 +336,19 @@ fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) 
 /// as scoreboards. Digest-level lines (outage markers, `+N more`
 /// pointers) escape as plain text; only invisible tags are added, so the
 /// `<pre>` visible text matches the quiet text digest byte for byte.
+///
+/// When `dated` the page reuses the home recap shape instead (see
+/// `datedHtml`): section bodies link like the home rows (sibling game +
+/// team anchors, live/upcoming spans, no `id="game-"` anchors, no art
+/// spans), and the title/nav use the home spelling — so a past
+/// `/all?date=` reads as the same exact recap view as the dated home.
 pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, zone: tz.Zone, art: bool, dated: bool) ![]u8 {
     const per_league = height orelse default_games_per_league;
+    // Dated past view delegates to the home-shaped composer (rows, links,
+    // title, and nav all match the dated home); `width`/`zone`/`art` are
+    // no-ops there (home HTML is fixed 50 columns, carries no zone in its
+    // title, and never renders marks).
+    if (dated) return datedHtml(allocator, sections, day, per_league);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -293,6 +425,216 @@ pub fn htmlWithZone(allocator: std.mem.Allocator, sections: []const DigestSectio
 /// ET-default wrapper for `htmlWithZone` (`dated=false`: today view).
 pub fn html(allocator: std.mem.Allocator, sections: []const DigestSection, day: []const u8, width: ?u16, height: ?u16, quiet: bool, dated: bool) ![]u8 {
     return htmlWithZone(allocator, sections, day, width, height, quiet, .et, dated);
+}
+
+/// Dated digest HTML: the explicit-`?date` past view links like the dated
+/// home. Game rows split into sibling anchors — every non-team chunk links
+/// the game view, each participant abbreviation links its team page — with
+/// the live/upcoming color span wrapping the siblings, exactly the home
+/// link shape (see `writeDatedHomeGameCell`). No `id="game-"` anchors (the
+/// scoreboard linkifier's shape; home has none), no art rows, so no
+/// braille, `rgb(`, or ANSI bytes reach the page by construction. Headers
+/// link their league page with the dim span, like home headers. The title
+/// and top nav use the home spelling (`sprts  {day}`, `/all?date=`
+/// prev/next twins).
+///
+/// The `<pre>` visible text matches the quiet dated text digest byte for
+/// byte (same lines, same order, including the top separator and the
+/// blank air): the separator rides as plain text — `─` needs no escaping
+/// — and only invisible tags are added. Intentional differences from the
+/// dated home HTML (kept, not drift): per-league digest order with the
+/// `+N more` pointer (no `LIVE NOW` regrouping, no `ALL LEAGUES` block —
+/// outage markers stay inline), and the digest `all`/`json` nav (the
+/// digest route identity; the host-dependent home footer text cannot
+/// render without a host in the digest signature).
+fn datedHtml(
+    allocator: std.mem.Allocator,
+    sections: []const DigestSection,
+    day: []const u8,
+    per_league: u16,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const title = try std.fmt.allocPrint(allocator, "sprts  {s}", .{day});
+    defer allocator.free(title);
+    try render.pageHead(w, title);
+    // HTML twin of the dated text nav: byte-identical visible text, each
+    // half its own link (the home nav-HTML shape).
+    if (try datedNavDates(allocator, day)) |nav| {
+        defer allocator.free(nav.prev);
+        defer allocator.free(nav.next);
+        const prev_href = try std.fmt.allocPrint(allocator, "/all?date={s}", .{nav.prev});
+        defer allocator.free(prev_href);
+        const next_href = try std.fmt.allocPrint(allocator, "/all?date={s}", .{nav.next});
+        defer allocator.free(next_href);
+        try w.writeAll("<a href=\"");
+        try render.escapeInto(w, prev_href);
+        try w.writeAll("\">");
+        try render.escapeInto(w, prev_href);
+        try w.writeAll("</a>    <a href=\"");
+        try render.escapeInto(w, next_href);
+        try w.writeAll("\">");
+        try render.escapeInto(w, next_href);
+        try w.writeAll("</a>\n");
+    }
+    // The top separator rides as plain text so the `<pre>` visible text
+    // stays byte-identical to the quiet dated text digest (which prints
+    // the same separator line under its nav).
+    {
+        var sep_buf: std.Io.Writer.Allocating = .init(allocator);
+        defer sep_buf.deinit();
+        try table.writeSeparator(&sep_buf.writer, 50);
+        const sep = try sep_buf.toOwnedSlice();
+        defer allocator.free(sep);
+        try render.escapeInto(w, std.mem.trimEnd(u8, sep, "\n"));
+        try w.writeByte('\n');
+    }
+    // Sections render aside, then the first row becomes the page `<h1>`
+    // title (the home-HTML shape): tags strip clean, so visible text and
+    // layout never change.
+    {
+        var sec: std.Io.Writer.Allocating = .init(allocator);
+        defer sec.deinit();
+        const widths = view.homeColumnWidths(DigestSection, sections);
+        var emitted = false;
+        for (sections) |section| {
+            const board = section.board orelse {
+                const marker = try view.digestUnavailable(allocator, section.league.slug, day);
+                defer allocator.free(marker);
+                try render.escapeInto(&sec.writer, marker);
+                try sec.writer.writeByte('\n');
+                emitted = true;
+                continue;
+            };
+            if (board.games.len == 0) continue;
+            const capped = @min(per_league, board.games.len);
+            if (emitted) try sec.writer.writeByte('\n');
+            emitted = true;
+            const header = try view.homeLeagueHeader(allocator, section.league.name, day);
+            defer allocator.free(header);
+            const href = try datedLeagueHref(allocator, section.league.slug, day);
+            defer allocator.free(href);
+            try render.writeHtmlLine(&sec.writer, allocator, header, 50, "dim", href);
+            for (board.games[0..capped]) |game| {
+                const line = try view.homeGameLine(allocator, section.league, game, widths.slug_w, widths.abbr_w) orelse continue;
+                defer allocator.free(line);
+                const game_href = try core.domain.gameHref(allocator, section.league.slug, board.date, game);
+                defer allocator.free(game_href);
+                try writeDatedHomeGameCell(allocator, line, section.league, game, &sec.writer, game_href);
+                try sec.writer.writeByte('\n');
+            }
+            if (capped < board.games.len) {
+                const pointer = try std.fmt.allocPrint(allocator, "+{d} more -> /{s}?date={s}", .{ board.games.len - capped, board.league, day });
+                defer allocator.free(pointer);
+                try render.escapeInto(&sec.writer, pointer);
+                try sec.writer.writeByte('\n');
+            }
+        }
+        const rendered = try sec.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeDatedH1FirstLine(w, rendered);
+    }
+    // Blank air matching the quiet dated text digest (which prints one
+    // before its footer), so visible-text parity holds line for line.
+    try w.writeByte('\n');
+    try w.writeAll("</pre><nav>");
+    try w.print("<a href=\"/all?date={s}\">all</a>", .{day});
+    try w.print("<a href=\"/api/v1/all?date={s}\">json</a>", .{day});
+    try render.closePageWithNav(w);
+    return out.toOwnedSlice();
+}
+
+/// Dated digest game cell: the home link shape. The fitted row splits into
+/// sibling anchors — every non-team chunk links the game view, each
+/// participant abbreviation wraps in a team link — with the live/upcoming
+/// color span around the siblings (a span containing anchors is valid
+/// HTML). Only non-empty abbreviations link: nameless bouts emit a single
+/// game link, so rows stay valid either way. Abbreviations match
+/// positionally (away first, then home) so a truncated name can never
+/// steal another team's link. Unmatched tails (scores, status) ride the
+/// trailing game link. The line is ragged (fitted, trailing blanks
+/// trimmed); stripping tags concatenates back to the same line, so visible
+/// text matches the dated text digest byte for byte. Padding reuses
+/// `table.writeCell` so the frame aligns with the text renderer.
+fn writeDatedHomeGameCell(allocator: std.mem.Allocator, line: []const u8, league: *const core.leagues.League, game: core.domain.Game, w: *std.Io.Writer, game_href: []const u8) !void {
+    const css = view.statusCssClass(game.state);
+    if (css) |class| {
+        try w.writeAll("<span class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    }
+    // Collect the fitted line first so link offsets stay aligned; the
+    // line stays ragged (trailing blanks trimmed) so underlines stop at
+    // the text and visible text matches the text renderer byte for byte.
+    var cell: std.Io.Writer.Allocating = .init(allocator);
+    defer cell.deinit();
+    try table.writeCell(&cell.writer, line, 50, null, false);
+    const padded = try cell.toOwnedSlice();
+    defer allocator.free(padded);
+    const trimmed = std.mem.trimEnd(u8, padded, " ");
+    var cursor: usize = 0;
+    const content = trimmed;
+    if (game.participants.len == 2) {
+        const first = game.participants[0];
+        const second = game.participants[1];
+        const away, const home_team = if (std.mem.eql(u8, second.home_away orelse "", "home"))
+            .{ first, second }
+        else if (std.mem.eql(u8, first.home_away orelse "", "home"))
+            .{ second, first }
+        else
+            .{ first, second };
+        for ([2]core.domain.Participant{ away, home_team }) |part| {
+            if (part.abbreviation.len == 0) continue;
+            if (std.mem.indexOf(u8, content[cursor..], part.abbreviation)) |rel| {
+                const at = cursor + rel;
+                if (at > cursor) {
+                    try w.writeAll("<a href=\"");
+                    try render.escapeInto(w, game_href);
+                    try w.writeAll("\">");
+                    try render.escapeInto(w, content[cursor..at]);
+                    try w.writeAll("</a>");
+                }
+                const team_href = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ league.slug, part.abbreviation });
+                defer allocator.free(team_href);
+                try w.writeAll("<a href=\"");
+                try render.escapeInto(w, team_href);
+                try w.writeAll("\">");
+                try render.escapeInto(w, part.abbreviation);
+                try w.writeAll("</a>");
+                cursor = at + part.abbreviation.len;
+            }
+        }
+    }
+    if (content[cursor..].len > 0) {
+        try w.writeAll("<a href=\"");
+        try render.escapeInto(w, game_href);
+        try w.writeAll("\">");
+        try render.escapeInto(w, content[cursor..]);
+        try w.writeAll("</a>");
+    }
+    if (css != null) try w.writeAll("</span>");
+}
+
+/// Wrap the first line of an already-rendered dated digest block as the
+/// page `<h1>` title; remaining bytes pass through untouched. The home
+/// shape (the live home wraps its first section row the same way): tags
+/// strip clean, so visible text never changes.
+fn writeDatedH1FirstLine(w: *std.Io.Writer, rendered: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, rendered, '\n')) |nl| {
+        if (nl == 0) {
+            try w.writeAll(rendered);
+            return;
+        }
+        try w.writeAll(render.h1_open);
+        try w.writeAll(rendered[0..nl]);
+        try w.writeAll("</h1>\n");
+        try w.writeAll(rendered[nl + 1 ..]);
+    } else if (rendered.len > 0) {
+        try w.writeAll(render.h1_open);
+        try w.writeAll(rendered);
+        try w.writeAll("</h1>");
+    }
 }
 
 fn stripAnsi(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -611,9 +953,14 @@ test "dated digest skips off-day leagues, keeps outage markers" {
     };
     const dated = try text(arena, &sections, "2025-09-10", false, null, null, false, true);
     defer arena.free(dated);
-    // The game that happened renders whole: status, records, pointers.
-    for ([_][]const u8{ "MLB", "Final", "AWY", "HME", "(77-70)", "(89-58)", "more: /<league>?date=<day>" }) |token| {
+    // The dated view reads like the dated home: home heading/nav spelling,
+    // home section header, home rows for the games that happened.
+    for ([_][]const u8{ "sprts  2025-09-10 ET", "/all?date=2025-09-09    /all?date=2025-09-11", "MLB  09-10", "Final", "AWY", "HME", "Scheduled", "more: /<league>?date=<day>" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, dated, token) != null);
+    }
+    // Home rows carry no records, no pointers, no scoreboard chrome.
+    for ([_][]const u8{ "(77-70)", "(89-58)", "game:", "sprts all", "MLB  2025-09-10 ET" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, dated, token) == null);
     }
     // Off-day league vanishes entirely: no section, no noise line.
     try std.testing.expect(std.mem.indexOf(u8, dated, "NFL") == null);
@@ -630,39 +977,55 @@ test "dated digest skips off-day leagues, keeps outage markers" {
     try std.testing.expect(std.mem.indexOf(u8, today, "/nba?date=2025-09-10: unavailable") != null);
 }
 
-test "dated digest matches today render when every league played" {
-    // Byte-parity lock: with no empty and no failed sections the dated
-    // flag selects nothing, so a past view renders exactly like today —
-    // same sections, same colors, same marks, same links (text + HTML).
+test "dated digest matches dated home rows, not scoreboard cards" {
+    // Row-equality lock: the dated digest delegates its section bodies to
+    // the home row composer, so every dated-home section line (nav,
+    // headers, rows) reads byte-identical in the dated digest. Same
+    // fixture day through both renderers; widths agree because both use
+    // page-wide `view.homeColumnWidths` over the same boards.
+    const provider = @import("provider.zig");
     const arena = std.testing.allocator;
+    const day = "2025-09-10";
     const mlb_board: core.domain.Scoreboard = .{
         .league = "mlb",
         .league_name = "MLB",
-        .date = "2025-09-10",
+        .date = day,
         .source = "test",
         .games = &.{
             .{
                 .id = "9",
+                .slug = "phi-nym",
                 .name = "PHI at NYM",
                 .starts_at = "2025-09-10T17:00Z",
                 .state = "post",
                 .status = "Final",
                 .participants = &.{
-                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61" },
-                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61", .home_away = "away" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70", .home_away = "home" },
                 },
             },
-            // Scheduled tail keeps the board mixed so the section renders
-            // its rich card (an all-final board goes compact).
             .{
                 .id = "10",
-                .name = "AWY at HME",
+                .slug = "awy-hme",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T19:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false, .home_away = "away" },
+                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "3", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "11",
+                .slug = "law-lhm",
+                .name = "Later",
                 .starts_at = "2025-09-10T23:00Z",
                 .state = "pre",
                 .status = "Scheduled",
                 .participants = &.{
-                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
-                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
+                    .{ .id = "5", .name = "Later Away", .abbreviation = "LAW", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "6", .name = "Later Home", .abbreviation = "LHM", .score = "", .winner = false, .home_away = "home" },
                 },
             },
         },
@@ -670,23 +1033,148 @@ test "dated digest matches today render when every league played" {
     const sections = [_]DigestSection{
         .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
     };
-    const dated_text = try text(arena, &sections, "2025-09-10", true, null, null, false, true);
+    var results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+    };
+    // Same boards, same page-wide geometry on both sides.
+    const home_widths = view.homeColumnWidths(provider.LeagueResult, &results);
+    const digest_widths = view.homeColumnWidths(DigestSection, &sections);
+    try std.testing.expectEqual(home_widths.slug_w, digest_widths.slug_w);
+    try std.testing.expectEqual(home_widths.abbr_w, digest_widths.abbr_w);
+    const home_text = try render.homeLive(arena, false, "example.test", &results, day, false, true);
+    defer arena.free(home_text);
+    const dated_text = try text(arena, &sections, day, false, null, null, false, true);
     defer arena.free(dated_text);
-    const today_text = try text(arena, &sections, "2025-09-10", true, null, null, false, false);
-    defer arena.free(today_text);
-    try std.testing.expectEqualStrings(today_text, dated_text);
-    // Colors and marks survive the past view (winner green, braille art).
-    try std.testing.expect(std.mem.indexOf(u8, dated_text, "\x1b[") != null);
-    try std.testing.expect(containsBraille(dated_text));
-    const dated_html = try html(arena, &sections, "2025-09-10", null, null, false, true);
-    defer arena.free(dated_html);
-    const today_html = try html(arena, &sections, "2025-09-10", null, null, false, false);
-    defer arena.free(today_html);
-    try std.testing.expectEqualStrings(today_html, dated_html);
-    try std.testing.expect(std.mem.indexOf(u8, dated_html, "PHI") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dated_html, "\x1b[") == null);
+    // Heading, nav, headers, and every game row match the dated home.
+    try std.testing.expect(std.mem.indexOf(u8, dated_text, "sprts  2025-09-10 ET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated_text, "/all?date=2025-09-09    /all?date=2025-09-11") != null);
+    var home_lines = std.mem.splitScalar(u8, home_text, '\n');
+    while (home_lines.next()) |line| {
+        if (line.len == 0) continue;
+        // Section chrome and rows only: banner, heading, LIVE regrouping,
+        // and the host footer are home-only by contract (see `datedText`).
+        // Rows start with the slug cell, so the footer (`Try: curl
+        // example.test/mlb`) never matches the row prefix.
+        if (std.mem.startsWith(u8, line, "mlb ") or
+            std.mem.indexOf(u8, line, "MLB") != null or
+            std.mem.startsWith(u8, line, "/all?date"))
+        {
+            try std.testing.expect(std.mem.indexOf(u8, dated_text, line) != null);
+        }
+    }
+    // The digest keeps per-league order instead of home's `LIVE NOW`
+    // regrouping: rows are identical, grouping differs when live games
+    // are present (past recap days are usually all-final, so no gap).
+    try std.testing.expect(std.mem.indexOf(u8, home_text, "LIVE NOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated_text, "LIVE NOW") == null);
+    // Scoreboard chrome is gone: full-date section headings, pointers,
+    // records, TV lines, and the digest's own old heading.
+    for ([_][]const u8{ "MLB  2025-09-10 ET", "game:", "(83-61)", "(74-70)", "TV:", "sprts all" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, dated_text, token) == null);
+    }
     _ = try std.unicode.Utf8View.init(dated_text);
-    _ = try std.unicode.Utf8View.init(dated_html);
+}
+
+test "dated digest html reuses home links without scoreboard anchors" {
+    // Link-shape lock: dated digest rows link like home rows (sibling game
+    // + team anchors with live/upcoming spans), never like scoreboard rows
+    // (`id="game-"` anchors, no spans). Same fixture as the text
+    // row-equality test so rows and links cover the same games.
+    const provider = @import("provider.zig");
+    const arena = std.testing.allocator;
+    const day = "2025-09-10";
+    const mlb_board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = day,
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .slug = "phi-nym",
+                .name = "PHI at NYM",
+                .starts_at = "2025-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "1", .name = "Philadelphia Phillies", .abbreviation = "PHI", .score = "5", .winner = true, .record = "83-61", .home_away = "away" },
+                    .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70", .home_away = "home" },
+                },
+            },
+            .{
+                .id = "10",
+                .slug = "awy-hme",
+                .name = "Away at Home",
+                .starts_at = "2025-09-10T19:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false, .home_away = "away" },
+                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "3", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "11",
+                .slug = "law-lhm",
+                .name = "Later",
+                .starts_at = "2025-09-10T23:00Z",
+                .state = "pre",
+                .status = "Scheduled",
+                .participants = &.{
+                    .{ .id = "5", .name = "Later Away", .abbreviation = "LAW", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "6", .name = "Later Home", .abbreviation = "LHM", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+    };
+    var results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+    };
+    const page = try html(arena, &sections, day, null, null, false, true);
+    defer arena.free(page);
+    const home_page = try render.homeHtmlLive(arena, "example.test", &results, day, false, true);
+    defer arena.free(home_page);
+    // Scoreboard anchor shape is gone; team links ride every row.
+    try std.testing.expect(std.mem.indexOf(u8, page, "id=\"game-") == null);
+    for ([_][]const u8{
+        "<a href=\"/mlb/PHI\">PHI</a>",
+        "<a href=\"/mlb/NYM\">NYM</a>",
+        "<a href=\"/mlb/AWY\">AWY</a>",
+        "<a href=\"/mlb/HME\">HME</a>",
+        "<a href=\"/mlb/LAW\">LAW</a>",
+        "<a href=\"/mlb/LHM\">LHM</a>",
+    }) |team_link| {
+        try std.testing.expect(std.mem.indexOf(u8, page, team_link) != null);
+        try std.testing.expect(std.mem.indexOf(u8, home_page, team_link) != null);
+    }
+    // Raw game hrefs (human slugs) survive verbatim on both pages.
+    for ([_][]const u8{
+        "/mlb/2025-09-10/phi-nym",
+        "/mlb/2025-09-10/awy-hme",
+        "/mlb/2025-09-10/law-lhm",
+    }) |game_href| {
+        try std.testing.expect(std.mem.indexOf(u8, page, game_href) != null);
+        try std.testing.expect(std.mem.indexOf(u8, home_page, game_href) != null);
+    }
+    // Span styles match home: live/upcoming on rows, dim on headers, and
+    // no art spans anywhere (no logos in dated views by construction).
+    for ([_][]const u8{ "class=\"live\"", "class=\"upcoming\"", "class=\"dim\"" }) |span| {
+        try std.testing.expect(std.mem.indexOf(u8, page, span) != null);
+        try std.testing.expect(std.mem.indexOf(u8, home_page, span) != null);
+    }
+    try std.testing.expect(!containsBraille(page));
+    try std.testing.expect(std.mem.indexOf(u8, page, "rgb(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    // The tags add no visible text: parity with the quiet dated digest.
+    const body = try text(arena, &sections, day, false, null, null, true, true);
+    defer arena.free(body);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
 }
 
 test "digest hostile fixture keeps text and HTML visible text equal" {
