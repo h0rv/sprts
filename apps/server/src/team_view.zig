@@ -1126,7 +1126,8 @@ test "art-off team HTML carries no marks, no logo spans" {
 // Every shared-composer row (`recordStandingsLine`, `gameLine` /
 // `gameLineFull`, probable lines) must surface verbatim in the text page
 // and as visible text (tags stripped, entities unescaped) in the HTML
-// page. The text pointer suffix (`  /{league}/{id}`) and the HTML link
+// page. The text pointer suffix (`  /{league}/{date}/{slug}`, numeric
+// legacy fallback inside) and the HTML link
 // wrapping are chrome: strip the pointer before comparing with the
 // linked HTML row.
 fn hostileTeamView() schedule.TeamView {

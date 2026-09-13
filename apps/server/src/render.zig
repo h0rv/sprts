@@ -911,7 +911,8 @@ pub fn scoreHtmlArt(allocator: std.mem.Allocator, board: domain.Scoreboard, widt
 
 /// Post-pass linkifier for `scoreHtml`: re-emits the plain-text table
 /// line by line, wrapping each game's status cell in a
-/// `<a href="/{league}/{id}" id="game-{id}">` anchor and each team's
+/// `<a href="/{league}/{date}/{slug}" id="game-{id}">` anchor (legacy
+/// numeric href when the game carries no stamped slug) and each team's
 /// abbreviation/name in `<a href="/{league}/{abbr}">` anchors. The
 /// `text` renderer stays the single source of layout: only invisible
 /// tags are added, so the visible text matches `text(color=false)`
@@ -4816,3 +4817,143 @@ test "dated home skips fully-skipped sections without stray blanks" {
     _ = try std.unicode.Utf8View.init(dated);
 }
 
+test "mlb scoreboard links prefer slugs, numeric fallback still resolves" {
+    // End to end through the provider: an ESPN-shaped MLB slate stamps
+    // day-unique slugs, and every emitted game link rides them — the text
+    // `game:` pointers and the HTML status anchors alike. Rows without a
+    // stamped slug keep the legacy numeric address, which still parses as
+    // the game route. Fixtures only, no live ESPN.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mlb = core.leagues.find("mlb").?;
+    const fixture =
+        \\{"events":[{"id":"401816828","name":"Minnesota Twins at Detroit Tigers","date":"2026-09-09T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401816828","date":"2026-09-09T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","score":"4","winner":true,"team":{"id":"5","displayName":"Minnesota Twins","abbreviation":"MIN"}},{"homeAway":"home","score":"2","winner":false,"team":{"id":"6","displayName":"Detroit Tigers","abbreviation":"DET"}}]}]},{"id":"401816829","name":"Atlanta Braves at Philadelphia Phillies","date":"2026-09-09T23:00Z","status":{"type":{"state":"in","shortDetail":"Top 7th"}},"competitions":[{"id":"401816829","date":"2026-09-09T23:00Z","status":{"type":{"state":"in","shortDetail":"Top 7th"}},"competitors":[{"homeAway":"away","score":"3","winner":false,"team":{"id":"15","displayName":"Atlanta Braves","abbreviation":"ATL"}},{"homeAway":"home","score":"3","winner":false,"team":{"id":"22","displayName":"Philadelphia Phillies","abbreviation":"PHI"}}]}]},{"id":"401816830","name":"Minnesota Twins at Detroit Tigers","date":"2026-09-10T00:30Z","status":{"type":{"state":"pre","shortDetail":"10:30 PM ET"}},"competitions":[{"id":"401816830","date":"2026-09-10T00:30Z","status":{"type":{"state":"pre","shortDetail":"10:30 PM ET"}},"competitors":[{"homeAway":"away","score":"","winner":false,"team":{"id":"5","displayName":"Minnesota Twins","abbreviation":"MIN"}},{"homeAway":"home","score":"","winner":false,"team":{"id":"6","displayName":"Detroit Tigers","abbreviation":"DET"}}]}]}]}
+    ;
+    const board = try provider.parseAndNormalize(arena, mlb, "2026-09-09", fixture);
+    try std.testing.expectEqual(@as(usize, 3), board.games.len);
+    try std.testing.expectEqualStrings("min-det", board.games[0].slug);
+    try std.testing.expectEqualStrings("atl-phi", board.games[1].slug);
+    try std.testing.expectEqualStrings("min-det-2", board.games[2].slug);
+    // The live game keeps rich cards, so every game owns a text pointer.
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    for ([_][]const u8{
+        "game: /mlb/2026-09-09/min-det",
+        "game: /mlb/2026-09-09/atl-phi",
+        "game: /mlb/2026-09-09/min-det-2",
+    }) |pointer| try std.testing.expect(std.mem.indexOf(u8, body, pointer) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "game: /mlb/401816828") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "game: /mlb/401816829") == null);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    for ([_][]const u8{
+        "<a href=\"/mlb/2026-09-09/min-det\" id=\"game-401816828\">",
+        "<a href=\"/mlb/2026-09-09/atl-phi\" id=\"game-401816829\">",
+        "<a href=\"/mlb/2026-09-09/min-det-2\" id=\"game-401816830\">",
+    }) |anchor| try std.testing.expect(std.mem.indexOf(u8, page, anchor) != null);
+    // Every pretty href parses to the date alias (never not_found) and
+    // resolves back to its own game through the provider lookup.
+    const want_alias = [_]struct { href: []const u8, id: []const u8, n: ?u16 }{
+        .{ .href = "/mlb/2026-09-09/min-det", .id = "401816828", .n = null },
+        .{ .href = "/mlb/2026-09-09/atl-phi", .id = "401816829", .n = null },
+        .{ .href = "/mlb/2026-09-09/min-det-2", .id = "401816830", .n = 2 },
+    };
+    for (want_alias) |want| {
+        const route = router.parse(want.href);
+        try std.testing.expect(route == .date_alias);
+        try std.testing.expect(route.date_alias.n == want.n);
+        const found = provider.findGameByMatchupN(board, route.date_alias.away, route.date_alias.home, route.date_alias.n orelse 1).?;
+        try std.testing.expectEqualStrings(want.id, found.id);
+    }
+    // Slug absent (hand-built rows): the numeric fallback emits in text
+    // and HTML, and the numeric URL still parses as the game route.
+    const bare_board: domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-09",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "9",
+                .name = "Away at Home",
+                .starts_at = "2026-09-09T17:00Z",
+                .state = "in",
+                .status = "Top 7th",
+                .participants = &.{
+                    .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "0", .winner = false },
+                    .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "1", .winner = false },
+                },
+            },
+        },
+    };
+    const bare_body = try text(arena, bare_board, false, null, null);
+    defer arena.free(bare_body);
+    try std.testing.expect(std.mem.indexOf(u8, bare_body, "game: /mlb/9") != null);
+    const bare_page = try scoreHtml(arena, bare_board, null, null);
+    defer arena.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "<a href=\"/mlb/9\" id=\"game-9\">") != null);
+    const numeric = router.parse("/mlb/401816828");
+    try std.testing.expect(numeric == .game);
+    try std.testing.expectEqualStrings("401816828", numeric.game.id);
+    const bare_numeric = router.parse("/mlb/9");
+    try std.testing.expect(bare_numeric == .game);
+    _ = try std.unicode.Utf8View.init(body);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "ucl dated board links render routable end to end" {
+    // The `?`-abbreviation slug fix, verified through the renderers: a UCL
+    // dated board (duels plus a placeholder side with no abbreviation)
+    // renders text and HTML from fixtures, and every game row link is
+    // non-empty, `?`-free, and parses to a route the provider resolves
+    // back to its own game (never not_found). Fixtures only, no live ESPN.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ucl = core.leagues.find("ucl").?;
+    const fixture =
+        \\{"events":[{"id":"401915444","name":"AS Roma at Fenerbahce","date":"2026-09-10T16:45Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitions":[{"id":"401915444","date":"2026-09-10T16:45Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"homeAway":"away","score":"1","winner":false,"team":{"id":"104","displayName":"AS Roma","abbreviation":"ROMA"}},{"homeAway":"home","score":"1","winner":false,"team":{"id":"436","displayName":"Fenerbahce","abbreviation":"FEN"}}]}]},{"id":"401915443","name":"Bodo/Glimt at Bayern Munich","date":"2026-09-10T19:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitions":[{"id":"401915443","date":"2026-09-10T19:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"homeAway":"away","score":"0","winner":false,"team":{"id":"2980","displayName":"Bodo/Glimt","abbreviation":"BODO"}},{"homeAway":"home","score":"5","winner":true,"team":{"id":"132","displayName":"Bayern Munich","abbreviation":"MUN"}}]}]},{"id":"9001","name":"Known at Mystery","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitions":[{"id":"9001","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"homeAway":"away","score":"","winner":false,"team":{"id":"1","displayName":"Known FC","abbreviation":"KNO"}},{"homeAway":"home","score":"","winner":false,"team":{"id":"2","displayName":"Mystery FC"}}]}]},{"id":"9002","name":"Paris SG at Atletico","date":"2026-09-10T21:00Z","status":{"type":{"state":"in","shortDetail":"2H 60'"}},"competitions":[{"id":"9002","date":"2026-09-10T21:00Z","status":{"type":{"state":"in","shortDetail":"2H 60'"}},"competitors":[{"homeAway":"away","score":"1","winner":false,"team":{"id":"10","displayName":"Paris SG","abbreviation":"PSG"}},{"homeAway":"home","score":"0","winner":false,"team":{"id":"11","displayName":"Atletico","abbreviation":"ATM"}}]}]}]}
+    ;
+    const board = try provider.parseAndNormalize(arena, ucl, "2026-09-10", fixture);
+    try std.testing.expectEqual(@as(usize, 4), board.games.len);
+    // The live game keeps rich cards, so every game owns a text pointer.
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    for (board.games) |game| {
+        const href = try domain.gameHref(arena, board.league, board.date, game);
+        defer arena.free(href);
+        try std.testing.expect(href.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, href, "?") == null);
+        try std.testing.expect(std.mem.indexOf(u8, game.slug, "?") == null);
+        const route = router.parse(href);
+        try std.testing.expect(route != .not_found);
+        if (route == .date_alias) {
+            const found = provider.findGameByMatchupN(board, route.date_alias.away, route.date_alias.home, route.date_alias.n orelse 1).?;
+            try std.testing.expectEqualStrings(game.id, found.id);
+        } else if (route == .date_event) {
+            const found = provider.findGameByOrdinal(board, route.date_event.n).?;
+            try std.testing.expectEqualStrings(game.id, found.id);
+        } else {
+            try std.testing.expect(false);
+        }
+        // Both surfaces carry the link: the text pointer and the HTML
+        // status anchor (with the numeric anchor id).
+        const pointer = try std.fmt.allocPrint(arena, "game: {s}", .{href});
+        defer arena.free(pointer);
+        try std.testing.expect(std.mem.indexOf(u8, body, pointer) != null);
+        const anchor = try std.fmt.allocPrint(arena, "<a href=\"{s}\" id=\"game-{s}\">", .{ href, game.id });
+        defer arena.free(anchor);
+        try std.testing.expect(std.mem.indexOf(u8, page, anchor) != null);
+    }
+    // Spot pins: duels ride the pair, the placeholder rides the ordinal.
+    try std.testing.expectEqualStrings("roma-fen", board.games[0].slug);
+    try std.testing.expectEqualStrings("bodo-mun", board.games[1].slug);
+    try std.testing.expectEqualStrings("event-3", board.games[2].slug);
+    try std.testing.expectEqualStrings("psg-atm", board.games[3].slug);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    _ = try std.unicode.Utf8View.init(page);
+}
