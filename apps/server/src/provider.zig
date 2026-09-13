@@ -516,12 +516,13 @@ fn boardParticipant(
             .id = team.id,
             .name = if (team.displayName.len > 0) team.displayName else team.name,
             // ESPN omits `abbreviation` on placeholder (TBD) sides and the
-            // struct default is "?": a "?" names no team, so it normalizes
-            // to "" here — otherwise the game stamps a duel slug (`kno-?`)
-            // the alias router can never parse (its abbrevs are 1-8 ASCII
-            // alnum, so the stamped link 404s), while the ordinal fallback
-            // (`event-N`) resolves through the date_event arm.
-            .abbreviation = if (team.abbreviation.len == 0 or std.mem.eql(u8, team.abbreviation, "?")) "" else team.abbreviation,
+            // struct default is "?"; postseason ships the literal "TBD"
+            // (sometimes "TBA"). None names a team, so all normalize to ""
+            // here — otherwise the game stamps a duel slug (`kno-?`,
+            // `kno-tbd`) the alias router can never parse (its abbrevs are
+            // 1-8 ASCII alnum, so the stamped link 404s), while the ordinal
+            // fallback (`event-N`) resolves through the date_event arm.
+            .abbreviation = if (team.abbreviation.len == 0 or std.mem.eql(u8, team.abbreviation, "?") or std.ascii.eqlIgnoreCase(team.abbreviation, "tbd") or std.ascii.eqlIgnoreCase(team.abbreviation, "tba")) "" else team.abbreviation,
         };
         if (competitor.athlete) |athlete| break :identity Identity{
             .id = competitor.id,
@@ -4962,10 +4963,12 @@ pub fn findGameByOrdinal(board: core.domain.Scoreboard, n: u16) ?*const core.dom
 /// alias miss message uses this to tell a duel-only dead end apart from a
 /// typo'd pair on an all-duel day.
 pub fn boardHasNonDuels(board: core.domain.Scoreboard) bool {
+    // One spelling for "duel" everywhere: the stamped slug rule. Any game
+    // that cannot wear the duel form (cards, races, fields, athlete duels,
+    // "?", TBD/TBA placeholders, duplicated pairs, unroutable abbrevs) is
+    // a non-duel for the miss hint.
     for (board.games) |*game| {
-        if (game.participants.len != 2) return true;
-        if (game.participants[0].abbreviation.len == 0) return true;
-        if (game.participants[1].abbreviation.len == 0) return true;
+        if (!core.domain.isDuelGame(game.*)) return true;
     }
     return false;
 }
@@ -4989,11 +4992,17 @@ fn isDuel(game: *const core.domain.Game, first: []const u8, second: []const u8) 
     const a = game.participants[0].abbreviation;
     const b = game.participants[1].abbreviation;
     if (a.len == 0 or b.len == 0) return false;
-    // The provider's missing-value placeholder is no duel side (see
-    // `core.domain.isDuelGame`): the router never parses "?", so no
-    // routable query can match through it — only a stamped `?-` slug
-    // could, and those no longer stamp.
+    // Same routability as the stamped slug (`core.domain.isDuelGame`):
+    // "?", TBD/TBA placeholders, overlong/non-alnum abbrevs, and
+    // duplicated pairs never match — the router never parses "?", and
+    // only a stamped unroutable slug could match through them.
     if (std.mem.eql(u8, a, "?") or std.mem.eql(u8, b, "?")) return false;
+    if (std.ascii.eqlIgnoreCase(a, "tbd") or std.ascii.eqlIgnoreCase(b, "tbd")) return false;
+    if (std.ascii.eqlIgnoreCase(a, "tba") or std.ascii.eqlIgnoreCase(b, "tba")) return false;
+    if (a.len > 8 or b.len > 8) return false;
+    for (a) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    for (b) |c| if (!std.ascii.isAlphanumeric(c)) return false;
+    if (std.ascii.eqlIgnoreCase(a, b)) return false;
     return std.ascii.eqlIgnoreCase(a, first) and std.ascii.eqlIgnoreCase(b, second);
 }
 
@@ -6418,4 +6427,245 @@ test "standings thread streak and games-behind, absent stays null" {
     const legacy = try fetchStandings(standingsTestAdapter(&legacy_fake), arena_state.allocator(), core.leagues.find("nfl").?);
     try std.testing.expect(legacy.groups[0].entries[0].streak == null);
     try std.testing.expect(legacy.groups[0].entries[0].games_behind == null);
+}
+
+// --- crew-f pretty IDs every league (appended; existing tests above untouched) ---
+//
+// For every league shape: board parse stamps a slug, `gameHref` is
+// non-empty, `router.parse` on that href resolves (never not_found), and
+// the provider lookup lands on the same game id. Placeholders and clash
+// suffixes ride the same chain.
+const pretty_router = @import("router.zig");
+
+fn checkPrettyChain(arena: std.mem.Allocator, board: core.domain.Scoreboard, index: usize) !void {
+    const game = board.games[index];
+    try std.testing.expect(game.slug.len > 0);
+    try std.testing.expect(game.id.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, game.slug, "?") == null);
+    const href = try core.domain.gameHref(arena, board.league, board.date, game);
+    try std.testing.expect(href.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, href, "?") == null);
+    const route = pretty_router.parse(href);
+    try std.testing.expect(route != .not_found);
+    switch (route) {
+        .date_alias => |alias| {
+            const hit = findGameByMatchupN(board, alias.away, alias.home, alias.n orelse 1) orelse {
+                std.debug.print("duel lookup missed for {s}\n", .{href});
+                return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqualStrings(game.id, hit.id);
+        },
+        .date_event => |alias| {
+            const hit = findGameByOrdinal(board, alias.n) orelse {
+                std.debug.print("ordinal lookup missed for {s}\n", .{href});
+                return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqualStrings(game.id, hit.id);
+        },
+        else => {
+            std.debug.print("pretty href routed elsewhere: {s}\n", .{href});
+            return error.TestUnexpectedResult;
+        },
+    }
+    // Numeric ids keep resolving: all-digit ids ride the game route.
+    var all_digits = true;
+    for (game.id) |c| if (c < '0' or c > '9') {
+        all_digits = false;
+        break;
+    };
+    if (all_digits) {
+        const numeric_target = try std.fmt.allocPrint(arena, "/{s}/{s}", .{ board.league, game.id });
+        const numeric = pretty_router.parse(numeric_target);
+        try std.testing.expect(numeric == .game);
+        try std.testing.expectEqualStrings(game.id, numeric.game.id);
+    }
+}
+
+fn prettyBoard(arena: std.mem.Allocator, league_slug: []const u8, day: []const u8, body: []const u8) !core.domain.Scoreboard {
+    return parseAndNormalize(arena, core.leagues.find(league_slug).?, day, body);
+}
+
+test "crew-f pretty IDs baseball (mlb) duel resolves" {
+    const body =
+        \\{"events":[{"id":"401","name":"Minnesota Twins at Detroit Tigers","date":"2026-09-09T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"401","date":"2026-09-09T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","score":"2","winner":false,"team":{"id":"a","displayName":"Minnesota Twins","abbreviation":"MIN"}},{"homeAway":"home","score":"5","winner":true,"team":{"id":"h","displayName":"Detroit Tigers","abbreviation":"DET"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "mlb", "2026-09-09", body);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("min-det", board.games[0].slug);
+    try std.testing.expectEqualStrings("/mlb/2026-09-09/min-det", try core.domain.gameHref(arena, board.league, board.date, board.games[0]));
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs football (nfl) duel resolves" {
+    const body =
+        \\{"events":[{"id":"402","name":"Patriots at Seahawks","date":"2026-09-07T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"402","date":"2026-09-07T17:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","score":"20","winner":true,"team":{"id":"a","displayName":"Patriots","abbreviation":"NE"}},{"homeAway":"home","score":"17","winner":false,"team":{"id":"h","displayName":"Seahawks","abbreviation":"SEA"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "nfl", "2026-09-07", body);
+    try std.testing.expectEqualStrings("ne-sea", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs basketball (nba) duel resolves" {
+    const body =
+        \\{"events":[{"id":"403","name":"Lakers at Celtics","date":"2026-09-09T23:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"403","date":"2026-09-09T23:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","score":"110","winner":true,"team":{"id":"a","displayName":"Los Angeles Lakers","abbreviation":"LAL"}},{"homeAway":"home","score":"105","winner":false,"team":{"id":"h","displayName":"Boston Celtics","abbreviation":"BOS"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "nba", "2026-09-09", body);
+    try std.testing.expectEqualStrings("lal-bos", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs hockey (nhl) duel resolves" {
+    const body =
+        \\{"events":[{"id":"404","name":"Oilers at Panthers","date":"2026-09-09T23:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"404","date":"2026-09-09T23:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"homeAway":"away","score":"3","winner":true,"team":{"id":"a","displayName":"Edmonton Oilers","abbreviation":"EDM"}},{"homeAway":"home","score":"2","winner":false,"team":{"id":"h","displayName":"Florida Panthers","abbreviation":"FLA"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "nhl", "2026-09-09", body);
+    try std.testing.expectEqualStrings("edm-fla", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs soccer (epl) duel resolves" {
+    const body =
+        \\{"events":[{"id":"405","name":"Arsenal at Chelsea","date":"2026-09-12T14:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitions":[{"id":"405","date":"2026-09-12T14:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"homeAway":"away","score":"2","winner":true,"team":{"id":"a","displayName":"Arsenal","abbreviation":"ARS"}},{"homeAway":"home","score":"1","winner":false,"team":{"id":"h","displayName":"Chelsea","abbreviation":"CHE"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "epl", "2026-09-12", body);
+    try std.testing.expectEqualStrings("ars-che", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs tennis (atp) ordinal resolves" {
+    const body =
+        \\{"events":[{"id":"189-2026","name":"US Open","date":"2026-08-24T15:05Z","groupings":[{"grouping":{"displayName":"Men's Singles"},"competitions":[{"id":"184607","date":"2026-08-24T15:05Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"1","order":2,"winner":false,"athlete":{"displayName":"Player One"},"linescores":[{"value":6,"tiebreak":3,"winner":false}]},{"id":"2","order":1,"winner":true,"athlete":{"displayName":"Player Two"},"linescores":[{"value":7,"tiebreak":7,"winner":true}]}]}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "atp", "2026-08-24", body);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("event-1", board.games[0].slug);
+    try std.testing.expectEqualStrings("/atp/2026-08-24/event-1", try core.domain.gameHref(arena, board.league, board.date, board.games[0]));
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs golf (pga) ordinal resolves" {
+    const body =
+        \\{"events":[{"id":"406","name":"Tour Championship","date":"2026-09-09T12:00Z","status":{"type":{"state":"in","shortDetail":"Round 3"}},"competitions":[{"id":"406","date":"2026-09-09T12:00Z","status":{"type":{"state":"in","shortDetail":"Round 3"}},"competitors":[{"id":"p1","order":1,"winner":true,"athlete":{"displayName":"Golfer One"}},{"id":"p2","order":2,"athlete":{"displayName":"Golfer Two"}},{"id":"p3","order":3,"athlete":{"displayName":"Golfer Three"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "pga", "2026-09-09", body);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("event-1", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs racing (f1) ordinal resolves" {
+    const body =
+        \\{"events":[{"id":"407","name":"Italian Grand Prix","date":"2025-09-07T13:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"circuit":{"fullName":"Monza"},"competitions":[{"id":"407","date":"2025-09-07T13:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","order":1,"winner":true,"athlete":{"displayName":"Max Verstappen"}},{"id":"b","order":2,"athlete":{"displayName":"Lando Norris"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "f1", "2025-09-07", body);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("event-1", board.games[0].slug);
+    try std.testing.expectEqualStrings("Monza", board.games[0].venue.?);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs mma (ufc) ordinal resolves" {
+    const body =
+        \\{"events":[{"id":"408","name":"UFC Fight Night","date":"2026-09-05T22:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitions":[{"id":"408","date":"2026-09-05T22:00Z","status":{"type":{"state":"post","shortDetail":"Final"}},"competitors":[{"id":"a","winner":true,"athlete":{"displayName":"Fighter One"}},{"id":"b","athlete":{"displayName":"Fighter Two"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "ufc", "2026-09-05", body);
+    try std.testing.expectEqual(@as(usize, 1), board.games.len);
+    try std.testing.expectEqualStrings("event-1", board.games[0].slug);
+    try checkPrettyChain(arena, board, 0);
+}
+
+test "crew-f pretty IDs clash same sides twice distinct slugs" {
+    // Non-MLB doubleheader (basketball): same pair twice one day must
+    // stamp distinct routable slugs that resolve to their own game ids.
+    const body =
+        \\{"events":[{"id":"501","name":"Lakers at Celtics","date":"2026-09-09T17:00Z","competitions":[{"id":"501","date":"2026-09-09T17:00Z","competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Los Angeles Lakers","abbreviation":"LAL"}},{"homeAway":"home","team":{"id":"h","displayName":"Boston Celtics","abbreviation":"BOS"}}]}]},{"id":"502","name":"Lakers at Celtics","date":"2026-09-09T20:00Z","competitions":[{"id":"502","date":"2026-09-09T20:00Z","competitors":[{"homeAway":"away","team":{"id":"a","displayName":"Los Angeles Lakers","abbreviation":"LAL"}},{"homeAway":"home","team":{"id":"h","displayName":"Boston Celtics","abbreviation":"BOS"}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const board = try prettyBoard(arena, "nba", "2026-09-09", body);
+    try std.testing.expectEqual(@as(usize, 2), board.games.len);
+    try std.testing.expectEqualStrings("lal-bos", board.games[0].slug);
+    try std.testing.expectEqualStrings("lal-bos-2", board.games[1].slug);
+    try std.testing.expect(!std.mem.eql(u8, board.games[0].slug, board.games[1].slug));
+    try checkPrettyChain(arena, board, 0);
+    try checkPrettyChain(arena, board, 1);
+    try std.testing.expectEqualStrings("501", findGameByMatchupN(board, "lal", "bos", 1).?.id);
+    try std.testing.expectEqualStrings("502", findGameByMatchupN(board, "lal", "bos", 2).?.id);
+    try std.testing.expect(findGameByMatchupN(board, "lal", "bos", 3) == null);
+}
+
+test "crew-f pretty IDs placeholders fall to event-N every shape" {
+    // Missing ("?"/absent), TBD/TBA literals, duplicated pairs, and
+    // unroutable abbrevs all take the ordinal form — never a duel slug —
+    // on every team-duel shape, and the ordinal href resolves.
+    const cases = [_]struct { away_abbr: ?[]const u8, home_abbr: ?[]const u8 }{
+        .{ .away_abbr = "?", .home_abbr = "?" },
+        .{ .away_abbr = "KNO", .home_abbr = "?" },
+        .{ .away_abbr = null, .home_abbr = null },
+        .{ .away_abbr = "TBD", .home_abbr = "TBD" },
+        .{ .away_abbr = "tbd", .home_abbr = "KNO" },
+        .{ .away_abbr = "TBA", .home_abbr = "KNO" },
+        .{ .away_abbr = "MIN", .home_abbr = "MIN" },
+        .{ .away_abbr = "M.IN", .home_abbr = "DET" },
+        .{ .away_abbr = "TOOLONGABBR", .home_abbr = "DET" },
+    };
+    const leagues = [_][]const u8{ "mlb", "nfl", "nba", "nhl", "epl" };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (leagues) |league_slug| {
+        for (cases, 0..) |case, ci| {
+            const away_frag: []const u8 = if (case.away_abbr) |abbr| try std.fmt.allocPrint(arena, "\"abbreviation\":\"{s}\"", .{abbr}) else "\"name\":\"TBD\"";
+            const home_frag: []const u8 = if (case.home_abbr) |abbr| try std.fmt.allocPrint(arena, "\"abbreviation\":\"{s}\"", .{abbr}) else "\"name\":\"TBD\"";
+            const body = try std.fmt.allocPrint(arena, "{{\"events\":[{{\"id\":\"9{d}\",\"name\":\"X at Y\",\"date\":\"2026-09-09T17:00Z\",\"competitions\":[{{\"id\":\"9{d}\",\"date\":\"2026-09-09T17:00Z\",\"competitors\":[{{\"homeAway\":\"away\",\"team\":{{\"id\":\"a\",\"displayName\":\"Away\",{s}}}}},{{\"homeAway\":\"home\",\"team\":{{\"id\":\"h\",\"displayName\":\"Home\",{s}}}}}]}}]}}]}}", .{ ci, ci, away_frag, home_frag });
+            const board = try prettyBoard(arena, league_slug, "2026-09-09", body);
+            try std.testing.expectEqual(@as(usize, 1), board.games.len);
+            try std.testing.expectEqualStrings("event-1", board.games[0].slug);
+            // Placeholders normalize: never "?", TBD, or TBA leaks.
+            for (board.games[0].participants) |participant| {
+                try std.testing.expect(!std.mem.eql(u8, participant.abbreviation, "?"));
+                try std.testing.expect(!std.ascii.eqlIgnoreCase(participant.abbreviation, "tbd"));
+                try std.testing.expect(!std.ascii.eqlIgnoreCase(participant.abbreviation, "tba"));
+            }
+            try std.testing.expect(findGameByMatchup(board, "kno", "mys") == null);
+            try checkPrettyChain(arena, board, 0);
+        }
+    }
+    // Postseason TBD literal normalizes to "" (never a duel slug).
+    const playoff =
+        \\{"events":[{"id":"601","name":"TBD at TBD","date":"2027-01-16T05:00Z","competitions":[{"id":"601","date":"2027-01-16T05:00Z","competitors":[{"homeAway":"away","team":{"id":"1","displayName":"TBD","abbreviation":"TBD"}},{"homeAway":"home","team":{"id":"2","displayName":"TBD","abbreviation":"TBD"}}]}]}]}
+    ;
+    const nfl_board = try prettyBoard(arena, "nfl", "2027-01-16", playoff);
+    try std.testing.expectEqualStrings("", nfl_board.games[0].participants[0].abbreviation);
+    try std.testing.expectEqualStrings("", nfl_board.games[0].participants[1].abbreviation);
+    try std.testing.expectEqualStrings("event-1", nfl_board.games[0].slug);
+    try checkPrettyChain(arena, nfl_board, 0);
 }
