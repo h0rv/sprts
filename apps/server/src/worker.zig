@@ -230,6 +230,8 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .team => |route| return serveTeam(env, alloc, route, format, zone),
         .today => |route| return serveToday(env, alloc, route, format),
         .team_game => |route| return serveTeamGame(env, alloc, route, format),
+        .team_last => |route| return serveTeamLast(env, alloc, route, format),
+        .team_next => |route| return serveTeamNext(env, alloc, route, format),
         .date_alias => |route| return serveDateAlias(env, alloc, route, format, zone),
         .week_alias => |route| return serveWeekAlias(env, alloc, route, format),
         .date_event => |route| return serveDateEvent(env, alloc, route, format, zone),
@@ -767,6 +769,106 @@ fn serveTeamGame(
     return game_resp;
 }
 
+/// Last-game shortcut `/{league}/{abbr}/last`: the live in-progress
+/// game first, else the most-recent completed game, else the team page
+/// itself — so an existing team never 404s here (unknown teams 404 like
+/// `serveToday`). The `/api/v1/` twin keeps the numeric id (JSON keeps
+/// ids). Fresh-only, no-store. Reuses the one `fetchTeam` schedule view;
+/// no extra upstream fetch.
+fn serveTeamLast(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TeamLastRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const day = try tz.resolveDay(alloc, null, epochSecondsNow(), .et);
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr, day) catch |err| {
+        if (core.isNotFound(err)) {
+            return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN team fetch failed for {s} {s}", .{ league.slug, route.abbr });
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const target = if (core.schedule.findLastGame(view)) |game|
+        if (route.api)
+            try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+        else
+            try vd.scheduleGameHref(alloc, league.slug, route.abbr, game)
+    else if (route.api)
+        try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, route.abbr })
+    else
+        try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, route.abbr });
+    const game_body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var game_resp = workers.Response.new();
+    game_resp.setStatus(.found);
+    game_resp.setHeader("location", target);
+    game_resp.setHeader("cache-control", "no-store");
+    game_resp.setHeader("x-content-type-options", "nosniff");
+    game_resp.setBody(game_body);
+    return game_resp;
+}
+
+/// Next-game shortcut `/{league}/{abbr}/next`: the soonest upcoming
+/// game, else the team page itself — so an existing team never 404s here
+/// (unknown teams 404 like `serveToday`). The `/api/v1/` twin keeps the
+/// numeric id (JSON keeps ids). Fresh-only, no-store. Reuses the one
+/// `fetchTeam` schedule view; no extra upstream fetch.
+fn serveTeamNext(
+    env: *workers.Env,
+    alloc: std.mem.Allocator,
+    route: router.TeamNextRoute,
+    format: router.Format,
+) !workers.Response {
+    const league = core.leagues.find(route.league) orelse {
+        return errorResponse(alloc, "unknown league; see /api/v1/leagues", format, .not_found);
+    };
+    var transport_state = WorkerTransport{};
+    const base_url = (try env.get("SPRTS_ESPN_BASE_URL")) orelse default_base_url;
+    const adapter = provider.EspnAdapter{
+        .allocator = alloc,
+        .io = workers.io(),
+        .base_url = base_url,
+        .transport = transport_state.asTransport(),
+        .clock = workerClock,
+    };
+    const day = try tz.resolveDay(alloc, null, epochSecondsNow(), .et);
+    const view = provider.fetchTeam(adapter, alloc, league, route.abbr, day) catch |err| {
+        if (core.isNotFound(err)) {
+            return errorResponse(alloc, "unknown team; see /api/v1/leagues", format, .not_found);
+        }
+        workers.log("upstream ESPN team fetch failed for {s} {s}", .{ league.slug, route.abbr });
+        return errorResponse(alloc, "scores are temporarily unavailable", format, .bad_gateway);
+    };
+    const target = if (core.schedule.findNextGame(view)) |game|
+        if (route.api)
+            try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+        else
+            try vd.scheduleGameHref(alloc, league.slug, route.abbr, game)
+    else if (route.api)
+        try std.fmt.allocPrint(alloc, "/api/v1/{s}/{s}", .{ league.slug, route.abbr })
+    else
+        try std.fmt.allocPrint(alloc, "/{s}/{s}", .{ league.slug, route.abbr });
+    const game_body = try std.fmt.allocPrint(alloc, "{s}\n", .{target});
+    var game_resp = workers.Response.new();
+    game_resp.setStatus(.found);
+    game_resp.setHeader("location", target);
+    game_resp.setHeader("cache-control", "no-store");
+    game_resp.setHeader("x-content-type-options", "nosniff");
+    game_resp.setBody(game_body);
+    return game_resp;
+}
 /// Human game alias, date form `/{league}/{date}/{away}-{home}[-N]`: resolve
 /// the day in the request zone, fetch that board fresh, redirect to the
 /// numeric (legacy) `/{league}/{id}` (a miss 404s: plain on all-duel days,

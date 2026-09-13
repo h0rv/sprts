@@ -230,6 +230,8 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  /{league}/YYYY/weekN/event[-N] Nth game of the football week: /nfl/2026/week1/event-3\n" ++
             "  /{league}/{abbr}/today today's game, 302 to it (team page fallback; curl -L)\n" ++
             "  /{league}/{abbr}/game most relevant game (live, today, else most recent), 302 to it (team page fallback, never 404; curl -L)\n" ++
+            "  /{league}/{abbr}/last last game (live when on, else most recent completed), 302 to it (team page fallback, never 404; curl -L)\n" ++
+            "  /{league}/{abbr}/next next scheduled game, 302 to it (team page fallback, never 404; curl -L)\n" ++
             "  duel-only: no abbr pair matches cards, races, tournaments, or name-only duels - those use event-N; that 404 names the ordinal form plus the day board\n" ++
             "\n" ++
             "TEXT HTML JSON\n" ++
@@ -278,6 +280,8 @@ pub fn llmsTxt(allocator: std.mem.Allocator) ![]u8 {
             "  curl -L localhost:8080/nfl/2026/week1/ne-sea\n" ++
             "  curl -L localhost:8080/mlb/PHI/today\n" ++
             "  curl -L localhost:8080/mlb/PHI/game\n" ++
+            "  curl -L localhost:8080/mlb/PHI/last\n" ++
+            "  curl -L localhost:8080/mlb/PHI/next\n" ++
             "  curl localhost:8080/openapi.json\n" ++
             "\n" ++
             "LEAGUES\n" ++

@@ -37,6 +37,15 @@ Sleep 400ms
 Type "timeout 5 curl -sN 'localhost:8080/mlb?stream=sse' | sed 's/^data: //; /^data:$/d'"
 Enter
 Sleep 5600ms
+Type "# last/next shortcuts: live-or-recent and next scheduled (curl -L follows the 302)"
+Enter
+Sleep 400ms
+Type "curl -sL localhost:8080/mlb/PHI/last | head -12"
+Enter
+Sleep 2000ms
+Type "curl -sL localhost:8080/mlb/PHI/next | head -12"
+Enter
+Sleep 2000ms
 Type "# Phillies live right now: stream their game"
 Enter
 Sleep 400ms
