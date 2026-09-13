@@ -974,8 +974,13 @@ pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, bo
             continue;
         }
         if (line[0] == '/') {
-            // The trailing `/{league}?date=` footer carries no links.
-            try escapeInto(w, line);
+            // The trailing `/{league}?date=` footer: every `?date=` half
+            // is its own query-param link (same visible text the text
+            // renderer prints, so curl output never changes). `rel` plus
+            // `aria-label` name the prev/next direction for assistive
+            // tech; non-nav `/` lines (hostile statuses) escape as plain
+            // text, as before.
+            try writeLinkedNavLine(w, line);
             try w.writeByte('\n');
             continue;
         }
@@ -1062,6 +1067,77 @@ pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, bo
     }
 }
 
+/// True when a status tail token is a zone label (`ET`, `EST`/`EDT`,
+/// `UTC`/`GMT`, `UTC±…`): the `tz.zoneTag` vocabulary plus the specific
+/// Eastern forms the provider still ships (`normalizeEastern` folds those
+/// to `ET` in home tails; scoreboard cards print the raw status).
+fn isZoneToken(token: []const u8) bool {
+    if (std.mem.eql(u8, token, "ET")) return true;
+    if (std.mem.eql(u8, token, "EST")) return true;
+    if (std.mem.eql(u8, token, "EDT")) return true;
+    if (std.mem.eql(u8, token, "UTC")) return true;
+    if (std.mem.eql(u8, token, "GMT")) return true;
+    if (std.mem.startsWith(u8, token, "UTC+") or std.mem.startsWith(u8, token, "UTC-")) return true;
+    return false;
+}
+
+/// Status text with its trailing zone glued: when the fitted line ends in
+/// a zone tag, the last two words ride one `white-space:nowrap` span
+/// (`9/13 - 8:20 PM ET` keeps `PM ET` together) so a narrow phone never
+/// strands the zone on its own line. The span strips clean, so `<pre>`
+/// visible text never changes; lines without a trailing zone (or a lone
+/// zone) escape as plain text.
+fn writeGluedStatus(w: *std.Io.Writer, s: []const u8) !void {
+    const last_sp = std.mem.lastIndexOfScalar(u8, s, ' ') orelse {
+        try escapeInto(w, s);
+        return;
+    };
+    if (!isZoneToken(s[last_sp + 1 ..])) {
+        try escapeInto(w, s);
+        return;
+    }
+    const head = s[0..last_sp];
+    const glue_at = if (std.mem.lastIndexOfScalar(u8, head, ' ')) |p| p + 1 else 0;
+    try escapeInto(w, s[0..glue_at]);
+    try w.writeAll("<span class=\"nobr\">");
+    try escapeInto(w, s[glue_at..]);
+    try w.writeAll("</span>");
+}
+
+/// In-`<pre>` date-nav footer (`/{league}?date={prev}    /{league}?date={next}`):
+/// each `?date=` half becomes its own link with byte-identical visible
+/// text, so the text renderer stays the single source of layout. Only
+/// invisible tags are added, so visible-text parity holds.
+fn writeLinkedNavLine(w: *std.Io.Writer, line: []const u8) !void {
+    var i: usize = 0;
+    var linked: usize = 0;
+    while (i < line.len) {
+        if (line[i] == ' ') {
+            try w.writeByte(' ');
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < line.len and line[j] != ' ') : (j += 1) {}
+        const token = line[i..j];
+        if (token.len > 1 and token[0] == '/' and std.mem.indexOf(u8, token, "?date=") != null) {
+            try w.writeAll("<a href=\"");
+            try escapeInto(w, token);
+            if (linked == 0) {
+                try w.writeAll("\" rel=\"prev\" aria-label=\"previous day\">");
+            } else {
+                try w.writeAll("\" rel=\"next\" aria-label=\"next day\">");
+            }
+            try escapeInto(w, token);
+            try w.writeAll("</a>");
+            linked += 1;
+        } else {
+            try escapeInto(w, token);
+        }
+        i = j;
+    }
+}
+
 /// Status (or name-only) row for one game: the trimmed line becomes the
 /// game link and carries the per-game anchor id. The href is the human
 /// `/{league}/{date}/{slug}` (numeric legacy fallback inside), while the
@@ -1069,6 +1145,9 @@ pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, bo
 /// Made `with_id` so a caller can reuse the wrapper for rows that already
 /// live inside a linked context without duplicating ids. Padding never
 /// enters the anchor, so underlines stop at the text.
+/// The trailing zone (if any) rides a `white-space:nowrap` span with its
+/// time inside the anchor (see `writeGluedStatus`), so narrow phones never
+/// strand it while visible text stays byte-identical.
 fn writeGameStatusRow(
     w: *std.Io.Writer,
     allocator: std.mem.Allocator,
@@ -1088,7 +1167,7 @@ fn writeGameStatusRow(
         try escapeInto(w, game.id);
     }
     try w.writeAll("\">");
-    try escapeInto(w, trimmed);
+    try writeGluedStatus(w, trimmed);
     try w.writeAll("</a>");
     try w.writeByte('\n');
 }
@@ -1646,7 +1725,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
+    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
 ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -2369,6 +2448,132 @@ test "scoreHtml narrow width keeps links and layout" {
     try std.testing.expect(std.mem.indexOf(u8, page, "+1 more") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
     try expectVisiblePreText(page, board, 40, 2);
+}
+
+test "mobile widths keep rows fitted with the zone glued" {
+    // Narrow-phone battery: the 52-column minimum clamps width 40 up, and
+    // no emitted row may exceed its effective width or strand the zone
+    // label on its own line. `tz.zoneTag` stays generic (`ET`) and the
+    // kickoff keeps its time and zone on one row at every size.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-13",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "dal-nyg",
+                .name = "DAL at NYG",
+                .starts_at = "2026-09-14T00:20Z",
+                .state = "pre",
+                .status = "9/13 - 8:20 PM EDT",
+                .participants = &.{
+                    .{ .id = "a", .name = "Dallas Cowboys", .abbreviation = "DAL", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "New York Giants", .abbreviation = "NYG", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+            // Live tail keeps the board rich so the zone status renders
+            // its full card row (a pre/post board goes compact).
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-13T23:00Z",
+                .state = "in",
+                .status = "Q3 0:00",
+                .participants = &.{},
+            },
+        },
+    };
+    for ([_]u16{ 40, 52, 80, 200 }) |width| {
+        const effective: usize = @min(@max(width, 52), 200);
+        const body = try textWithZoneArt(arena, board, false, width, null, .et, true);
+        defer arena.free(body);
+        // Heading names its zone on one fitted row.
+        try std.testing.expect(std.mem.indexOf(u8, body, "NFL  2026-09-13 ET") != null);
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        var rows: usize = 0;
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            rows += 1;
+            try std.testing.expect(table.textCells(line) <= effective);
+            // No orphaned zone token: no row is a bare zone, and the
+            // kickoff keeps its time and zone on the same row.
+            try std.testing.expect(!isZoneToken(std.mem.trim(u8, line, " ")));
+            if (std.mem.indexOf(u8, line, "8:20 PM") != null) {
+                try std.testing.expect(std.mem.indexOf(u8, line, "EDT") != null);
+            }
+        }
+        try std.testing.expect(rows > 0);
+        _ = try std.unicode.Utf8View.init(body);
+    }
+}
+
+test "mobile html glues the zone and stays narrow-friendly" {
+    // The kickoff status `9/13 - 8:20 PM ET` keeps `PM ET` in one
+    // `white-space:nowrap` span so phones never strand the zone; the page
+    // head still carries the viewport meta and the `<pre>` still wraps
+    // instead of scrolling sideways. Glue adds no visible text.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-13",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "dal-nyg",
+                .name = "DAL at NYG",
+                .starts_at = "2026-09-14T00:20Z",
+                .state = "pre",
+                .status = "9/13 - 8:20 PM ET",
+                .participants = &.{
+                    .{ .id = "a", .name = "Dallas Cowboys", .abbreviation = "DAL", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "New York Giants", .abbreviation = "NYG", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "2",
+                .name = "Later",
+                .starts_at = "2026-09-13T23:00Z",
+                .state = "in",
+                .status = "Q3 0:00",
+                .participants = &.{},
+            },
+        },
+    };
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "name=\"viewport\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "width=device-width") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"nobr\">PM ET</span>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, ".nobr{white-space:nowrap}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "white-space:pre-wrap;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "overflow:hidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    _ = try std.unicode.Utf8View.init(page);
+}
+
+test "query-param nav links in html, stays plain in text" {
+    // Prev/next `?date=` footer halves are real links on the web with the
+    // same hrefs and the same visible text; the CLI bytes stay exactly the
+    // plain `/mlb?date=…` line they always were.
+    const arena = std.testing.allocator;
+    const board = testBoard();
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "/mlb?date=2026-09-05    /mlb?date=2026-09-07") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<a href") == null);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-05\" rel=\"prev\" aria-label=\"previous day\">/mlb?date=2026-09-05</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-07\" rel=\"next\" aria-label=\"next day\">/mlb?date=2026-09-07</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    _ = try std.unicode.Utf8View.init(page);
 }
 
 test "empty abbreviations emit no team link, text and HTML" {
