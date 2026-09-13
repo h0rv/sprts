@@ -122,19 +122,32 @@ pub const Scoreboard = struct {
 /// True when a game can wear the duel form: exactly two participants,
 /// both abbreviated (cards, races, fields, and athlete duels fail this
 /// and take the ordinal form, like the alias lookup downstream). The
-/// provider's missing-value placeholder ("?") is no abbreviation: a "?"
-/// side takes the ordinal form too, since the alias router only parses
-/// 1-8 ASCII alnum and a stamped `?-` duel slug could never resolve.
+/// provider's missing-value placeholder ("?") and ESPN's TBD/TBA sides
+/// are no abbreviation, nor is a duplicated pair (same abbr both sides:
+/// TBD-vs-TBD placeholders, never a real matchup), nor any abbreviation
+/// the alias router cannot parse (1-8 ASCII alnum): such games take the
+/// ordinal form too, since a stamped unroutable duel slug could never
+/// resolve.
 pub fn isDuelGame(game: Game) bool {
     if (game.participants.len != 2) return false;
-    return isRoutableAbbr(game.participants[0].abbreviation) and isRoutableAbbr(game.participants[1].abbreviation);
+    const a = game.participants[0].abbreviation;
+    const b = game.participants[1].abbreviation;
+    if (!isRoutableAbbr(a) or !isRoutableAbbr(b)) return false;
+    // A duplicated pair names no matchup (TBD-vs-TBD placeholders); the
+    // ordinal form keeps it addressable without colliding with real duels.
+    if (std.ascii.eqlIgnoreCase(a, b)) return false;
+    return true;
 }
 
-/// True when an abbreviation can name a duel side: non-empty and not the
-/// provider's missing-value placeholder.
+/// True when an abbreviation can name a duel side: 1-8 ASCII alnum (the
+/// alias router's `isAliasAbbr` shape, mirrored here so every stamped
+/// slug parses), and not a placeholder ("?", TBD/TBA in any casing).
 fn isRoutableAbbr(abbreviation: []const u8) bool {
-    if (abbreviation.len == 0) return false;
+    if (abbreviation.len == 0 or abbreviation.len > 8) return false;
     if (std.mem.eql(u8, abbreviation, "?")) return false;
+    if (std.ascii.eqlIgnoreCase(abbreviation, "tbd")) return false;
+    if (std.ascii.eqlIgnoreCase(abbreviation, "tba")) return false;
+    for (abbreviation) |c| if (!std.ascii.isAlphanumeric(c)) return false;
     return true;
 }
 
@@ -320,4 +333,31 @@ test "game href prefers the slug, falls back to the numeric id" {
     const legacy = try gameHref(arena, "mlb", "2026-09-09", slugDuel(&parts));
     defer arena.free(legacy);
     try std.testing.expectEqualStrings("/mlb/x", legacy);
+}
+
+test "crew-f placeholders, duplicates, and unroutable abbrevs take ordinals" {
+    const arena = std.testing.allocator;
+    const bad = [_][2][]const u8{
+        .{ "?", "?" },
+        .{ "KNO", "?" },
+        .{ "", "DET" },
+        .{ "TBD", "TBD" },
+        .{ "tbd", "KNO" },
+        .{ "TBA", "KNO" },
+        .{ "MIN", "MIN" },
+        .{ "min", "MIN" },
+        .{ "M.IN", "DET" },
+        .{ "TOOLONGABBR", "DET" },
+    };
+    for (bad) |pair| {
+        const parts = slugParticipants(pair[0], pair[1]);
+        try std.testing.expect(!isDuelGame(slugDuel(&parts)));
+        const games = [_]Game{slugDuel(&parts)};
+        const slug = try boardGameSlug(arena, &games, 0);
+        defer arena.free(slug);
+        try std.testing.expectEqualStrings("event-1", slug);
+    }
+    // Routable pairs still duel, case-insensitively.
+    const good = slugParticipants("MIN", "DET");
+    try std.testing.expect(isDuelGame(slugDuel(&good)));
 }
