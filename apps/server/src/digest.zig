@@ -347,9 +347,10 @@ fn degradedSlugs(allocator: std.mem.Allocator, sections: []const DigestSection) 
 /// section's board slice), so every status cell links its game view and
 /// every abbreviation links its team page — same anchors, same
 /// scoped-underline CSS (padding outside anchors), same empty-abbr guard
-/// as scoreboards. Digest-level lines (outage markers, `+N more`
-/// pointers) escape as plain text; only invisible tags are added, so the
-/// `<pre>` visible text matches the quiet text digest byte for byte.
+/// as scoreboards. The `+N more` pointer links its league day with the
+/// same visible text the text digest prints; outage markers escape as
+/// plain text. Only invisible tags are added, so the `<pre>` visible text
+/// matches the quiet text digest byte for byte.
 ///
 /// When `dated` the page reuses the home recap shape instead (see
 /// `datedHtml`): section bodies link like the home rows (sibling game +
@@ -418,8 +419,15 @@ pub fn htmlWithZoneArt(allocator: std.mem.Allocator, sections: []const DigestSec
         if (capped < board.games.len) {
             const pointer = try std.fmt.allocPrint(allocator, "+{d} more -> /{s}?date={s}", .{ board.games.len - capped, board.league, day });
             defer allocator.free(pointer);
+            const href = try std.fmt.allocPrint(allocator, "/{s}?date={s}", .{ board.league, day });
+            defer allocator.free(href);
+            // Query-param link in HTML, plain `+N more -> /…` line in
+            // text: same visible text, so parity holds either way.
+            try w.writeAll("<a href=\"");
+            try render.escapeInto(w, href);
+            try w.writeAll("\">");
             try render.escapeInto(w, pointer);
-            try w.writeByte('\n');
+            try w.writeAll("</a>\n");
         }
     }
     try w.writeAll("</pre><nav>");
@@ -550,8 +558,13 @@ fn datedHtml(
             if (capped < board.games.len) {
                 const pointer = try std.fmt.allocPrint(allocator, "+{d} more -> /{s}?date={s}", .{ board.games.len - capped, board.league, day });
                 defer allocator.free(pointer);
+                const more_href = try datedLeagueHref(allocator, board.league, day);
+                defer allocator.free(more_href);
+                try sec.writer.writeAll("<a href=\"");
+                try render.escapeInto(&sec.writer, more_href);
+                try sec.writer.writeAll("\">");
                 try render.escapeInto(&sec.writer, pointer);
-                try sec.writer.writeByte('\n');
+                try sec.writer.writeAll("</a>\n");
             }
         }
         const rendered = try sec.toOwnedSlice();
@@ -1316,6 +1329,59 @@ test "digest hostile fixture keeps text and HTML visible text equal" {
     const seen = try view.expectVisibleParity(arena, page);
     defer arena.free(seen);
     try std.testing.expectEqualStrings(body, seen);
+}
+
+test "digest more pointer links in html, stays plain in text" {
+    // Seven games pin the default cap at five: the `+2 more ->
+    // /mlb?date=…` pointer is a real query-param link on the web with the
+    // same href and the same visible text; the CLI bytes stay exactly the
+    // plain pointer line they always were. Dated views link the same way.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const games = try arena.alloc(core.domain.Game, 7);
+    for (games, 0..) |*game, i| {
+        game.* = .{
+            .id = try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .name = "Away at Home",
+            .starts_at = "2026-09-06T17:00Z",
+            .state = "post",
+            .status = "Final",
+            .participants = &.{
+                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false },
+                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
+            },
+        };
+    }
+    const board: core.domain.Scoreboard = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .date = "2026-09-06",
+        .source = "test",
+        .games = games,
+    };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = board },
+    };
+    const body = try text(arena, &sections, "2026-09-06", false, null, null, true, false);
+    try std.testing.expect(std.mem.indexOf(u8, body, "+2 more -> /mlb?date=2026-09-06") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "<a href") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    const page = try html(arena, &sections, "2026-09-06", null, null, false, false);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-06\">+2 more -&gt; /mlb?date=2026-09-06</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(page);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+    // Dated past view: same pointer, same link, same parity.
+    const dated_body = try text(arena, &sections, "2026-09-06", false, null, null, true, true);
+    try std.testing.expect(std.mem.indexOf(u8, dated_body, "+2 more -> /mlb?date=2026-09-06") != null);
+    const dated_page = try html(arena, &sections, "2026-09-06", null, null, false, true);
+    try std.testing.expect(std.mem.indexOf(u8, dated_page, "<a href=\"/mlb?date=2026-09-06\">+2 more -&gt; /mlb?date=2026-09-06</a>") != null);
+    const dated_seen = try view.expectVisibleParity(arena, dated_page);
+    defer arena.free(dated_seen);
+    try std.testing.expectEqualStrings(dated_body, dated_seen);
 }
 
 test "digest html links every shown game and team like scoreboards" {
