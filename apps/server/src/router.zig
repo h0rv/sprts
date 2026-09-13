@@ -80,6 +80,30 @@ pub const TeamGameRoute = struct {
     api: bool,
 };
 
+/// Human shortcut: `/{league}/{abbr}/last` jumps to the team's most
+/// recent game — the live in-progress game when one is on, else the
+/// most-recent completed game — or falls back to the team page itself
+/// when the team has no completed games (never 404s for an existing
+/// team). Same redirect mechanics as `TeamGameRoute` (302, no-store,
+/// numeric id resolution, `/api/v1/` twin keeps the id). Display flags
+/// are meaningless on a redirect and stay unset.
+pub const TeamLastRoute = struct {
+    league: []const u8,
+    abbr: []const u8,
+    api: bool,
+};
+
+/// Human shortcut: `/{league}/{abbr}/next` jumps to the team's next
+/// scheduled game — the soonest upcoming row — or falls back to the team
+/// page itself when the team has nothing scheduled (never 404s for an
+/// existing team). Same redirect mechanics as `TeamGameRoute`.
+/// Display flags are meaningless on a redirect and stay unset.
+pub const TeamNextRoute = struct {
+    league: []const u8,
+    abbr: []const u8,
+    api: bool,
+};
+
 /// Human game address, date form: `/{league}/{YYYY-MM-DD}/{away}-{home}`
 /// (lowercase abbrevs, e.g. `/mlb/2026-09-09/min-det`; the relative tokens
 /// `today|tomorrow|yesterday` ride too). This is the linked (canonical
@@ -220,6 +244,8 @@ pub const Route = union(enum) {
     teams: TeamsRoute,
     today: TodayRoute,
     team_game: TeamGameRoute,
+    team_last: TeamLastRoute,
+    team_next: TeamNextRoute,
     date_alias: DateAliasRoute,
     week_alias: WeekAliasRoute,
     date_event: DateEventRoute,
@@ -294,7 +320,11 @@ pub fn parse(target: []const u8) Route {
     // Human shortcuts: /{league}/{abbr}/today redirects to the team's
     // game today (team page fallback when none); /{league}/{abbr}/game
     // redirects to the team's most relevant game (live, today, else most
-    // recent; team page fallback, never 404 for an existing team). Caught
+    // recent; team page fallback, never 404 for an existing team);
+    // /{league}/{abbr}/last redirects to the live game when one is on,
+    // else the most-recent completed game (team page fallback, never 404);
+    // /{league}/{abbr}/next redirects to the next scheduled game (team
+    // page fallback, never 404). Caught
     // before the game/team split, which only sees two segments; anything
     // deeper or different stays not_found.
     if (std.mem.indexOfScalar(u8, slug, '/')) |slash| {
@@ -325,6 +355,27 @@ pub fn parse(target: []const u8) Route {
                 !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
             {
                 return .{ .team_game = .{
+                    .league = league,
+                    .abbr = seg2,
+                    .api = api,
+                } };
+            }
+            // Last-game shortcut (see TeamLastRoute) and next-game
+            // shortcut (see TeamNextRoute): same reserved-word guard as
+            // `game`, so no tab or help page is shadowed.
+            if (seg2.len > 0 and std.mem.eql(u8, seg3, "last") and
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
+            {
+                return .{ .team_last = .{
+                    .league = league,
+                    .abbr = seg2,
+                    .api = api,
+                } };
+            }
+            if (seg2.len > 0 and std.mem.eql(u8, seg3, "next") and
+                !isHelpSegment(seg2) and !isStandingsSegment(seg2) and !isTeamsSegment(seg2) and !isTourSegment(seg2))
+            {
+                return .{ .team_next = .{
                     .league = league,
                     .abbr = seg2,
                     .api = api,
@@ -1085,6 +1136,42 @@ test "game shortcut parses team scope with address family" {
     try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/game?color=0").team_game.abbr);
 }
 
+test "last and next shortcuts parse team scope with address family" {
+    const last = parse("/mlb/PHI/last").team_last;
+    try std.testing.expectEqualStrings("mlb", last.league);
+    try std.testing.expectEqualStrings("PHI", last.abbr);
+    try std.testing.expect(!last.api);
+    const last_api = parse("/api/v1/mlb/PHI/last").team_last;
+    try std.testing.expect(last_api.api);
+    try std.testing.expectEqualStrings("PHI", last_api.abbr);
+    const next = parse("/mlb/PHI/next").team_next;
+    try std.testing.expectEqualStrings("mlb", next.league);
+    try std.testing.expectEqualStrings("PHI", next.abbr);
+    try std.testing.expect(!next.api);
+    const next_api = parse("/api/v1/mlb/PHI/next").team_next;
+    try std.testing.expect(next_api.api);
+    try std.testing.expectEqualStrings("PHI", next_api.abbr);
+    // Deeper paths, wrong tails, and reserved words stay not_found.
+    try std.testing.expect(parse("/mlb/PHI/last/x") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/next/x") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/LAST") == .not_found);
+    try std.testing.expect(parse("/mlb/PHI/NEXT") == .not_found);
+    try std.testing.expect(parse("/mlb//last") == .not_found);
+    try std.testing.expect(parse("/mlb//next") == .not_found);
+    try std.testing.expect(parse("/mlb/help/last") == .not_found);
+    try std.testing.expect(parse("/mlb/standings/next") == .not_found);
+    try std.testing.expect(parse("/mlb/teams/last") == .not_found);
+    try std.testing.expect(parse("/mlb/tour/next") == .not_found);
+    // A date in the middle is not a reserved word: like `/today` it parses
+    // (dispatch 404s it as an unknown team).
+    try std.testing.expect(parse("/mlb/2026-09-09/last") == .team_last);
+    try std.testing.expect(parse("/mlb/2026-09-09/next") == .team_next);
+    // The game shortcut is untouched by its siblings.
+    try std.testing.expect(parse("/mlb/PHI/game") == .team_game);
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/last?color=0").team_last.abbr);
+    try std.testing.expectEqualStrings("PHI", parse("/mlb/PHI/next?color=0").team_next.abbr);
+}
+
 test "today shortcut parses team scope with address family" {
     const short = parse("/mlb/PHI/today").today;
     try std.testing.expectEqualStrings("mlb", short.league);
@@ -1488,6 +1575,8 @@ test "art kill-switch parses off case-insensitively, anything else is on" {
     // Redirects and mark-free pages carry no art flag.
     try std.testing.expect(@TypeOf(parse("/mlb/PHI/today").today) == TodayRoute);
     try std.testing.expect(@TypeOf(parse("/mlb/PHI/game").team_game) == TeamGameRoute);
+    try std.testing.expect(@TypeOf(parse("/mlb/PHI/last").team_last) == TeamLastRoute);
+    try std.testing.expect(@TypeOf(parse("/mlb/PHI/next").team_next) == TeamNextRoute);
     try std.testing.expect(@TypeOf(parse("/").home) == HomeRoute);
 }
 

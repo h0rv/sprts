@@ -418,6 +418,93 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             };
             try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
         },
+        .team_last => |game_route| {
+            // Last-game shortcut: the live in-progress game first, else the
+            // most-recent completed game, else the team page itself — so an
+            // existing team never 404s here (unknown teams 404 like
+            // `/today`). Fresh-only, no-store, no query carried over
+            // (today-arm parity). Reuses the one `fetchTeam` schedule view;
+            // no extra upstream fetch.
+            const league = core.leagues.find(game_route.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const day = try server_app.tz.resolveDay(arena, null, now_s, .et);
+            const view = server_app.provider.fetchTeam(adapter, arena, league, game_route.abbr, day) catch |err| {
+                if (core.isNotFound(err)) {
+                    status = .not_found;
+                    try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
+                    return;
+                }
+                status = .bad_gateway;
+                std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, game_route.abbr, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            const dest = if (core.schedule.findLastGame(view)) |game|
+                if (game_route.api)
+                    try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+                else
+                    try server_app.view.scheduleGameHref(arena, league.slug, game_route.abbr, game)
+            else if (game_route.api)
+                try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game_route.abbr })
+            else
+                try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game_route.abbr });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
+        .team_next => |game_route| {
+            // Next-game shortcut: the soonest upcoming game, else the team
+            // page itself — so an existing team never 404s here (unknown
+            // teams 404 like `/today`). Fresh-only, no-store, no query
+            // carried over (today-arm parity). Reuses the one `fetchTeam`
+            // schedule view; no extra upstream fetch.
+            const league = core.leagues.find(game_route.league) orelse {
+                status = .not_found;
+                try respondError(arena, request, "unknown league; see /api/v1/leagues", format, .not_found);
+                return;
+            };
+            const day = try server_app.tz.resolveDay(arena, null, now_s, .et);
+            const view = server_app.provider.fetchTeam(adapter, arena, league, game_route.abbr, day) catch |err| {
+                if (core.isNotFound(err)) {
+                    status = .not_found;
+                    try respondError(arena, request, "unknown team; see /api/v1/leagues", format, .not_found);
+                    return;
+                }
+                status = .bad_gateway;
+                std.log.warn("ESPN team request failed for {s}/{s}: {t}", .{ league.slug, game_route.abbr, err });
+                try respondError(arena, request, "scores are temporarily unavailable", format, .bad_gateway);
+                return;
+            };
+            const dest = if (core.schedule.findNextGame(view)) |game|
+                if (game_route.api)
+                    try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game.id })
+                else
+                    try server_app.view.scheduleGameHref(arena, league.slug, game_route.abbr, game)
+            else if (game_route.api)
+                try std.fmt.allocPrint(arena, "/api/v1/{s}/{s}", .{ league.slug, game_route.abbr })
+            else
+                try std.fmt.allocPrint(arena, "/{s}/{s}", .{ league.slug, game_route.abbr });
+            defer arena.free(dest);
+            status = .found;
+            const redirect_body = try std.fmt.allocPrint(arena, "{s}\n", .{dest});
+            defer arena.free(redirect_body);
+            const redirect_headers = [_]std.http.Header{
+                .{ .name = "location", .value = dest },
+                .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            };
+            try request.respond(redirect_body, .{ .status = status, .extra_headers = &redirect_headers });
+        },
         .date_alias => |alias| {
             // Human game alias, date form: resolve the day (relative tokens
             // ride the request zone via tz.resolveDay, like the scoreboard),
@@ -785,6 +872,8 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .team => |r| std.fmt.allocPrint(arena, "team/{s}/{s}/{s}", .{ r.league, r.abbr, r.date orelse "today" }),
         .today => |r| std.fmt.allocPrint(arena, "today/{s}/{s}", .{ r.league, r.abbr }),
         .team_game => |r| std.fmt.allocPrint(arena, "team-game/{s}/{s}", .{ r.league, r.abbr }),
+        .team_last => |r| std.fmt.allocPrint(arena, "team-last/{s}/{s}", .{ r.league, r.abbr }),
+        .team_next => |r| std.fmt.allocPrint(arena, "team-next/{s}/{s}", .{ r.league, r.abbr }),
         .date_alias => |r| std.fmt.allocPrint(arena, "date-alias/{s}/{s}", .{ r.league, r.date }),
         .week_alias => |r| std.fmt.allocPrint(arena, "week-alias/{s}/{s}", .{ r.league, r.season }),
         .date_event => |r| std.fmt.allocPrint(arena, "date-event/{s}/{s}", .{ r.league, r.date }),

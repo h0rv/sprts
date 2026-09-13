@@ -155,6 +155,27 @@ pub fn findTodayGame(view: TeamView) ?GameRef {
     return null;
 }
 
+/// Most recent game for `/{league}/{abbr}/last`: the live in-progress
+/// game first (it is the game on right now), else the most-recent
+/// completed game, else null (the caller falls back to the team page
+/// itself, so an existing team never 404s). Pure scan like
+/// `findFeaturedGame`; no day argument — recency is schedule order.
+pub fn findLastGame(view: TeamView) ?GameRef {
+    if (view.live) |live| return live;
+    if (view.last.len > 0) return view.last[0];
+    if (view.extra_past.len > 0) return view.extra_past[0];
+    return null;
+}
+
+/// Next scheduled game for `/{league}/{abbr}/next`: the soonest upcoming
+/// row, else null (the caller falls back to the team page itself).
+/// Pure scan; the live game is not upcoming, so it never answers here.
+pub fn findNextGame(view: TeamView) ?GameRef {
+    if (view.next.len > 0) return view.next[0];
+    if (view.extra_next.len > 0) return view.extra_next[0];
+    return null;
+}
+
 /// Most relevant game for `/{league}/{abbr}/game`: the live in-progress
 /// game first, else today's game (flagged upcoming rows, then finals
 /// played today, newest first), else the most-recent completed game, else
@@ -435,4 +456,69 @@ test "findFeaturedGame prefers live, today, then most-recent completed" {
         .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
     };
     try std.testing.expect(findFeaturedGame(arena, empty, "2026-09-06") == null);
+}
+
+test "findLastGame prefers live, then most-recent completed" {
+    const live = GameRef{ .id = "l", .date = "2026-09-06T19:05Z", .opponent_abbrev = "A", .opponent_name = "A", .home_away = "home", .status = "Top 7th", .state = "in", .result = "1-0 Top 7th" };
+    const recent = GameRef{ .id = "r", .date = "2026-09-05T23:10Z", .opponent_abbrev = "B", .opponent_name = "B", .home_away = "away", .status = "Final", .state = "post", .result = "W 5-3" };
+    const older = GameRef{ .id = "o", .date = "2026-09-04T19:05Z", .opponent_abbrev = "C", .opponent_name = "C", .home_away = "home", .status = "Final", .state = "post", .result = "L 1-2" };
+    const upcoming = GameRef{ .id = "u", .date = "2026-09-08T19:05Z", .opponent_abbrev = "D", .opponent_name = "D", .home_away = "home", .status = "Scheduled", .state = "pre", .result = "vs D" };
+    const base = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .last = &.{recent},
+        .next = &.{upcoming},
+        .extra_past = &.{older},
+    };
+    // Live outranks completed games.
+    var with_live = base;
+    with_live.live = live;
+    try std.testing.expectEqualStrings("l", findLastGame(with_live).?.id);
+    // Otherwise the most-recent completed game wins (upcoming ignored).
+    try std.testing.expectEqualStrings("r", findLastGame(base).?.id);
+    // Beyond-the-window past rows still answer when the window is empty.
+    var overflow_only = base;
+    overflow_only.last = &.{};
+    try std.testing.expectEqualStrings("o", findLastGame(overflow_only).?.id);
+    // Nothing completed yields null: the caller falls back to the team page.
+    const future_only = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .next = &.{upcoming},
+    };
+    try std.testing.expect(findLastGame(future_only) == null);
+}
+
+test "findNextGame returns the soonest upcoming game" {
+    const soon = GameRef{ .id = "s", .date = "2026-09-08T19:05Z", .opponent_abbrev = "B", .opponent_name = "B", .home_away = "home", .status = "Scheduled", .state = "pre", .result = "vs B" };
+    const later = GameRef{ .id = "z", .date = "2026-09-10T19:05Z", .opponent_abbrev = "C", .opponent_name = "C", .home_away = "away", .status = "Scheduled", .state = "pre", .result = "at C" };
+    const past = GameRef{ .id = "p", .date = "2026-09-05T23:10Z", .opponent_abbrev = "D", .opponent_name = "D", .home_away = "away", .status = "Final", .state = "post", .result = "W 5-3" };
+    const live = GameRef{ .id = "l", .date = "2026-09-06T19:05Z", .opponent_abbrev = "A", .opponent_name = "A", .home_away = "home", .status = "Top 7th", .state = "in", .result = "1-0 Top 7th" };
+    const base = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .last = &.{past},
+        .next = &.{ soon, later },
+    };
+    // Soonest upcoming wins (completed games ignored, live ignored).
+    try std.testing.expectEqualStrings("s", findNextGame(base).?.id);
+    var with_live = base;
+    with_live.live = live;
+    try std.testing.expectEqualStrings("s", findNextGame(with_live).?.id);
+    // Beyond-the-window upcoming rows still answer when the window is empty.
+    var overflow_only = base;
+    overflow_only.next = &.{};
+    overflow_only.extra_next = &.{later};
+    try std.testing.expectEqualStrings("z", findNextGame(overflow_only).?.id);
+    // Nothing upcoming yields null: the caller falls back to the team page.
+    const past_only = TeamView{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .last = &.{past},
+    };
+    try std.testing.expect(findNextGame(past_only) == null);
 }

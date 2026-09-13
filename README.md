@@ -79,6 +79,29 @@ docker run --rm -p 8080:8080 sprts
 
 Flags: `?date=YYYY-MM-DD`, `?week=N` for football, `?0` for one line output, `?format=text|html`, `?color=0`, `?art=off`, `?stream=sse`. Date words like `today` and `tomorrow` also work.
 
+## Team shortcuts
+
+Shell-alias friendly redirects for one team's games. Each answers a 302
+to the game (follow it with `curl -L`); an existing team never 404s —
+with nowhere to point, the shortcut falls back to the team page itself.
+
+```sh
+# Last Phillies game: live right now when one is on, else the most recent final
+curl -L https://sprts.horv.co/mlb/phi/last
+alias lastphils='curl -Ls https://sprts.horv.co/mlb/phi/last'
+
+# Next scheduled Phillies game
+curl -L https://sprts.horv.co/mlb/phi/next
+alias nextphils='curl -Ls https://sprts.horv.co/mlb/phi/next'
+
+# Most relevant game (live, today, else most recent) and today's game
+curl -L https://sprts.horv.co/mlb/phi/game
+curl -L https://sprts.horv.co/mlb/phi/today
+```
+
+The `/api/v1/` twins (`/api/v1/mlb/phi/last`, `/api/v1/mlb/phi/next`)
+redirect the same way but keep the numeric game id.
+
 ## Docs
 
 * Live reference: `https://sprts.horv.co/docs`
