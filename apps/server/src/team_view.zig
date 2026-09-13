@@ -1396,3 +1396,47 @@ test "family soccer team view renders draws, standing, and links in text and HTM
         try std.testing.expect(teamContainsLine(text, fitted_full));
     }
 }
+
+// Slug-preferred schedule links: MLB duel rows link the human
+// `/{league}/{date}/{duel}` address in text pointers and HTML anchors;
+// the numeric fallback fires only when no abbr pair exists to name
+// (nameless bouts — never MLB, where ESPN always ships abbreviations).
+// Fixture-only, no ESPN.
+test "team schedule rows prefer pretty hrefs with numeric fallback" {
+    const arena = std.testing.allocator;
+    const view = testView();
+    const text = try renderText(arena, view, false, null, null);
+    defer arena.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/mlb/2026-09-05/nym-phi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/mlb/401814694") == null);
+    const page = try teamHtml(arena, view, "mlb", null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-05/nym-phi\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401814694\">") == null);
+    // Abbrev-less row: numeric legacy fallback on both surfaces.
+    const nameless: schedule.TeamView = .{
+        .league = "mlb",
+        .league_name = "MLB",
+        .team = .{ .id = "22", .abbrev = "PHI", .name = "Philadelphia Phillies" },
+        .last = &.{.{
+            .id = "401814694",
+            .date = "2026-09-05T23:10Z",
+            .opponent_abbrev = "",
+            .opponent_name = "",
+            .home_away = "",
+            .status = "Final",
+            .state = "post",
+            .result = "W 5-3",
+        }},
+    };
+    const fallback_text = try renderText(arena, nameless, false, null, null);
+    defer arena.free(fallback_text);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_text, "/mlb/401814694") != null);
+    const fallback_page = try teamHtml(arena, nameless, "mlb", null, null);
+    defer arena.free(fallback_page);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_page, "<a href=\"/mlb/401814694\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_text, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(text);
+    _ = try std.unicode.Utf8View.init(page);
+}

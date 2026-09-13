@@ -1612,3 +1612,21 @@ test "tour assets are exact vendored filenames only" {
     // the serve layer answers 404 via the league lookup.
     try std.testing.expect(parse("/tour-assets") == .scoreboard);
 }
+
+test "numeric game URLs resolve while slug aliases stay canonical" {
+    // The legacy numeric address keeps rendering: all digits route to the
+    // game view (slug or no slug on the payload).
+    const numeric = parse("/mlb/401816895").game;
+    try std.testing.expectEqualStrings("mlb", numeric.league);
+    try std.testing.expectEqualStrings("401816895", numeric.id);
+    // The API twin keeps the numeric id (JSON keeps ids, no slug twin).
+    const api = parse("/api/v1/mlb/401816895").game;
+    try std.testing.expectEqualStrings("401816895", api.id);
+    // The human slug forms route to their alias resolvers, never the team
+    // view and never the numeric game route.
+    try std.testing.expect(parse("/mlb/2026-09-11/phi-nym") == .date_alias);
+    try std.testing.expect(parse("/mlb/2026-09-11/event-3") == .date_event);
+    try std.testing.expect(parse("/mlb/2026-09-11/phi-nym") != .game);
+    // Aliases are human-only: the /api/v1/ spelling has no twin.
+    try std.testing.expect(parse("/api/v1/mlb/2026-09-11/phi-nym") == .not_found);
+}

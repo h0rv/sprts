@@ -121,10 +121,21 @@ pub const Scoreboard = struct {
 /// `gameHref`), matching the human alias routes.
 /// True when a game can wear the duel form: exactly two participants,
 /// both abbreviated (cards, races, fields, and athlete duels fail this
-/// and take the ordinal form, like the alias lookup downstream).
+/// and take the ordinal form, like the alias lookup downstream). The
+/// provider's missing-value placeholder ("?") is no abbreviation: a "?"
+/// side takes the ordinal form too, since the alias router only parses
+/// 1-8 ASCII alnum and a stamped `?-` duel slug could never resolve.
 pub fn isDuelGame(game: Game) bool {
     if (game.participants.len != 2) return false;
-    return game.participants[0].abbreviation.len > 0 and game.participants[1].abbreviation.len > 0;
+    return isRoutableAbbr(game.participants[0].abbreviation) and isRoutableAbbr(game.participants[1].abbreviation);
+}
+
+/// True when an abbreviation can name a duel side: non-empty and not the
+/// provider's missing-value placeholder.
+fn isRoutableAbbr(abbreviation: []const u8) bool {
+    if (abbreviation.len == 0) return false;
+    if (std.mem.eql(u8, abbreviation, "?")) return false;
+    return true;
 }
 
 fn lowerDuplicated(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -257,6 +268,39 @@ test "board slugs disambiguate doubleheaders, ordinals count every game" {
         defer arena.free(slug);
         try std.testing.expectEqualStrings(want[i], slug);
     }
+}
+
+test "placeholder abbreviations take the ordinal form, hrefs stay routable" {
+    // "?" is the provider's missing-value default, not a team: duel checks
+    // reject it so no `?-` slug stamps (the alias router only parses 1-8
+    // ASCII alnum and would 404 such a href). The game falls back to its
+    // board ordinal, which resolves through the date_event arm.
+    const arena = std.testing.allocator;
+    const mystery = [2]Participant{
+        .{ .id = "a", .name = "Known FC", .abbreviation = "KNO", .score = "", .winner = false },
+        .{ .id = "b", .name = "Mystery FC", .abbreviation = "?", .score = "", .winner = false },
+    };
+    try std.testing.expect(!isDuelGame(slugDuel(&mystery)));
+    const games = [_]Game{slugDuel(&mystery)};
+    const slug = try boardGameSlug(arena, &games, 0);
+    defer arena.free(slug);
+    try std.testing.expectEqualStrings("event-1", slug);
+    const href = try gameHref(arena, "ucl", "2026-09-10", games[0]);
+    defer arena.free(href);
+    // Hand-built rows carry no stamped slug, so the numeric id still
+    // addresses them (the provider stamps ordinals at parse time).
+    try std.testing.expectEqualStrings("/ucl/x", href);
+    const stamped = try gameHref(arena, "ucl", "2026-09-10", .{
+        .id = "9001",
+        .name = "",
+        .starts_at = "",
+        .state = "pre",
+        .status = "Scheduled",
+        .slug = slug,
+        .participants = &mystery,
+    });
+    defer arena.free(stamped);
+    try std.testing.expectEqualStrings("/ucl/2026-09-10/event-1", stamped);
 }
 
 test "game href prefers the slug, falls back to the numeric id" {

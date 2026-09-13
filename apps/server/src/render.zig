@@ -79,8 +79,8 @@ test "scoreboard json carries both id and slug" {
                 .slug = "event-2",
                 .name = "Grand Prix",
                 .starts_at = "2026-09-09T13:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -114,9 +114,11 @@ test "scoreboard json carries both id and slug" {
 /// All-final boards (at least one game, every `state == "post"`) read as
 /// the home summary instead of full cards: one `view.homeGameLine` row
 /// per game — the same columns as the home rows — with no marks, no TV
-/// lines, and no `game:` pointers. Each row still closes with a
-/// separator rule so the HTML linkifier keys one game link per row.
-/// Empty boards keep their note; any live/scheduled game (or an unknown
+/// lines, and no `game:` pointers. Compact boards carry no per-game
+/// separator rules: the frame opens once under the heading and the rows
+/// run uninterrupted like the homepage (the HTML linkifier keys compact
+/// rows positionally, not off rules — see `writeLinkedScoreboard`).
+/// Empty boards keep their note; any live game (or an unknown
 /// league slug, which has no home geometry to compose) keeps the rich
 /// card form.
 pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, color: bool, width: ?u16, height: ?u16, zone: tz.Zone, art: bool) ![]u8 {
@@ -134,10 +136,12 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
     if (board.games.len == 0) {
         try table.writeLine(w, "No games scheduled.", cols, null, color);
     }
-    // All-final fast form (see the doc comment): one shared home row per
-    // game, decided once for the whole board — never per game — so mixed
-    // boards stay uniformly rich.
-    const compact = board.games.len > 0 and view.boardIsAllFinal(board) and leagues.find(board.league) != null;
+    // Compact fast form (see the doc comment): one shared home row per
+    // game, decided once for the whole board — never per game — so live
+    // boards stay uniformly rich. The gate is pre/post (no live games):
+    // past all-final days, future all-scheduled days, and mixed
+    // post+pre days all read as the homepage rows.
+    const compact = board.games.len > 0 and view.boardIsPrePost(board) and leagues.find(board.league) != null;
     const compact_widths = if (compact) view.scoreboardCompactWidths(board) else view.CompactWidths{ .slug_w = 3, .abbr_w = 2 };
     const compact_league = if (compact) leagues.find(board.league) else null;
     for (board.games[0..shown]) |game| {
@@ -148,7 +152,6 @@ pub fn textWithZoneArt(allocator: std.mem.Allocator, board: domain.Scoreboard, c
                 try std.fmt.allocPrint(allocator, "{s}", .{game.status});
             defer allocator.free(line);
             try table.writeLine(w, line, cols, view.statusAnsi(game.state), color);
-            try table.writeSeparator(w, cols);
             continue;
         }
         try table.writeLine(w, game.status, cols, view.statusAnsi(game.state), color);
@@ -469,7 +472,9 @@ fn gameIsLive(game: domain.Game) bool {
 /// Live games first, then one section per league with games today
 /// (league header links to the league page in HTML), then idle leagues
 /// as links. Leagues with no board (fetch failed) count as idle: the
-/// page never fails because of one league. Rules are sparing: the frame
+/// page never fails because of one league. A league whose every game is
+/// live or nothing-to-show opens no section at all, so a header is never
+/// followed by a blank. Rules are sparing: the frame
 /// opens once at the top and closes once at the bottom; sections breathe
 /// through blank spacer rows, never mid rules — the grid stays quiet
 /// even on dense days.
@@ -510,14 +515,22 @@ fn homeSections(
     if (live) separated = true;
     for (boards) |result| {
         const board = result.board orelse continue;
-        var has_today = false;
+        // Visible-row lookahead: a section opens only when at least one
+        // non-live game composes to a row. A board of nothing-but-live
+        // games regroups under LIVE NOW; a board whose every game is
+        // nothing-to-show (nameless, participant-free, so `homeGameLine`
+        // stays null) opens no bare header — otherwise the inter-section
+        // breather lands directly under the header and reads as a stray
+        // blank inside the section.
+        var has_visible = false;
         for (board.games) |game| {
-            if (!gameIsLive(game)) {
-                has_today = true;
-                break;
-            }
+            if (gameIsLive(game)) continue;
+            const probe = try view.homeGameLine(allocator, result.league, game, slug_w, abbr_w) orelse continue;
+            allocator.free(probe);
+            has_visible = true;
+            break;
         }
-        if (!has_today) continue;
+        if (!has_visible) continue;
         if (separated) try w.writeByte('\n');
         // League header: name plus M/D date (year is implicit in the
         // page heading). Whole line links to the league page in HTML.
@@ -920,6 +933,11 @@ pub fn scoreHtmlArt(allocator: std.mem.Allocator, board: domain.Scoreboard, widt
 /// either way.
 pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, board: domain.Scoreboard, body: []const u8, color_body: []const u8, inner: usize, shown: usize, heading_as_h1: bool) !void {
     _ = inner;
+    // Compact boards (pre/post, no live — see `textWithZoneArt`) carry no
+    // per-game separator rules: heading, one home-summary row per game,
+    // then the `+N more` trailer / footer. Rows link positionally here
+    // instead of off `pending_rule` so text and HTML stay in lockstep.
+    const is_compact = board.games.len > 0 and view.boardIsPrePost(board) and leagues.find(board.league) != null;
     var game_idx: usize = 0;
     var current: ?usize = null;
     var part_pos: usize = 0;
@@ -968,6 +986,20 @@ pub fn writeLinkedScoreboard(w: *std.Io.Writer, allocator: std.mem.Allocator, bo
             try w.writeAll(h1_open);
             try escapeInto(w, line);
             try w.writeAll("</h1>\n");
+            continue;
+        }
+        if (is_compact) {
+            // Rule-less compact rows: each content line owns exactly one
+            // game, in board order. The `+N more` trailer (or note) falls
+            // through to plain text once every shown slot is consumed.
+            if (game_idx < shown) {
+                const game = &board.games[game_idx];
+                game_idx += 1;
+                try writeGameStatusRow(w, allocator, board.league, board.date, game, line, true);
+                continue;
+            }
+            try escapeInto(w, line);
+            try w.writeByte('\n');
             continue;
         }
         if (pending_rule) {
@@ -1727,8 +1759,8 @@ test "text renderer draws a document and no HTML" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -1766,14 +1798,14 @@ test "text renderer draws a document and no HTML" {
                     .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true },
                 },
             },
-            // Scheduled tail keeps the board mixed so the duel renders
-            // its rich card (an all-final board goes compact).
+            // Live tail keeps the board rich so the duel renders its
+            // full card (a pre/post board with no live games goes compact).
             .{
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -1863,15 +1895,15 @@ test "HTML pages link and never carry ANSI" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
     };
     const page = try scoreHtml(std.testing.allocator, board, null, null);
     defer std.testing.allocator.free(page);
-    try std.testing.expect(std.mem.indexOf(u8, page, "<pre>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<pre") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb?date=2026-09-05\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb?date=2026-09-06\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "Final &lt;OT&gt;") != null);
@@ -2233,8 +2265,8 @@ test "scoreHtml art rows stay pos-indexed and unlinked" {
                 .id = "10",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2366,8 +2398,8 @@ test "empty abbreviations emit no team link, text and HTML" {
                 .id = "182773",
                 .name = "Later",
                 .starts_at = "2026-09-10T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2777,14 +2809,14 @@ test "text renderer prints both marks side by side" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
-            // Scheduled tail keeps the board mixed so the duel renders
-            // its rich card (an all-final board goes compact, mark-free).
+            // Live tail keeps the board rich so the duel renders its
+            // full card (a pre/post board with no live games goes compact).
             .{
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2820,14 +2852,14 @@ test "text renderer colors marks and strips them with color=false" {
                     .{ .id = "2", .name = "New York Yankees", .abbreviation = "NYY", .score = "3", .winner = false },
                 },
             },
-            // Scheduled tail keeps the board mixed so the duel renders
-            // its rich card (an all-final board goes compact, mark-free).
+            // Live tail keeps the board rich so the duel renders its
+            // full card (a pre/post board with no live games goes compact).
             .{
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2900,8 +2932,8 @@ test "text renderer prints no mark for teams without one" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2935,8 +2967,8 @@ test "athlete-style rows show the full name with an empty abbr cell" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -2983,8 +3015,8 @@ test "records render after the score in team rows" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -3018,8 +3050,8 @@ test "multibyte names keep the frame aligned" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -3542,8 +3574,8 @@ fn artDuelBoard() domain.Scoreboard {
                 .id = "10",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -3613,8 +3645,8 @@ test "art off drops stacked marks and their interior blanks too" {
                 .id = "8",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -4061,11 +4093,10 @@ test "dated home parity holds for all-final past and scheduled future days" {
 }
 
 test "past scoreboard keeps records, winner colors, marks, and links" {
-    // Content contract for past dates: a mixed board from last season
-    // renders the full today treatment for its final game — records,
-    // winner tick + green, team marks, game/team links — because no
-    // renderer consults the request date, only the board in hand. (An
-    // all-final past board goes compact instead; see the all-final test.)
+    // Content contract for live boards: a board with a live game renders
+    // the full rich card for its final game — records, winner tick +
+    // green, team marks, game/team links. (A pre/post board with no live
+    // games goes compact instead; see the compact test.)
     const arena = std.testing.allocator;
     const board: domain.Scoreboard = .{
         .league = "mlb",
@@ -4085,14 +4116,15 @@ test "past scoreboard keeps records, winner colors, marks, and links" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false, .record = "74-70" },
                 },
             },
-            // Scheduled tail keeps the board mixed so the final renders
-            // its rich card (an all-final board goes compact).
+            // Live tail keeps the board rich so the final renders its
+            // full card (a pre/post board with no live games goes
+            // compact; see the compact test).
             .{
                 .id = "10",
                 .name = "Later",
                 .starts_at = "2025-09-10T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -4196,9 +4228,248 @@ test "all-final scoreboards render compact home-summary rows" {
     try expectVisiblePreText(capped_page, board, null, 1);
 }
 
+test "dated league past day renders compact home rows" {
+    // Bug 1 lock: a past all-final league day (`/{league}?date=`, no live
+    // games) reads as the homepage rows — same `view.homeGameLine`
+    // composer, same widths — with no per-game `─` rules (only the single
+    // header rule), no blank between header and first row, no braille
+    // marks, no TV/records/`game:` lines. Text and HTML stay in lockstep
+    // via the shared composers (`expectVisibleParity`).
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-10",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "sf-lar",
+                .name = "SF at LAR",
+                .starts_at = "2026-09-10T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "San Francisco 49ers", .abbreviation = "SF", .score = "27", .winner = true, .home_away = "away" },
+                    .{ .id = "h", .name = "Los Angeles Rams", .abbreviation = "LAR", .score = "7", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "2",
+                .slug = "dal-nyg",
+                .name = "DAL at NYG",
+                .starts_at = "2026-09-10T20:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "c", .name = "Dallas Cowboys", .abbreviation = "DAL", .score = "24", .winner = true, .home_away = "away" },
+                    .{ .id = "d", .name = "New York Giants", .abbreviation = "NYG", .score = "17", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    try std.testing.expect(view.boardIsPrePost(board));
+    try std.testing.expect(view.boardIsAllFinal(board));
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    // Compact rows equal the shared home composer with the same widths.
+    const widths = view.scoreboardCompactWidths(board);
+    const nfl = core.leagues.find("nfl").?;
+    for (board.games) |game| {
+        const want = try view.homeGameLine(arena, nfl, game, widths.slug_w, widths.abbr_w);
+        defer if (want) |r| arena.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, body, want.?) != null);
+    }
+    // No rich chrome: no marks, no TV, no records, no pointers.
+    try std.testing.expect(!containsBraille(body));
+    for ([_][]const u8{ "TV:", "game:", "(11-3)", "San Francisco 49ers" }) |token| {
+        try std.testing.expect(std.mem.indexOf(u8, body, token) == null);
+    }
+    // Exactly one `─` rule line (the header rule); no per-game rules.
+    var rule_lines: usize = 0;
+    var body_lines = std.mem.splitScalar(u8, body, '\n');
+    while (body_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "─") != null) rule_lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rule_lines);
+    // No blank between header and first row: heading, rule, then the
+    // first compact row immediately (Bug 2 exact-match).
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    const heading = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, heading, "NFL  2026-09-10 ET") != null);
+    const rule = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, rule, "─") != null);
+    const first_row = lines.next().?;
+    try std.testing.expect(first_row.len != 0);
+    try std.testing.expect(std.mem.startsWith(u8, first_row, "nfl"));
+    try std.testing.expect(std.mem.indexOf(u8, first_row, "SF") != null);
+    _ = try std.unicode.Utf8View.init(body);
+    // HTML lockstep: one game link per compact row, visible text equal.
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl/2026-09-10/sf-lar\" id=\"game-1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl/2026-09-10/dal-nyg\" id=\"game-2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+}
+
+test "dated league future scheduled day renders compact home rows" {
+    // Bug 1 lock, future twin: an all-scheduled league day (no live
+    // games) reads as the same compact homepage rows — same composer,
+    // same single-header-rule / no-blank / no-chrome contract as the past
+    // day above. Scheduled rows keep their upcoming tint at emit time.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-18",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "3",
+                .slug = "kc-phi",
+                .name = "KC at PHI",
+                .starts_at = "2026-09-18T17:00Z",
+                .state = "pre",
+                .status = "9/18 - 8:20 PM EDT",
+                .participants = &.{
+                    .{ .id = "a", .name = "Kansas City Chiefs", .abbreviation = "KC", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "Philadelphia Eagles", .abbreviation = "PHI", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    try std.testing.expect(view.boardIsPrePost(board));
+    try std.testing.expect(!view.boardIsAllFinal(board));
+    const body = try text(arena, board, false, null, null);
+    defer arena.free(body);
+    const widths = view.scoreboardCompactWidths(board);
+    const nfl = core.leagues.find("nfl").?;
+    const want = try view.homeGameLine(arena, nfl, board.games[0], widths.slug_w, widths.abbr_w);
+    defer if (want) |r| arena.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, body, want.?) != null);
+    try std.testing.expect(!containsBraille(body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "TV:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "game:") == null);
+    var rule_lines: usize = 0;
+    var body_lines = std.mem.splitScalar(u8, body, '\n');
+    while (body_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "─") != null) rule_lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rule_lines);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    const heading = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, heading, "NFL  2026-09-18 ET") != null);
+    const rule = lines.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, rule, "─") != null);
+    const first_row = lines.next().?;
+    try std.testing.expect(first_row.len != 0);
+    try std.testing.expect(std.mem.startsWith(u8, first_row, "nfl"));
+    _ = try std.unicode.Utf8View.init(body);
+    const page = try scoreHtml(arena, board, null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/nfl/2026-09-18/kc-phi\" id=\"game-3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+}
+
+test "dated league mixed day height-cap keeps rows and more trailer" {
+    // Bug 1 lock, mixed twin: a post+pre day with no live games stays
+    // compact (never rich cards), height-capped with the `+N more`
+    // trailer — and every shown row still links its game view in HTML.
+    const arena = std.testing.allocator;
+    const board: domain.Scoreboard = .{
+        .league = "ncaaf",
+        .league_name = "NCAAF",
+        .date = "2026-09-12",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "osu-mich",
+                .name = "OSU at MICH",
+                .starts_at = "2026-09-12T16:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "Ohio State Buckeyes", .abbreviation = "OSU", .score = "31", .winner = true, .home_away = "away" },
+                    .{ .id = "h", .name = "Michigan Wolverines", .abbreviation = "MICH", .score = "28", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "2",
+                .slug = "ala-lsu",
+                .name = "ALA at LSU",
+                .starts_at = "2026-09-12T19:00Z",
+                .state = "pre",
+                .status = "9/12 - 7:30 PM EDT",
+                .participants = &.{
+                    .{ .id = "c", .name = "Alabama Crimson Tide", .abbreviation = "ALA", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "d", .name = "LSU Tigers", .abbreviation = "LSU", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "3",
+                .slug = "uga-fla",
+                .name = "UGA at FLA",
+                .starts_at = "2026-09-12T23:00Z",
+                .state = "pre",
+                .status = "9/12 - 8:00 PM EDT",
+                .participants = &.{
+                    .{ .id = "e", .name = "Georgia Bulldogs", .abbreviation = "UGA", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "f", .name = "Florida Gators", .abbreviation = "FLA", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+        },
+    };
+    try std.testing.expect(view.boardIsPrePost(board));
+    try std.testing.expect(!view.boardIsAllFinal(board));
+    const body = try text(arena, board, false, null, 2);
+    defer arena.free(body);
+    // Two shown compact rows plus the capped trailer; the hidden game
+    // stays out of the text.
+    const widths = view.scoreboardCompactWidths(board);
+    const ncaaf = core.leagues.find("ncaaf").?;
+    for (board.games[0..2]) |game| {
+        const want = try view.homeGameLine(arena, ncaaf, game, widths.slug_w, widths.abbr_w);
+        defer if (want) |r| arena.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, body, want.?) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, body, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UGA") == null);
+    try std.testing.expect(!containsBraille(body));
+    var rule_lines: usize = 0;
+    var body_lines = std.mem.splitScalar(u8, body, '\n');
+    while (body_lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "─") != null) rule_lines += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rule_lines);
+    _ = try std.unicode.Utf8View.init(body);
+    // HTML lockstep: shown rows link, hidden rows don't, trailer survives
+    // with visible-text parity (the `+N more` href text).
+    const page = try scoreHtml(arena, board, null, 2);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/ncaaf/2026-09-12/osu-mich\" id=\"game-1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/ncaaf/2026-09-12/ala-lsu\" id=\"game-2\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "id=\"game-3\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, 2);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(body, seen);
+}
+
 test "mixed and empty boards keep their existing forms" {
-    // Any live/scheduled game keeps the rich card; an empty board keeps
-    // its note. Both hold through text and HTML parity.
+    // Any live game keeps the rich card; an empty board keeps its note.
+    // Both hold through text and HTML parity. (Pre/post boards with no
+    // live games go compact; see the compact test.)
     const arena = std.testing.allocator;
     const mixed: domain.Scoreboard = .{
         .league = "mlb",
@@ -4222,8 +4493,8 @@ test "mixed and empty boards keep their existing forms" {
                 .id = "2",
                 .name = "Later",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -4231,7 +4502,7 @@ test "mixed and empty boards keep their existing forms" {
     try std.testing.expect(!view.boardIsAllFinal(mixed));
     const rich = try text(arena, mixed, false, null, null);
     defer arena.free(rich);
-    for ([_][]const u8{ "Final", "AWY", "HME", "game: /mlb/2026-09-06/awy-hme", "Scheduled", "Later" }) |token| {
+    for ([_][]const u8{ "Final", "AWY", "HME", "game: /mlb/2026-09-06/awy-hme", "Top 7th", "Later" }) |token| {
         try std.testing.expect(std.mem.indexOf(u8, rich, token) != null);
     }
     const rich_page = try scoreHtml(arena, mixed, null, null);
@@ -4289,8 +4560,8 @@ test "scoreboard hostile fixture keeps text and HTML visible text equal" {
                 .id = "3",
                 .name = "Rain-delayed <i>showcase</i> & friends",
                 .starts_at = "2026-09-06T19:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{},
             },
         },
@@ -4371,8 +4642,8 @@ fn familyScoreboard() domain.Scoreboard {
                 .id = "11",
                 .name = "Rain-delayed <showcase> & friends",
                 .starts_at = "2026-09-06T19:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .network = "ESPN+",
                 .participants = &.{},
             },
@@ -4451,14 +4722,15 @@ test "family scoreboard per-league boards keep TV parity" {
                     .network = family.network,
                     .participants = &.{ family.away, family.home },
                 },
-                // Scheduled tail keeps the board mixed so the final
-                // renders its rich card (an all-final board goes compact).
+                // Live tail keeps the board rich so the final
+                // renders its full card (a pre/post board with no live
+                // games goes compact).
                 .{
                     .id = "2",
                     .name = "Later",
                     .starts_at = "2026-09-06T23:00Z",
-                    .state = "pre",
-                    .status = "Scheduled",
+                    .state = "in",
+                    .status = "Top 7th",
                     .participants = &.{},
                 },
             },
@@ -4478,3 +4750,69 @@ test "family scoreboard per-league boards keep TV parity" {
         try expectVisiblePreText(page, board, null, null);
     }
 }
+
+test "dated home skips fully-skipped sections without stray blanks" {
+    // A section whose every game is nothing-to-show (nameless,
+    // participant-free, so `view.homeGameLine` stays null) opens no bare
+    // header: the inter-section breather must join the neighboring
+    // sections directly, never land under a header or trail a section.
+    // Fixture: one-game NFL final between two one-game finals, with a
+    // fully-skipped NCAAM section in the middle, through the dated path.
+    const arena = std.testing.allocator;
+    const day = "2026-09-10";
+    const mlb_game: domain.Game = .{
+        .id = "2", .name = "TB at ATL", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .participants = &.{
+            .{ .id = "c", .name = "Tampa Bay Rays", .abbreviation = "TB", .score = "1", .winner = false, .home_away = "away" },
+            .{ .id = "d", .name = "Atlanta Braves", .abbreviation = "ATL", .score = "3", .winner = true, .home_away = "home" },
+        },
+    };
+    const stub_game: domain.Game = .{
+        .id = "9", .name = "", .starts_at = "", .state = "post", .status = "Final", .participants = &.{},
+    };
+    const nfl_game: domain.Game = .{
+        .id = "1", .name = "SF at LAR", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .participants = &.{
+            .{ .id = "a", .name = "San Francisco 49ers", .abbreviation = "SF", .score = "27", .winner = true, .home_away = "away" },
+            .{ .id = "h", .name = "Los Angeles Rams", .abbreviation = "LAR", .score = "7", .winner = false, .home_away = "home" },
+        },
+    };
+    // The stub composes to nothing, so the middle section must vanish.
+    try std.testing.expect(try view.homeGameLine(arena, core.leagues.find("ncaam").?, stub_game, 5, 3) == null);
+    const mlb_board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = day, .source = "test", .games = &.{mlb_game} };
+    const ncaam_board: domain.Scoreboard = .{ .league = "ncaam", .league_name = "NCAA Men's Basketball", .date = day, .source = "test", .games = &.{stub_game} };
+    const nfl_board: domain.Scoreboard = .{ .league = "nfl", .league_name = "NFL", .date = day, .source = "test", .games = &.{nfl_game} };
+    const results = [_]provider.LeagueResult{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+        .{ .league = core.leagues.find("ncaam").?, .board = ncaam_board },
+        .{ .league = core.leagues.find("nfl").?, .board = nfl_board },
+    };
+    const dated = try homeLive(arena, false, "example.test", &results, day, true, true);
+    defer arena.free(dated);
+    // Exact join: the MLB last row, exactly one breather, then the NFL
+    // header immediately followed by its single game row. Page-wide
+    // widths count the stub board's slug (`ncaam`), so the slug column
+    // is 5 wide here.
+    try std.testing.expect(std.mem.indexOf(u8, dated,
+        "mlb   TB    1 @ ATL   3 ✓       Final\n\nNFL  09-10\nnfl   SF   27 @ LAR   7 ✓       Final\n") != null);
+    // The skipped section leaves no header and no extra breather behind.
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NCAAM") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NCAA Men") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "\n\n\n") == null);
+    // Every section header is immediately followed by its first row:
+    // no blank between a header and its row, no trailing blank inside
+    // a section.
+    var lines = std.mem.splitScalar(u8, dated, '\n');
+    var prev_is_header = false;
+    while (lines.next()) |line| {
+        if (prev_is_header) try std.testing.expect(line.len != 0);
+        prev_is_header = std.mem.indexOf(u8, line, "  09-10") != null;
+    }
+    // No empty and no failed boards here, so the dated flag selects
+    // nothing: byte-identical to the today view.
+    const today = try homeLive(arena, false, "example.test", &results, day, true, false);
+    defer arena.free(today);
+    try std.testing.expectEqualStrings(today, dated);
+    _ = try std.unicode.Utf8View.init(dated);
+}
+

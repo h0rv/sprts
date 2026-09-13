@@ -1122,6 +1122,23 @@ pub fn boardIsAllFinal(board: domain.Scoreboard) bool {
     return true;
 }
 
+/// True when the board carries at least one game and no game is live
+/// (`state == "in"`): every game is pre or post (past + scheduled).
+/// Scoreboard renderers use this as the compact gate (see
+/// `render.textWithZoneArt`): dated league days — all-final past days,
+/// all-scheduled future days, and mixed post+pre days — all read as the
+/// same compact home-summary rows as the homepage, via the shared
+/// `homeGameLine` composer. Any live game keeps the rich card form;
+/// empty boards keep their note; unknown league slugs keep rich (no home
+/// geometry to compose).
+pub fn boardIsPrePost(board: domain.Scoreboard) bool {
+    if (board.games.len == 0) return false;
+    for (board.games) |game| {
+        if (std.mem.eql(u8, game.state, "in")) return false;
+    }
+    return true;
+}
+
 /// Scoreboard heading: `{League}  {date} {zone}`. Shared by text and
 /// HTML (via the text body the linkifier post-passes).
 /// Kept out of the one-line `?0` renderers, which stay bare by design.
@@ -1613,6 +1630,40 @@ test "all-final predicate and compact widths" {
     defer if (row) |r| arena.free(r);
     try std.testing.expect(std.mem.indexOf(u8, row.?, "mlb AWY   2 @ HME   5") != null);
     try std.testing.expect(std.mem.indexOf(u8, row.?, "Final") != null);
+}
+
+test "pre-post predicate gates compact on live absence" {
+    // The scoreboard compact gate (`render.textWithZoneArt`): any board
+    // with no live games — all-final past days, all-scheduled future
+    // days, mixed post+pre days — goes compact; any live game, or no
+    // games at all, stays out.
+    const final_game: domain.Game = .{
+        .id = "1", .name = "", .starts_at = "2026-09-06T17:00Z", .state = "post", .status = "Final",
+        .participants = &.{.{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false }},
+    };
+    const sched_game: domain.Game = .{
+        .id = "2", .name = "", .starts_at = "2026-09-06T23:00Z", .state = "pre", .status = "Scheduled",
+        .participants = &.{.{ .id = "b", .name = "Later", .abbreviation = "LTA", .score = "", .winner = false }},
+    };
+    const live_game: domain.Game = .{
+        .id = "3", .name = "", .starts_at = "2026-09-06T19:00Z", .state = "in", .status = "Top 7th",
+        .participants = &.{.{ .id = "c", .name = "Live", .abbreviation = "LIV", .score = "1", .winner = false }},
+    };
+    const all_final: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{final_game} };
+    try std.testing.expect(boardIsPrePost(all_final));
+    try std.testing.expect(boardIsAllFinal(all_final));
+    const all_sched: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{sched_game} };
+    try std.testing.expect(boardIsPrePost(all_sched));
+    try std.testing.expect(!boardIsAllFinal(all_sched));
+    const mixed: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{ final_game, sched_game } };
+    try std.testing.expect(boardIsPrePost(mixed));
+    try std.testing.expect(!boardIsAllFinal(mixed));
+    const with_live: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{ final_game, live_game } };
+    try std.testing.expect(!boardIsPrePost(with_live));
+    try std.testing.expect(!boardIsAllFinal(with_live));
+    const empty: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    try std.testing.expect(!boardIsPrePost(empty));
+    try std.testing.expect(!boardIsAllFinal(empty));
 }
 
 test "playsLines carry clock and wrap like scoring" {

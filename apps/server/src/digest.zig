@@ -223,6 +223,7 @@ fn datedText(
         const board = section.board orelse {
             const marker = try view.digestUnavailable(allocator, section.league.slug, day);
             defer allocator.free(marker);
+            if (emitted) try w.writeByte('\n');
             try w.print("{s}\n", .{marker});
             emitted = true;
             continue;
@@ -230,6 +231,19 @@ fn datedText(
         // Answered-but-empty is an off-day: skip the section entirely.
         if (board.games.len == 0) continue;
         const capped = @min(per_league, board.games.len);
+        // Visible-row lookahead (homeSections parity): a section opens
+        // only when at least one capped game composes to a row. A board
+        // of nothing-but-nothing-to-show opens no bare header — otherwise
+        // the inter-section breather lands directly under the header and
+        // reads as a stray blank inside the section.
+        var has_visible = false;
+        for (board.games[0..capped]) |game| {
+            const probe = try view.homeGameLine(allocator, section.league, game, widths.slug_w, widths.abbr_w) orelse continue;
+            allocator.free(probe);
+            has_visible = true;
+            break;
+        }
+        if (!has_visible) continue;
         if (emitted) try w.writeByte('\n');
         emitted = true;
         const header = try view.homeLeagueHeader(allocator, section.league.name, day);
@@ -502,6 +516,7 @@ fn datedHtml(
             const board = section.board orelse {
                 const marker = try view.digestUnavailable(allocator, section.league.slug, day);
                 defer allocator.free(marker);
+                if (emitted) try sec.writer.writeByte('\n');
                 try render.escapeInto(&sec.writer, marker);
                 try sec.writer.writeByte('\n');
                 emitted = true;
@@ -509,6 +524,14 @@ fn datedHtml(
             };
             if (board.games.len == 0) continue;
             const capped = @min(per_league, board.games.len);
+            var has_visible = false;
+            for (board.games[0..capped]) |game| {
+                const probe = try view.homeGameLine(allocator, section.league, game, widths.slug_w, widths.abbr_w) orelse continue;
+                allocator.free(probe);
+                has_visible = true;
+                break;
+            }
+            if (!has_visible) continue;
             if (emitted) try sec.writer.writeByte('\n');
             emitted = true;
             const header = try view.homeLeagueHeader(allocator, section.league.name, day);
@@ -861,17 +884,17 @@ test "digest art off strips section marks, keeps sections and pointers" {
                     .{ .id = "2", .name = "New York Mets", .abbreviation = "NYM", .score = "3", .winner = false },
                 },
             },
-            // Scheduled tail keeps the board mixed so the section renders
-            // its rich card (an all-final board goes compact).
+            // Live tail keeps the board rich so the section renders its
+            // full card (a pre/post board with no live games goes compact).
             .{
                 .id = "10",
                 .name = "AWY at HME",
                 .starts_at = "2026-09-06T23:00Z",
-                .state = "pre",
-                .status = "Scheduled",
+                .state = "in",
+                .status = "Top 7th",
                 .participants = &.{
-                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
-                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
+                    .{ .id = "3", .name = "Away", .abbreviation = "AWY", .score = "1", .winner = false },
+                    .{ .id = "4", .name = "Home", .abbreviation = "HME", .score = "2", .winner = false },
                 },
             },
         },
@@ -1177,6 +1200,71 @@ test "dated digest html reuses home links without scoreboard anchors" {
     try std.testing.expectEqualStrings(body, seen);
 }
 
+test "dated digest skips nothing-to-show sections without stray blanks" {
+    // Bug 2 lock (digest twin of the dated-home skipped-section test): a
+    // section whose every capped game is nothing-to-show (nameless,
+    // participant-free, so `view.homeGameLine` stays null) opens no bare
+    // header — the inter-section breather must join the neighboring
+    // sections directly, never land under a header or trail a section.
+    // Every emitted header is immediately followed by its first row: no
+    // blank between a header and its row, no trailing blank inside a
+    // section; blanks live BETWEEN sections only.
+    const arena = std.testing.allocator;
+    const day = "2026-09-10";
+    const mlb_game: core.domain.Game = .{
+        .id = "2", .name = "TB at ATL", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .participants = &.{
+            .{ .id = "c", .name = "Tampa Bay Rays", .abbreviation = "TB", .score = "1", .winner = false, .home_away = "away" },
+            .{ .id = "d", .name = "Atlanta Braves", .abbreviation = "ATL", .score = "3", .winner = true, .home_away = "home" },
+        },
+    };
+    const stub_game: core.domain.Game = .{
+        .id = "9", .name = "", .starts_at = "", .state = "post", .status = "Final", .participants = &.{},
+    };
+    const nfl_game: core.domain.Game = .{
+        .id = "1", .name = "SF at LAR", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .participants = &.{
+            .{ .id = "a", .name = "San Francisco 49ers", .abbreviation = "SF", .score = "27", .winner = true, .home_away = "away" },
+            .{ .id = "h", .name = "Los Angeles Rams", .abbreviation = "LAR", .score = "7", .winner = false, .home_away = "home" },
+        },
+    };
+    try std.testing.expect(try view.homeGameLine(arena, core.leagues.find("ncaam").?, stub_game, 5, 3) == null);
+    const mlb_board: core.domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = day, .source = "test", .games = &.{mlb_game} };
+    const ncaam_board: core.domain.Scoreboard = .{ .league = "ncaam", .league_name = "NCAA Men's Basketball", .date = day, .source = "test", .games = &.{stub_game} };
+    const nfl_board: core.domain.Scoreboard = .{ .league = "nfl", .league_name = "NFL", .date = day, .source = "test", .games = &.{nfl_game} };
+    const sections = [_]DigestSection{
+        .{ .league = core.leagues.find("mlb").?, .board = mlb_board },
+        .{ .league = core.leagues.find("ncaam").?, .board = ncaam_board },
+        .{ .league = core.leagues.find("nfl").?, .board = nfl_board },
+    };
+    const dated = try text(arena, &sections, day, false, null, null, true, true);
+    defer arena.free(dated);
+    // Exact join: MLB last row, exactly one breather, then the NFL header
+    // immediately followed by its single game row (no blank after header).
+    // Page-wide widths count the stub board's slug (`ncaam`), so the slug
+    // column is 5 wide here.
+    try std.testing.expect(std.mem.indexOf(u8, dated,
+        "mlb   TB    1 @ ATL   3 \xe2\x9c\x93       Final\n\nNFL  09-10\nnfl   SF   27 @ LAR   7 \xe2\x9c\x93       Final\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NCAAM") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "NCAA Men") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "\n\n\n") == null);
+    var lines = std.mem.splitScalar(u8, dated, '\n');
+    var prev_is_header = false;
+    while (lines.next()) |line| {
+        if (prev_is_header) try std.testing.expect(line.len != 0);
+        prev_is_header = std.mem.indexOf(u8, line, "  09-10") != null;
+    }
+    _ = try std.unicode.Utf8View.init(dated);
+    // HTML twin keeps the same spacing with visible-text parity.
+    const page = try html(arena, &sections, day, null, null, true, true);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "NCAAM") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    const seen = try view.expectVisibleParity(arena, page);
+    defer arena.free(seen);
+    try std.testing.expectEqualStrings(dated, seen);
+}
+
 test "digest hostile fixture keeps text and HTML visible text equal" {
     // Phase 5 lock: digest sections ride `render.text` (which composes
     // every row through the shared `view` composers), so hostile
@@ -1244,15 +1332,15 @@ test "digest html links every shown game and team like scoreboards" {
             .slug = try std.fmt.allocPrint(arena, "awy-hme-{d}", .{i}),
             .name = "Away at Home",
             .starts_at = "2026-09-06T17:00Z",
-            // Scheduled lead keeps the shown slice mixed so it renders
-            // its rich card (an all-final board goes compact). The lead
-            // sits inside the cap, so seven games still pin the cap at
+            // Live lead keeps the shown slice rich so it renders its full
+            // card (a pre/post board with no live games goes compact). The
+            // lead sits inside the cap, so seven games still pin the cap at
             // five and the `+2 more` pointer is unchanged.
-            .state = if (i == 0) "pre" else "post",
-            .status = if (i == 0) "Scheduled" else "Final",
+            .state = if (i == 0) "in" else "post",
+            .status = if (i == 0) "Top 7th" else "Final",
             .participants = if (i == 0) &.{
-                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "", .winner = false },
-                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "", .winner = false },
+                .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "1", .winner = false },
+                .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "2", .winner = false },
             } else &.{
                 .{ .id = "a", .name = "Away", .abbreviation = "AWY", .score = "2", .winner = false, .record = "69-74" },
                 .{ .id = "h", .name = "Home", .abbreviation = "HME", .score = "5", .winner = true, .record = "80-63" },

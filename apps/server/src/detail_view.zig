@@ -35,6 +35,17 @@ fn spLine(allocator: std.mem.Allocator, abbreviation: []const u8, name: []const 
     return std.fmt.allocPrint(allocator, "SP {s}: {s}", .{ abbreviation, name });
 }
 
+/// Canonical self address for one game: the human `/{league}/{date}/{slug}`
+/// when the game carries a stamped slug, else the legacy numeric
+/// `/{league}/{id}` (numeric URLs keep resolving). One decision point so
+/// the text pointer line and the HTML nav permalink can never drift.
+pub fn detailSelfHref(allocator: std.mem.Allocator, game: detail.GameDetail) ![]u8 {
+    if (game.slug.len > 0) {
+        return std.fmt.allocPrint(allocator, "/{s}/{s}/{s}", .{ game.league, game.date, game.slug });
+    }
+    return std.fmt.allocPrint(allocator, "/{s}/{s}", .{ game.league, game.id });
+}
+
 /// `width` is total terminal columns of the document. Never shrinks below
 /// the classic 52-wide page. `height` caps the scoring plays listed
 /// (`+N more (?height=M)` trailer); null/0 = latest 5.
@@ -242,6 +253,10 @@ pub fn renderText(allocator: std.mem.Allocator, game: detail.GameDetail, color: 
         try table.writeLine(w, line, cols, null, color);
     }
     try w.writeByte('\n');
+    const self = try detailSelfHref(allocator, game);
+    defer allocator.free(self);
+    try w.writeAll(self);
+    try w.writeByte('\n');
     const back = try std.fmt.allocPrint(allocator, "/{s}?date={s}\n", .{ game.league, game.date });
     defer allocator.free(back);
     try w.writeAll(back);
@@ -440,6 +455,12 @@ pub fn detailHtmlMtime(allocator: std.mem.Allocator, game: detail.GameDetail, wi
     }
     try w.writeAll("<nav>");
     try w.print("<a href=\"/{s}?date={s}\">scores</a>", .{ game.league, game.date });
+    // Canonical self address: the human slug form when the game carries
+    // one, numeric legacy fallback when absent. The API twin below stays
+    // numeric (JSON keeps ids, no slug twin — see router).
+    const self_href = try detailSelfHref(allocator, game);
+    defer allocator.free(self_href);
+    try w.print("<a href=\"{s}\">permalink</a>", .{self_href});
     try w.print("<a href=\"/api/v1/{s}/{s}\">json</a>", .{ game.league, game.id });
     try render.closePageWithNav(w);
     return out.toOwnedSlice();
@@ -2465,4 +2486,41 @@ test "detail win probability renders line and skips when absent" {
     const bare_page = try detailHtml(arena, testDetail(), null, null);
     defer arena.free(bare_page);
     try std.testing.expect(std.mem.indexOf(u8, bare_page, "Win probability:") == null);
+}
+
+// Slug-preferred self links: the detail page carries the game's stamped
+// slug, so its own address must ride the page in the human form (numeric
+// legacy fallback when the game carries none). Fixture-only, no ESPN.
+test "detail pages link the pretty slug address with numeric fallback" {
+    const arena = std.testing.allocator;
+    // Slug present (testDetail stamps "atl-phi"): text prints the human
+    // address, HTML links it as the nav permalink.
+    const body = try renderText(arena, testDetail(), false, null, null);
+    defer arena.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "/mlb/2026-09-06/atl-phi\n") != null);
+    const page = try detailHtml(arena, testDetail(), null, null);
+    defer arena.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/2026-09-06/atl-phi\">permalink</a>") != null);
+    // No human-family numeric game link: the id rides the API twin only.
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/mlb/401816828\">") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<a href=\"/api/v1/mlb/401816828\">json</a>") != null);
+    // Helper level: slug wins, empty slug falls back to the numeric id.
+    const pretty = try detailSelfHref(arena, testDetail());
+    defer arena.free(pretty);
+    try std.testing.expectEqualStrings("/mlb/2026-09-06/atl-phi", pretty);
+    var bare = testDetail();
+    bare.slug = "";
+    const fallback = try detailSelfHref(arena, bare);
+    defer arena.free(fallback);
+    try std.testing.expectEqualStrings("/mlb/401816828", fallback);
+    const bare_body = try renderText(arena, bare, false, null, null);
+    defer arena.free(bare_body);
+    try std.testing.expect(std.mem.indexOf(u8, bare_body, "/mlb/401816828\n") != null);
+    const bare_page = try detailHtml(arena, bare, null, null);
+    defer arena.free(bare_page);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "<a href=\"/mlb/401816828\">permalink</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bare_body, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare_page, "\x1b[") == null);
+    _ = try std.unicode.Utf8View.init(body);
+    _ = try std.unicode.Utf8View.init(page);
 }

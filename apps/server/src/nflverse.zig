@@ -381,6 +381,10 @@ pub const NflverseSource = struct {
     store: ?*std.heap.ArenaAllocator = null,
     rows: []const Row = &.{},
     stamp: []const u8 = "",
+    /// True once the missing-stamp warn has been emitted. Caches the
+    /// absent state so a missing snapshot warns once (startup/first
+    /// request) and later per-request hits degrade to `std.log.debug`.
+    warned_missing: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) NflverseSource {
         return .{ .allocator = allocator, .io = io, .dir = dir };
@@ -404,6 +408,19 @@ pub const NflverseSource = struct {
             self.rows = &.{};
             self.stamp = "";
         }
+        self.warned_missing = false;
+    }
+
+    /// Read the stamp once at startup so a missing snapshot warns once
+    /// here instead of per-request; later misses degrade to debug via
+    /// `ensureFreshLocked`. Best-effort: never fails startup.
+    pub fn prime(self: *NflverseSource) void {
+        if (self.dir.len == 0) return;
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        self.ensureFreshLocked() catch |err| {
+            std.log.debug("nflverse snapshot prime failed ({t})", .{err});
+        };
     }
 
     pub fn asSource(self: *NflverseSource) Source {
@@ -434,7 +451,14 @@ pub const NflverseSource = struct {
         const stamp_path = try std.fmt.allocPrint(self.allocator, "{s}/timestamp.txt", .{self.dir});
         defer self.allocator.free(stamp_path);
         const stamp_raw = std.Io.Dir.cwd().readFileAlloc(self.io, stamp_path, self.allocator, .limited(64)) catch |err| {
-            if (self.store == null) std.log.warn("nflverse snapshot stamp unreadable ({t}): no fallback until tools/fetch-nflverse runs", .{err});
+            if (self.store == null) {
+                if (!self.warned_missing) {
+                    self.warned_missing = true;
+                    std.log.warn("nflverse snapshot stamp unreadable ({t}): no fallback until tools/fetch-nflverse runs", .{err});
+                } else {
+                    std.log.debug("nflverse snapshot stamp still unreadable ({t}): no fallback", .{err});
+                }
+            }
             return;
         };
         defer self.allocator.free(stamp_raw);
@@ -674,4 +698,21 @@ test "Source vtable dispatches to the snapshot" {
     const board = (try source.asSource().fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-05")).?;
     try std.testing.expectEqualStrings(source_label, board.source);
     try std.testing.expect((try source.asSource().fetchBoard(arena, core.leagues.find("nfl").?, "2024-09-07")) == null);
+}
+
+test "missing stamp warns once and stays null without fallback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const league = core.leagues.find("nfl").?;
+    var source = NflverseSource.init(std.testing.allocator, testIo(), "nonexistent-nflverse-dir-for-test");
+    defer source.deinit();
+    // Startup prime emits the single warn; both lookups stay null (no
+    // fallback) with the absent state cached.
+    source.prime();
+    try std.testing.expect(source.warned_missing);
+    try std.testing.expect((try source.boardForDay(arena, league, "2024-09-05")) == null);
+    try std.testing.expect(source.warned_missing);
+    try std.testing.expect((try source.boardForDay(arena, league, "2024-09-05")) == null);
+    try std.testing.expect(source.warned_missing);
 }

@@ -19,6 +19,9 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("listening on http://{s}:{d}", .{ host, listener.socket.address.getPort() });
     var nv_source = server_app.nflverse.NflverseSource.init(allocator, io, nflverse_dir);
     defer nv_source.deinit();
+    // Prime the snapshot stamp once: a missing snapshot warns once here
+    // instead of per-request (later misses degrade to debug).
+    nv_source.prime();
     const adapter: server_app.provider.EspnAdapter = .{ .allocator = allocator, .io = io, .base_url = base_url, .nflverse = &nv_source };
     var cache = server_app.native_cache.NativeCache.init(allocator, io, server_app.native_cache.realClock);
     defer cache.deinit();

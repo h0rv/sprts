@@ -515,7 +515,13 @@ fn boardParticipant(
         if (competitor.team) |team| break :identity Identity{
             .id = team.id,
             .name = if (team.displayName.len > 0) team.displayName else team.name,
-            .abbreviation = team.abbreviation,
+            // ESPN omits `abbreviation` on placeholder (TBD) sides and the
+            // struct default is "?": a "?" names no team, so it normalizes
+            // to "" here — otherwise the game stamps a duel slug (`kno-?`)
+            // the alias router can never parse (its abbrevs are 1-8 ASCII
+            // alnum, so the stamped link 404s), while the ordinal fallback
+            // (`event-N`) resolves through the date_event arm.
+            .abbreviation = if (team.abbreviation.len == 0 or std.mem.eql(u8, team.abbreviation, "?")) "" else team.abbreviation,
         };
         if (competitor.athlete) |athlete| break :identity Identity{
             .id = competitor.id,
@@ -4983,6 +4989,11 @@ fn isDuel(game: *const core.domain.Game, first: []const u8, second: []const u8) 
     const a = game.participants[0].abbreviation;
     const b = game.participants[1].abbreviation;
     if (a.len == 0 or b.len == 0) return false;
+    // The provider's missing-value placeholder is no duel side (see
+    // `core.domain.isDuelGame`): the router never parses "?", so no
+    // routable query can match through it — only a stamped `?-` slug
+    // could, and those no longer stamp.
+    if (std.mem.eql(u8, a, "?") or std.mem.eql(u8, b, "?")) return false;
     return std.ascii.eqlIgnoreCase(a, first) and std.ascii.eqlIgnoreCase(b, second);
 }
 
@@ -5315,6 +5326,82 @@ test "stamped slugs resolve back through the alias lookups" {
     try std.testing.expectEqualStrings("swapped", findGameByMatchupN(stamped, "det", "min", 1).?.id);
     try std.testing.expectEqualStrings("race", findGameByOrdinal(stamped, 4).?.id);
     try std.testing.expect(findGameByOrdinal(stamped, 5) == null);
+}
+
+test "ucl boards stamp routable slugs and resolve board plus detail" {
+    // UCL 2026-09-10 shape: winnerless draws, 4-char abbreviations, and a
+    // placeholder side whose team object carries no abbreviation. The
+    // struct default "?" must NOT leak into the slug: a stamped `kno-?`
+    // href routes not_found (the game is not clickable) while every other
+    // league links fine, so the placeholder normalizes to "" and the game
+    // takes the ordinal form, which resolves through the date_event arm.
+    const board_fixture =
+        \\{"events":[{"id":"401915444","name":"AS Roma at Fenerbahce","date":"2026-09-10T16:45Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitions":[{"id":"401915444","date":"2026-09-10T16:45Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"id":"104","homeAway":"away","score":"1","winner":false,"team":{"id":"104","displayName":"AS Roma","abbreviation":"ROMA"}},{"id":"436","homeAway":"home","score":"1","winner":false,"team":{"id":"436","displayName":"Fenerbahce","abbreviation":"FEN"}}]}]},{"id":"401915443","name":"Bodo/Glimt at Bayern Munich","date":"2026-09-10T19:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitions":[{"id":"401915443","date":"2026-09-10T19:00Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"id":"2980","homeAway":"away","score":"0","winner":false,"team":{"id":"2980","displayName":"Bodo/Glimt","abbreviation":"BODO"}},{"id":"132","homeAway":"home","score":"5","winner":true,"team":{"id":"132","displayName":"Bayern Munich","abbreviation":"MUN"}}]}]},{"id":"9001","name":"Known at Mystery","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitions":[{"id":"9001","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"id":"1","homeAway":"away","score":"","winner":false,"team":{"id":"1","displayName":"Known FC","abbreviation":"KNO"}},{"id":"2","homeAway":"home","score":"","winner":false,"team":{"id":"2","displayName":"Mystery FC"}}]}]},{"id":"9002","name":"TBD at TBD","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitions":[{"id":"9002","date":"2026-09-10T19:00Z","status":{"type":{"state":"pre","shortDetail":"Scheduled"}},"competitors":[{"id":"3","homeAway":"away","score":"","winner":false,"team":{"id":"3","displayName":"TBD","abbreviation":""}},{"id":"4","homeAway":"home","score":"","winner":false,"team":{"id":"4","displayName":"TBD","abbreviation":""}}]}]}]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ucl = core.leagues.find("ucl").?;
+    const board = try parseAndNormalize(arena, ucl, "2026-09-10", board_fixture);
+    try std.testing.expectEqual(@as(usize, 4), board.games.len);
+    // Draws and 4-char pairings stamp the listed-order duel slug.
+    try std.testing.expectEqualStrings("roma-fen", board.games[0].slug);
+    try std.testing.expectEqualStrings("bodo-mun", board.games[1].slug);
+    // The omitted abbreviation normalizes to "" (never "?"), so both
+    // placeholder games take the board-ordinal form.
+    try std.testing.expectEqualStrings("", board.games[2].participants[1].abbreviation);
+    try std.testing.expectEqualStrings("event-3", board.games[2].slug);
+    try std.testing.expectEqualStrings("event-4", board.games[3].slug);
+    // Every href is non-empty and carries no placeholder: duels ride the
+    // human pair, ordinals the board position, all under the board date.
+    const want_hrefs = [_][]const u8{
+        "/ucl/2026-09-10/roma-fen",
+        "/ucl/2026-09-10/bodo-mun",
+        "/ucl/2026-09-10/event-3",
+        "/ucl/2026-09-10/event-4",
+    };
+    for (board.games, 0..) |game, i| {
+        try std.testing.expect(game.slug.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, game.slug, "?") == null);
+        const href = try core.domain.gameHref(arena, board.league, board.date, game);
+        try std.testing.expectEqualStrings(want_hrefs[i], href);
+    }
+    // Board resolution: duels match either order, the placeholder pair
+    // matches nothing (no duel exists to name), ordinals count every game.
+    try std.testing.expectEqualStrings("401915444", findGameByMatchup(board, "roma", "fen").?.id);
+    try std.testing.expectEqualStrings("401915444", findGameByMatchup(board, "fen", "roma").?.id);
+    try std.testing.expectEqualStrings("401915443", findGameByMatchup(board, "bodo", "mun").?.id);
+    try std.testing.expect(findGameByMatchup(board, "kno", "mys") == null);
+    try std.testing.expectEqualStrings("9001", findGameByOrdinal(board, 3).?.id);
+    try std.testing.expectEqualStrings("9002", findGameByOrdinal(board, 4).?.id);
+    try std.testing.expect(findGameByOrdinal(board, 5) == null);
+    // The numeric-id fallback still works for unstamped (hand-built) rows.
+    const legacy = try core.domain.gameHref(arena, "ucl", "2026-09-10", .{
+        .id = "9009",
+        .name = "",
+        .starts_at = "",
+        .state = "pre",
+        .status = "Scheduled",
+        .participants = &.{},
+    });
+    try std.testing.expectEqualStrings("/ucl/9009", legacy);
+    // Detail resolution: the summary joins the board row by id and carries
+    // the stamped slug, so the linked href lands on the game.
+    const summary_fixture =
+        \\{"header":{"competitions":[{"id":"401915444","date":"2026-09-10T16:45Z","status":{"type":{"state":"post","shortDetail":"FT"}},"competitors":[{"id":"436","homeAway":"home","winner":false,"score":1,"team":{"id":"436","displayName":"Fenerbahce","abbreviation":"FEN"}},{"id":"104","homeAway":"away","winner":false,"score":1,"team":{"id":"104","displayName":"AS Roma","abbreviation":"ROMA"}}]}]}}
+    ;
+    var fake = DetailFake{ .summary_body = summary_fixture, .board_body = board_fixture };
+    const detail = try detailAdapter(&fake).fetchDetail(arena, ucl, "401915444");
+    try std.testing.expectEqual(@as(usize, 1), fake.summary_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.board_calls);
+    try std.testing.expectEqualStrings("401915444", detail.id);
+    try std.testing.expectEqualStrings("roma-fen", detail.slug);
+    try std.testing.expectEqualStrings("ucl", detail.league);
+    try std.testing.expectEqualStrings("2026-09-10", detail.date);
+    try std.testing.expectEqualStrings("post", detail.state);
+    try std.testing.expectEqual(@as(usize, 2), detail.participants.len);
+    try std.testing.expectEqualStrings("ROMA", detail.participants[0].abbreviation);
+    try std.testing.expectEqualStrings("FEN", detail.participants[1].abbreviation);
 }
 
 test "boardHasNonDuels separates cards and fields from duel days" {
