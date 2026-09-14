@@ -1726,7 +1726,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
+    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
 ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -2656,6 +2656,110 @@ test "braille art rows keep a line-height-1 block span rule in the page style" {
     const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
     defer std.testing.allocator.free(scoreboard);
     try std.testing.expect(std.mem.indexOf(u8, scoreboard, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
+}
+
+test "page pre stack is mono-only so digits keep their advance" {
+    // Regression: `"Noto Sans Symbols 2"` is proportional and its ASCII
+    // coverage is digits-only (cmap: `0-9`, no letters, no `-/:` —
+    // verified against the shipped font file). Sitting mid-stack in the
+    // `pre` rule ahead of generic `monospace`, it stole digits on systems
+    // without the earlier mono faces while letters fell through to the
+    // terminal monospace: wide letterspaced digits (`2 0 2 6 - 0 9 - 1 3`),
+    // tight letters, broken columns. The `pre` stack must be monospace
+    // end to end so digits and letters share one advance.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,\"DejaVu Sans Mono\",monospace;") != null);
+    // Scope the ban to the `pre{...}` rule: the braille art-span rule
+    // keeps its own coverage stack (art rows carry no digits/letters),
+    // as does the mobile `.nobr` zone glue.
+    const pre_at = std.mem.indexOf(u8, page_style, "pre{margin:0;").?;
+    const pre_end = std.mem.indexOfScalarPos(u8, page_style, pre_at, '}').?;
+    try std.testing.expect(std.mem.indexOf(u8, page_style[pre_at..pre_end], "Noto Sans Symbols 2") == null);
+    // The kept fixes stay: braille art-span block rule + nobr glue.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, ".nobr{white-space:nowrap}") != null);
+}
+
+/// No `<...>` tag boundary may sit between two ASCII digits: links and
+/// spans must wrap whole digit runs, never split them, so every digit
+/// keeps its monospace advance and columns align.
+fn expectNoSplitDigits(page: []const u8) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, page, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, page, lt, '>') orelse return error.TestUnexpectedResult;
+        const before_is_digit = lt > 0 and page[lt - 1] >= '0' and page[lt - 1] <= '9';
+        const after_is_digit = gt + 1 < page.len and page[gt + 1] >= '0' and page[gt + 1] <= '9';
+        try std.testing.expect(!(before_is_digit and after_is_digit));
+        i = gt + 1;
+    }
+}
+
+test "scoreboard html keeps digit runs contiguous" {
+    // Dates, kickoff times, and scores reach the page as unbroken runs:
+    // the date-nav halves link whole `/all?date=…` tokens, the game
+    // anchor wraps the whole status, and the `.nobr` zone glue starts on
+    // a space (never between digits).
+    const board: domain.Scoreboard = .{
+        .league = "nfl",
+        .league_name = "NFL",
+        .date = "2026-09-13",
+        .source = "test",
+        .games = &.{
+            .{
+                .id = "1",
+                .slug = "dal-nyg",
+                .name = "",
+                .starts_at = "2026-09-14T00:20Z",
+                .state = "pre",
+                .status = "9/13 - 8:20 PM ET",
+                .participants = &.{
+                    .{ .id = "a", .name = "Dallas Cowboys", .abbreviation = "DAL", .score = "", .winner = false, .home_away = "away" },
+                    .{ .id = "h", .name = "New York Giants", .abbreviation = "NYG", .score = "", .winner = false, .home_away = "home" },
+                },
+            },
+            .{
+                .id = "2",
+                .slug = "nyj-buf",
+                .name = "",
+                .starts_at = "2026-09-13T17:00Z",
+                .state = "post",
+                .status = "Final",
+                .participants = &.{
+                    .{ .id = "a", .name = "New York Jets", .abbreviation = "NYJ", .score = "27", .winner = true, .home_away = "away" },
+                    .{ .id = "h", .name = "Buffalo Bills", .abbreviation = "BUF", .score = "24", .winner = false, .home_away = "home" },
+                },
+            },
+            // Live tail keeps the board rich (pre/post-only goes compact).
+            .{
+                .id = "3",
+                .name = "Later",
+                .starts_at = "2026-09-13T23:00Z",
+                .state = "in",
+                .status = "Q3 1:23",
+                .participants = &.{},
+            },
+        },
+    };
+    const page = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(page);
+    // Contiguous runs: board date, nav prev/next, kickoff date + time,
+    // scores, live clock. The zone glue rides a space boundary.
+    for ([_][]const u8{ "2026-09-13", "2026-09-12", "2026-09-14", "9/13 - 8:20", "8:20", "27", "24", "1:23" }) |run| {
+        try std.testing.expect(std.mem.indexOf(u8, page, run) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page, "<span class=\"nobr\">PM ET</span>") != null);
+    try expectNoSplitDigits(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "\x1b[") == null);
+    try expectVisiblePreText(page, board, null, null);
+
+    // Same pin through the home sibling-anchor path (game/team links
+    // split rows around abbreviations; scores ride the trailing link).
+    var results = [_]provider.LeagueResult{
+        .{ .league = leagues.find("nfl").?, .board = board },
+    };
+    const homepage = try homeHtmlLive(std.testing.allocator, "example.test", &results, "2026-09-13", false, false);
+    defer std.testing.allocator.free(homepage);
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "2026-09-13") != null);
+    try expectNoSplitDigits(homepage);
 }
 
 test "footer nav ends with the theme toggle on every page" {
