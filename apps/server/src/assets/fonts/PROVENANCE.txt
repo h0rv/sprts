@@ -1,0 +1,27 @@
+Self-hosted webfonts (no third-party CDN; same-origin only).
+
+- plex-mono-latin1-e8993d94.woff2 (17544 bytes)
+  IBM Plex Mono Regular, Latin1 subset, verbatim official build.
+  Upstream: https://github.com/IBM/plex/releases/download/%40ibm%2Fplex-mono%402.5.0/ibm-plex-mono.zip
+  (ibm-plex-mono/fonts/split/woff2/IBMPlexMono-Regular-Latin1.woff2)
+  License: SIL Open Font License 1.1 (see OFL-plex.txt).
+  Covers U+0020-007E + Latin-1 + smart quotes/dashes: all page
+  letters and digits live in this one file, so digits/letters can
+  never split across faces. Tabular digits (advance 600/1000upm).
+
+- plex-mono-pi-b8002770.woff2 (13780 bytes)
+  IBM Plex Mono Regular, Pi subset, verbatim official build.
+  Same upstream zip: .../fonts/split/woff2/IBMPlexMono-Regular-Pi.woff2
+  License: SIL Open Font License 1.1 (see OFL-plex.txt).
+  Covers U+2500-259F (box drawing + blocks), U+2713 (winner tick),
+  arrows U+2190-2199. Same 600 advance as Latin1.
+
+- adwaita-mono-braille-4fa851e7.woff2 (1624 bytes)
+  Adwaita Mono Regular subset to U+2800-28FF (braille), built with:
+  fonttools pyftsubset --unicodes=U+2800-28FF --flavor=woff2 --no-hinting
+  Source TTF upstream: https://gitlab.gnome.org/GNOME/adwaita-fonts/-/raw/main/mono/AdwaitaMono-Regular.ttf
+  License: SIL Open Font License 1.1 (see OFL-adwaita.txt).
+  All 256 braille cells, uniform 600 advance (verified from the cmap).
+
+Filenames carry the sha256 prefix of their bytes (immutable cache).
+Total: 32948 bytes.

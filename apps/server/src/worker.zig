@@ -54,6 +54,7 @@ const stream = @import("stream.zig");
 const tz = @import("tz.zig");
 const tour = @import("tour.zig");
 const vd = @import("view.zig");
+const fonts = @import("fonts.zig");
 
 const default_base_url = "https://site.api.espn.com/apis/site/v2";
 
@@ -239,6 +240,7 @@ pub fn fetch(request: *workers.Request, env: *workers.Env, _: *workers.Context) 
         .standings => |route| return serveStandings(env, alloc, route, format, zone),
         .tour => |route| return serveTour(alloc, route, format),
         .tour_asset => |route| return serveTourAsset(route),
+        .font => |route| return serveFont(alloc, route, format),
         .teams => |route| return serveTeams(env, alloc, route, format),
     }
 }
@@ -1307,6 +1309,25 @@ fn serveTourAsset(route: router.TourAssetRoute) workers.Response {
     const body = if (is_js) tour.xterm_js else tour.xterm_css;
     const content_type = if (is_js) tour.js_content_type else tour.css_content_type;
     return staticResponse(body, content_type, null);
+}
+
+/// Self-hosted webfonts (see `fonts.zig`): fingerprinted woff2 with the
+/// woff2 content type and an immutable year-long cache (the hash in the
+/// filename changes whenever the bytes do), never the edge cache. The
+/// router only matches known faces, so the lookup cannot miss; an
+/// unknown name answers the format-aware 404 instead of an empty 200.
+fn serveFont(alloc: std.mem.Allocator, route: router.FontRoute, format: router.Format) !workers.Response {
+    const body = fonts.find(route.name) orelse {
+        return errorResponse(alloc, "route not found", format, .not_found);
+    };
+    var resp = workers.Response.new();
+    resp.setStatus(.ok);
+    resp.setHeader("content-type", fonts.content_type);
+    resp.setHeader("cache-control", fonts.cache_control);
+    resp.setHeader("vary", edge.vary_value);
+    resp.setHeader("x-content-type-options", "nosniff");
+    resp.setBody(body);
+    return resp;
 }
 
 fn errorResponse(

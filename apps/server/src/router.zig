@@ -1,5 +1,6 @@
 const std = @import("std");
 const dates = @import("sprts_core").date;
+const fonts = @import("fonts.zig");
 
 pub const Format = enum { text, html, json };
 
@@ -207,6 +208,12 @@ pub const TourAssetRoute = struct {
     name: []const u8,
 };
 
+/// Self-hosted webfonts (`/fonts/...`): exact fingerprinted filenames
+/// only (see `fonts.zig`), anything else stays not_found.
+pub const FontRoute = struct {
+    name: []const u8,
+};
+
 pub const HomeRoute = struct {
     date: ?[]const u8,
     color: ?bool,
@@ -253,6 +260,7 @@ pub const Route = union(enum) {
     standings: StandingsRoute,
     tour: TourRoute,
     tour_asset: TourAssetRoute,
+    font: FontRoute,
     help: HelpRoute,
     openapi,
     docs,
@@ -293,6 +301,11 @@ pub fn parse(target: []const u8) Route {
     if (std.mem.eql(u8, path, "/favicon.svg")) return .favicon;
     if (std.mem.eql(u8, path, "/tour-assets/xterm.min.js")) return .{ .tour_asset = .{ .name = "xterm.min.js" } };
     if (std.mem.eql(u8, path, "/tour-assets/xterm.css")) return .{ .tour_asset = .{ .name = "xterm.css" } };
+    if (std.mem.startsWith(u8, path, "/fonts/")) {
+        const name = path["/fonts/".len..];
+        if (fonts.find(name) != null) return .{ .font = .{ .name = name } };
+        return .not_found;
+    }
     if (std.mem.eql(u8, path, "/llms.txt")) return .llms;
     if (std.mem.eql(u8, path, "/api/v1/leagues") or std.mem.eql(u8, path, "/api/v1")) return .leagues;
 
@@ -1700,6 +1713,42 @@ test "tour assets are exact vendored filenames only" {
     // Bare /tour-assets is a (unknown) league slug like /teams was:
     // the serve layer answers 404 via the league lookup.
     try std.testing.expect(parse("/tour-assets") == .scoreboard);
+}
+
+test "font routes are exact fingerprinted filenames only" {
+    // Every checked-in face resolves with its bare filename; the serve
+    // layer answers the bytes with the woff2 content type.
+    try std.testing.expect(parse("/fonts/plex-mono-latin1-e8993d94.woff2") == .font);
+    try std.testing.expect(parse("/fonts/plex-mono-pi-b8002770.woff2") == .font);
+    try std.testing.expect(parse("/fonts/adwaita-mono-braille-4fa851e7.woff2") == .font);
+    try std.testing.expectEqualStrings("plex-mono-pi-b8002770.woff2", parse("/fonts/plex-mono-pi-b8002770.woff2").font.name);
+    // Serve mapping the arms share: a parsed font route resolves to
+    // non-empty woff2 bytes under the woff2 content type (unknown names
+    // never parse here, so the arms never answer an empty 200).
+    for ([_][]const u8{
+        "/fonts/plex-mono-latin1-e8993d94.woff2",
+        "/fonts/plex-mono-pi-b8002770.woff2",
+        "/fonts/adwaita-mono-braille-4fa851e7.woff2",
+    }) |target| {
+        const body = fonts.find(parse(target).font.name).?;
+        try std.testing.expect(body.len > 1_000);
+        try std.testing.expect(std.mem.startsWith(u8, body, "wOF2"));
+    }
+    try std.testing.expectEqualStrings("font/woff2", fonts.content_type);
+    // Query strings ride along ignored (the fingerprint is the cache
+    // buster; `?v=` still serves).
+    try std.testing.expect(parse("/fonts/plex-mono-latin1-e8993d94.woff2?v=1") == .font);
+    try std.testing.expect(parse("/fonts/adwaita-mono-braille-4fa851e7.woff2/") == .font);
+    // Anything else under /fonts/ is not a face: wrong hash and wrong
+    // extension miss directly (the prefix is reserved, so these answer
+    // not_found, never a league slug).
+    try std.testing.expect(parse("/fonts/plex-mono-latin1-e8993d93.woff2") == .not_found);
+    try std.testing.expect(parse("/fonts/plex-mono-latin1-e8993d94.ttf") == .not_found);
+    try std.testing.expect(parse("/fonts/xterm.min.js") == .not_found);
+    // Bare /fonts (slash or not) is an (unknown) league slug like
+    // /tour-assets was: the serve layer answers 404 via the league lookup.
+    try std.testing.expect(parse("/fonts/") == .scoreboard);
+    try std.testing.expect(parse("/fonts") == .scoreboard);
 }
 
 test "numeric game URLs resolve while slug aliases stay canonical" {

@@ -14,6 +14,7 @@ pub const native_cache = @import("native_cache.zig");
 pub const stream = @import("stream.zig");
 pub const digest = @import("digest.zig");
 pub const tour = @import("tour.zig");
+pub const fonts = @import("fonts.zig");
 
 test {
     _ = provider;
@@ -32,4 +33,5 @@ test {
     _ = stream;
     _ = digest;
     _ = tour;
+    _ = fonts;
 }
