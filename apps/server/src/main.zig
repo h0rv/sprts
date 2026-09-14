@@ -797,6 +797,23 @@ fn handleRequest(allocator: std.mem.Allocator, io: std.Io, request: *std.http.Se
             asset_headers[2] = .{ .name = "x-content-type-options", .value = "nosniff" };
             try request.respond(body, .{ .status = status, .extra_headers = asset_headers[0..] });
         },
+        .font => |font| {
+            // Self-hosted webfonts (see `fonts.zig`): fingerprinted woff2
+            // with their own content type (not a Format) — tour-asset
+            // pattern, but immutable year-long cache since the hash in
+            // the filename changes whenever the bytes do.
+            status = .ok;
+            const body = server_app.fonts.find(font.name) orelse {
+                status = .not_found;
+                try respondError(arena, request, "route not found", format, .not_found);
+                return;
+            };
+            var font_headers: [3]std.http.Header = undefined;
+            font_headers[0] = .{ .name = "content-type", .value = server_app.fonts.content_type };
+            font_headers[1] = .{ .name = "cache-control", .value = server_app.fonts.cache_control };
+            font_headers[2] = .{ .name = "x-content-type-options", .value = "nosniff" };
+            try request.respond(body, .{ .status = status, .extra_headers = font_headers[0..] });
+        },
         .teams => |teams_route| {
             // JSON-only endpoint (no text/HTML twin): the team list is a
             // picker payload for JSON clients, and no text table exists
@@ -881,6 +898,7 @@ fn routeLabel(arena: std.mem.Allocator, route: server_app.router.Route) ![]u8 {
         .standings => |r| std.fmt.allocPrint(arena, "standings/{s}", .{r.league}),
         .tour => |r| if (r.league) |slug| try std.fmt.allocPrint(arena, "tour/{s}", .{slug}) else arena.dupe(u8, "tour"),
         .tour_asset => |r| std.fmt.allocPrint(arena, "tour-asset/{s}", .{r.name}),
+        .font => |r| std.fmt.allocPrint(arena, "font/{s}", .{r.name}),
         .teams => |r| std.fmt.allocPrint(arena, "teams/{s}", .{r.league}),
     };
 }

@@ -9,6 +9,7 @@ const provider = @import("provider.zig");
 const table = @import("table.zig");
 const tz = @import("tz.zig");
 const view = @import("view.zig");
+const fonts = @import("fonts.zig");
 
 /// Classic box: 52 terminal columns, 50 between the borders.
 const default_inner_width = 50;
@@ -1726,8 +1727,9 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
-;
+    "<style>" ++ fonts.font_face_css ++
+    \\:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 "Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:"Sprts Braille","Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
+    ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
 /// the tinygrad/pi.dev kind of minimal geometric favicon, in our own
@@ -2644,11 +2646,12 @@ test "page style is plaintext: no buttons, pre always scrolls" {
 test "braille art rows keep a line-height-1 block span rule in the page style" {
     // Color art rows render as `<span aria-hidden="true">` blocks (see
     // `writeColorArtRow`); the page style must pin those spans to
-    // `display:block` + `line-height:1` with a braille-capable mono stack
+    // `display:block` + `line-height:1` with the designated braille face
+    // first (self-hosted Adwaita Mono braille subset, uniform advance)
     // and no kerning/ligatures, so braille cells never drift apart.
     // (Wrapping plain mono art rows in spans is explicitly deferred.)
     try std.testing.expect(std.mem.indexOf(u8, page_style, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "\"DejaVu Sans Mono\",\"Noto Sans Symbols 2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "font-family:\"Sprts Braille\",\"Sprts Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,\"DejaVu Sans Mono\",monospace;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "font-kerning:none;font-variant-ligatures:none") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "\"liga\" 0,\"calt\" 0") != null);
     // The rule ships inside a rendered page, not just the style const.
@@ -2658,25 +2661,53 @@ test "braille art rows keep a line-height-1 block span rule in the page style" {
     try std.testing.expect(std.mem.indexOf(u8, scoreboard, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
 }
 
-test "page pre stack is mono-only so digits keep their advance" {
+test "page pre stack leads with the self-hosted mono webfont" {
     // Regression: `"Noto Sans Symbols 2"` is proportional and its ASCII
     // coverage is digits-only (cmap: `0-9`, no letters, no `-/:` —
     // verified against the shipped font file). Sitting mid-stack in the
     // `pre` rule ahead of generic `monospace`, it stole digits on systems
     // without the earlier mono faces while letters fell through to the
     // terminal monospace: wide letterspaced digits (`2 0 2 6 - 0 9 - 1 3`),
-    // tight letters, broken columns. The `pre` stack must be monospace
-    // end to end so digits and letters share one advance.
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,\"DejaVu Sans Mono\",monospace;") != null);
+    // tight letters, broken columns. The `pre` stack now leads with the
+    // self-hosted `Sprts Mono` webfont (IBM Plex Mono splits whose Latin1
+    // file holds BOTH letters and digits, so the two can never split
+    // across faces again) and keeps the system mono stack as fallback.
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre{margin:0;font:16px/1.5 \"Sprts Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,\"DejaVu Sans Mono\",monospace;") != null);
     // Scope the ban to the `pre{...}` rule: the braille art-span rule
-    // keeps its own coverage stack (art rows carry no digits/letters),
-    // as does the mobile `.nobr` zone glue.
+    // leads with its own designated braille face (art rows carry no
+    // digits/letters), as does the mobile `.nobr` zone glue.
     const pre_at = std.mem.indexOf(u8, page_style, "pre{margin:0;").?;
     const pre_end = std.mem.indexOfScalarPos(u8, page_style, pre_at, '}').?;
     try std.testing.expect(std.mem.indexOf(u8, page_style[pre_at..pre_end], "Noto Sans Symbols 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style[pre_at..pre_end], "Sprts Braille") == null);
     // The kept fixes stay: braille art-span block rule + nobr glue.
     try std.testing.expect(std.mem.indexOf(u8, page_style, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, ".nobr{white-space:nowrap}") != null);
+}
+
+test "page style embeds the self-hosted font faces with precise ranges" {
+    // Three `@font-face`s (see `fonts.font_face_css`): same-family
+    // Latin1 + Pi with disjoint unicode-ranges, plus the braille-only
+    // face. `font-display:swap` keeps first paint unblocked; every URL
+    // is a fingerprinted same-origin `/fonts/...woff2` (no CDN).
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "@font-face") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "font-display:swap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "unicode-range:U+0020-007E") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "U+2500-259F") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "U+2713") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "unicode-range:U+2800-28FF") != null);
+    for ([_][]const u8{ fonts.latin_path, fonts.pi_path, fonts.braille_path }) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, page_style, path) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "http") == null);
+    // Rendered pages carry the faces: the scoreboard references every
+    // fingerprinted URL through its shared head.
+    const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(scoreboard);
+    for ([_][]const u8{ fonts.latin_path, fonts.pi_path, fonts.braille_path }) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, scoreboard, path) != null);
+    }
 }
 
 /// No `<...>` tag boundary may sit between two ASCII digits: links and
@@ -5088,17 +5119,30 @@ test "dated home skips fully-skipped sections without stray blanks" {
     const arena = std.testing.allocator;
     const day = "2026-09-10";
     const mlb_game: domain.Game = .{
-        .id = "2", .name = "TB at ATL", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .id = "2",
+        .name = "TB at ATL",
+        .starts_at = "2026-09-10T17:00Z",
+        .state = "post",
+        .status = "Final",
         .participants = &.{
             .{ .id = "c", .name = "Tampa Bay Rays", .abbreviation = "TB", .score = "1", .winner = false, .home_away = "away" },
             .{ .id = "d", .name = "Atlanta Braves", .abbreviation = "ATL", .score = "3", .winner = true, .home_away = "home" },
         },
     };
     const stub_game: domain.Game = .{
-        .id = "9", .name = "", .starts_at = "", .state = "post", .status = "Final", .participants = &.{},
+        .id = "9",
+        .name = "",
+        .starts_at = "",
+        .state = "post",
+        .status = "Final",
+        .participants = &.{},
     };
     const nfl_game: domain.Game = .{
-        .id = "1", .name = "SF at LAR", .starts_at = "2026-09-10T17:00Z", .state = "post", .status = "Final",
+        .id = "1",
+        .name = "SF at LAR",
+        .starts_at = "2026-09-10T17:00Z",
+        .state = "post",
+        .status = "Final",
         .participants = &.{
             .{ .id = "a", .name = "San Francisco 49ers", .abbreviation = "SF", .score = "27", .winner = true, .home_away = "away" },
             .{ .id = "h", .name = "Los Angeles Rams", .abbreviation = "LAR", .score = "7", .winner = false, .home_away = "home" },
@@ -5120,8 +5164,7 @@ test "dated home skips fully-skipped sections without stray blanks" {
     // header immediately followed by its single game row. Page-wide
     // widths count the stub board's slug (`ncaam`), so the slug column
     // is 5 wide here.
-    try std.testing.expect(std.mem.indexOf(u8, dated,
-        "mlb   TB    1 @ ATL   3 ✓       Final\n\nNFL  09-10\nnfl   SF   27 @ LAR   7 ✓       Final\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dated, "mlb   TB    1 @ ATL   3 ✓       Final\n\nNFL  09-10\nnfl   SF   27 @ LAR   7 ✓       Final\n") != null);
     // The skipped section leaves no header and no extra breather behind.
     try std.testing.expect(std.mem.indexOf(u8, dated, "NCAAM") == null);
     try std.testing.expect(std.mem.indexOf(u8, dated, "NCAA Men") == null);
