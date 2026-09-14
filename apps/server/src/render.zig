@@ -1726,7 +1726,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const page_style =
-    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-wrap:break-word}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
+    \\<style>:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Symbols 2",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
 ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -2639,6 +2639,23 @@ test "page style is plaintext: no buttons, pre always scrolls" {
     // Theme rides on CSS vars; the toggle flips data-theme + localStorage.
     try std.testing.expect(std.mem.indexOf(u8, page_style, "--bg") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_style, "data-theme") != null);
+}
+
+test "braille art rows keep a line-height-1 block span rule in the page style" {
+    // Color art rows render as `<span aria-hidden="true">` blocks (see
+    // `writeColorArtRow`); the page style must pin those spans to
+    // `display:block` + `line-height:1` with a braille-capable mono stack
+    // and no kerning/ligatures, so braille cells never drift apart.
+    // (Wrapping plain mono art rows in spans is explicitly deferred.)
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "\"DejaVu Sans Mono\",\"Noto Sans Symbols 2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "font-kerning:none;font-variant-ligatures:none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "\"liga\" 0,\"calt\" 0") != null);
+    // The rule ships inside a rendered page, not just the style const.
+    const board: domain.Scoreboard = .{ .league = "mlb", .league_name = "MLB", .date = "2026-09-06", .source = "test", .games = &.{} };
+    const scoreboard = try scoreHtml(std.testing.allocator, board, null, null);
+    defer std.testing.allocator.free(scoreboard);
+    try std.testing.expect(std.mem.indexOf(u8, scoreboard, "pre span[aria-hidden=\"true\"]{display:block;line-height:1;") != null);
 }
 
 test "footer nav ends with the theme toggle on every page" {
