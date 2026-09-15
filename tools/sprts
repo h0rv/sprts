@@ -16,6 +16,8 @@ usage: sprts [--json] [--help] [watch] <league> [team|id|date|flag] [...]
   sprts nfl 0           one-line mode (?0)            sprts mlb phi today
   sprts phi             fav team ($SPRTS_LEAGUE)       sprts team         $SPRTS_TEAM
   sprts watch mlb       re-curl every 15s until ^C    sprts --json mlb   /api/v1/...
+  sprts mlb phi last    last game (live else final)   sprts mlb phi next   next game
+  sprts mlb phi game    most relevant game            sprts watch mlb phi last
 date words (today|tomorrow|yesterday|YYYY-MM-DD) -> ?date=; 0, *=*, weekN -> query
 env: SPRTS_HOST SPRTS_LEAGUE SPRTS_TEAM
 EOF
@@ -71,6 +73,7 @@ EOF
     while [ "$#" -gt 0 ]; do
         case "$1" in
         today) case "$_sP" in /*/*) _sP="$_sP/today" ;; *) _sQ="${_sQ:+${_sQ}&}date=$1" ;; esac ;;
+        last | next | game) case "$_sP" in /*/*) _sP="$_sP/$1" ;; *) _sQ="${_sQ:+${_sQ}&}$1" ;; esac ;;
         tomorrow | yesterday | [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) _sQ="${_sQ:+${_sQ}&}date=$1" ;;
         0 | *=*) _sQ="${_sQ:+${_sQ}&}$1" ;;
         week*) _sQ="${_sQ:+${_sQ}&}week=${1#week}" ;;

@@ -54,6 +54,14 @@
       // override miniflare wraps a phantom "SprtsContainer" export that the
       // Zig entry point doesn't provide (Class extends value undefined).
       "migrations": [],
+      // The wasm worker serves everything itself (fonts included, embedded
+      // in the binary) — no container or DO binding. `containers` must be
+      // repeated here because top-level keys are not inherited by
+      // environments. `durable_objects` is intentionally left at the top
+      // level only: redeclaring SPRTS_CONTAINER here makes wrangler demand
+      // the class from the Zig entrypoint (which doesn't export it), so the
+      // remaining "add a binding" notice is cosmetic and the deploy succeeds.
+      "containers": [],
       "observability": {
         "enabled": true,
         "logs": {

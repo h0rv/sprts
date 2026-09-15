@@ -102,6 +102,35 @@ curl -L https://sprts.horv.co/mlb/phi/today
 The `/api/v1/` twins (`/api/v1/mlb/phi/last`, `/api/v1/mlb/phi/next`)
 redirect the same way but keep the numeric game id.
 
+## Putting shortcuts to work
+
+The shell client speaks them directly, including live refresh:
+
+```sh
+sprts mlb phi last         # text: live game, else last final
+sprts mlb phi next         # text: next scheduled game
+sprts watch mlb phi last   # re-curl every 15s until ^C
+sprts --json mlb phi last  # the same game as JSON
+```
+
+Recipes for prompts, tmux segments, and cron (`-s` silences curl,
+`-L` follows the 302):
+
+```sh
+# One-line score, e.g. "Final: ATL 4 PHI 9"
+curl -Ls https://sprts.horv.co/api/v1/mlb/phi/last |
+  jq -r '"\(.status): " + ([.participants[] | "\(.abbreviation) \(.score)"] | join(" "))'
+
+# First pitch, e.g. "9/15 - 6:45 PM EDT at Nationals Park"
+curl -Ls https://sprts.horv.co/api/v1/mlb/phi/next |
+  jq -r 'select(.state == "pre") | "\(.status) at \(.venue)"'
+
+# Notify when last night's final is in (state flips to "post")
+curl -Ls https://sprts.horv.co/api/v1/mlb/phi/last |
+  jq -e 'select(.state == "post") | .status' >/dev/null &&
+  notify-send "Phillies final in"
+```
+
 ## Docs
 
 * Live reference: `https://sprts.horv.co/docs`
