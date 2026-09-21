@@ -72,6 +72,21 @@ early. `?tz=ET|UTC` (plus `EST`, `EDT`, `America/New_York`, `GMT`, `Z`,
 - Responses render from the cached board. Render flags stay out of the
   cache key.
 
+## Browser shell
+
+All HTML routes use the page shell in `render.zig`. `pageHead` and
+`pageHeadLive` open ordinary `<pre>` views; `pageMainHead` is the same shell
+for a specialized body such as the xterm tour. The shell is the only owner of
+the viewport, self-hosted fonts, theme boot script, color tokens, page spacing,
+skip link, home mark, and footer close. A specialized page may add component
+CSS, but it must build on those tokens instead of restating a second palette or
+document skeleton.
+
+The home mark is one decorative SVG using `currentColor`, with an explicit
+`114x30` intrinsic size and block layout. At phone widths it becomes `95x25`.
+Do not add theme-specific duplicate SVGs or leave either SVG dimension
+implicit: both patterns have produced extra line-box height on mobile engines.
+
 ## Tests
 
 - `mise run check` passes.

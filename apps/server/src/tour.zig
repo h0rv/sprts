@@ -23,6 +23,7 @@
 //! tour ignores content negotiation and always serves HTML).
 
 const std = @import("std");
+const render = @import("render.zig");
 
 /// Vendored xterm.js 5.5.0 UMD build (`Terminal` global). MIT licensed,
 /// see the header comment inside the file.
@@ -36,6 +37,21 @@ pub const html_content_type = "text/html; charset=utf-8";
 
 pub const js_path = "/tour-assets/xterm.min.js";
 pub const css_path = "/tour-assets/xterm.css";
+
+/// The terminal is a different content component, not a different site.
+/// Its small component stylesheet builds on the canonical page shell and
+/// design tokens from `render.zig`.
+const tour_head =
+    "<link rel=\"stylesheet\" href=\"" ++ css_path ++ "\">" ++
+    "<style>" ++
+    "main.tour{max-width:900px;font:16px/1.5 \"Sprts Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}" ++
+    ".tour header{color:var(--muted);margin-bottom:12px}.tour header h1{display:inline;color:var(--ink);font-weight:bold}" ++
+    ".tour #term{border:1px solid var(--line);min-height:240px;background:var(--bg)}" ++
+    ".tour #term .xterm{padding:8px}" ++
+    ".tour .hint{color:var(--muted);font-size:14px}.tour .hint code{color:var(--ink)}" ++
+    ".tour #links{margin-top:10px;font-size:14px}.tour #links a{margin:0 14px 6px 0;display:inline-block}" ++
+    "@media(max-width:480px){main.tour{font-size:13px}.tour #term .xterm{padding:4px}}" ++
+    "</style>";
 
 /// Full tour page for one league slug, or the digest tour when null (the
 /// player opens `/all?stream=sse...` then). The stream base rides in `BASE`
@@ -52,41 +68,28 @@ pub fn tourHtml(arena: std.mem.Allocator, league: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
-        "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
-        "<title>");
-    try escapeInto(w, title);
-    try w.writeAll("</title><link rel=\"stylesheet\" href=\"" ++ css_path ++ "\">" ++
-        "<style>" ++
-        "html,body{margin:0;background:#10140f;color:#e6ebe7}" ++
-        "main{max-width:900px;margin:auto;padding:20px 14px;font:16px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}" ++
-        "header{color:#8b968f;margin-bottom:12px}header strong{color:#e6ebe7}" ++
-        "header a,.hint a,#links a{color:#6fd3a0}" ++
-        "#term{border:1px solid #2a332c;min-height:240px;background:#10140f}" ++
-        "#term .xterm{padding:8px}" ++
-        ".hint{color:#8b968f;font-size:14px}.hint code{color:#e6ebe7}" ++
-        "#links{margin-top:10px;font-size:14px}#links a{margin:0 14px 6px 0;display:inline-block}" ++
-        ".dim{color:#8b968f}" ++
-        "</style></head><body><main><header><strong>");
-    try escapeInto(w, title);
-    try w.writeAll("</strong> &middot; live &middot; read-only &middot; <a href=\"/\">leagues</a> <a href=\"/:help\">help</a></header>" ++
+    try render.pageMainHead(w, title, tour_head, "tour");
+    try w.writeAll(render.skip_link ++ render.home_logo_mark ++ "<header><h1 id=\"content\">");
+    try render.escapeInto(w, title);
+    try w.writeAll("</h1> &middot; live &middot; read-only &middot; <a href=\"/\">leagues</a> <a href=\"/:help\">help</a></header>" ++
         "<div id=\"term\" role=\"img\" aria-label=\"Live scores terminal\"></div>" ++
         "<noscript><p>No JavaScript: this tour needs JS for the terminal. Same feed in curl: <code>curl -N '");
-    try escapeInto(w, curl_url);
+    try render.escapeInto(w, curl_url);
     try w.writeAll("'</code></p></noscript>" ++
         "<p class=\"hint\">Live feed, no input: resize refetches the width. Same frames in curl: <code>curl -N '");
-    try escapeInto(w, curl_url);
+    try render.escapeInto(w, curl_url);
     try w.writeAll("'</code></p><nav id=\"links\" aria-label=\"Games and teams in this frame\"></nav>" ++
         "<script src=\"" ++ js_path ++ "\"></script><script>(function(){\n" ++
         "var BASE='");
-    try escapeInto(w, base);
+    try render.escapeInto(w, base);
     try w.writeAll("';\n" ++
         \\var el=document.getElementById('term');
         \\var list=document.getElementById('links');
         \\var es=null,retry=null;
-        \\var term=new Terminal({cursorBlink:false,theme:{background:'#10140f',foreground:'#e6ebe7',cursor:'#e6ebe7'}});
+        \\function palette(){var s=getComputedStyle(document.documentElement);return {background:s.getPropertyValue('--bg').trim(),foreground:s.getPropertyValue('--ink').trim(),cursor:s.getPropertyValue('--ink').trim()};}
+        \\var term=new Terminal({cursorBlink:false,theme:palette()});
         \\term.open(el);
+        \\new MutationObserver(function(){term.options.theme=palette();}).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
         \\function cols(){
         \\var w=Math.floor(el.clientWidth/8.4);
         \\return Math.max(52,Math.min(200,w||80));
@@ -112,19 +115,9 @@ pub fn tourHtml(arena: std.mem.Allocator, league: ?[]const u8) ![]u8 {
         \\connect();
         \\})();
     );
-    try w.writeAll("</script></main></body></html>");
+    try w.writeAll("</script><nav><a href=\"/\">leagues</a><a href=\"/:help\">help</a>");
+    try render.closePageWithNav(w);
     return out.toOwnedSlice();
-}
-
-fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| switch (byte) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(byte),
-    };
 }
 
 test "vendored xterm assets are present with pinned content types" {
@@ -167,6 +160,15 @@ test "tour page wires xterm to the SSE stream with a no-JS fallback" {
     try std.testing.expect(std.mem.indexOf(u8, page, "onData") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "onKey") == null);
     try std.testing.expect(std.mem.indexOf(u8, page, "read-only") != null);
+    // The tour uses the canonical shell instead of carrying a parallel site:
+    // same responsive viewport, brand, theme tokens/toggle, and one h1 target.
+    try std.testing.expect(std.mem.indexOf(u8, page, "width=device-width,initial-scale=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, render.home_logo_mark) != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "--bg:#0d0e10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "light/dark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "<main class=\"tour\">") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, page, "<h1"));
+    try std.testing.expect(std.mem.indexOf(u8, page, "MutationObserver") != null);
 }
 
 test "digest tour streams the all-leagues feed" {

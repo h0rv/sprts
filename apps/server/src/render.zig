@@ -236,7 +236,7 @@ fn colorize(w: *std.Io.Writer, code: []const u8, s: []const u8, enabled: bool) !
 }
 
 /// Compact `sprts` wordmark for terminal home pages: the same 13
-/// (`logo_dark_svg`, 13 polygons on a 10-unit grid) transliterated with
+/// (`logo_svg`, 13 polygons on a 10-unit grid) transliterated with
 /// half-block characters so each logo pixel renders ~square — terminal
 /// cells are ~2:1 tall, so full blocks stretched the mark vertically.
 /// Pixel rows pair up (ascender+x-height, two mid rows, descender
@@ -1499,13 +1499,13 @@ pub fn homeHtml(allocator: std.mem.Allocator) ![]u8 {
     return homeHtmlDay(allocator, null);
 }
 
-/// Home page mark: the pixel-S favicon displayed above the table (outside
-/// `<pre>`, so visible-text tests never see it). Fixed size, cached with
-/// the favicon itself.
+/// Home page mark displayed above the content. It inherits `--ink`, so one
+/// SVG works in both themes; keeping two theme-specific copies used to leave
+/// two independently-sized inline SVG boxes in the page and was the source
+/// of intermittent extra vertical space on mobile browsers.
 pub const home_logo_mark =
     "<a class=\"logo-home\" href=\"/\" aria-label=\"sprts home\">" ++
-    "<span class=\"logo-dark\">" ++ logo_dark_svg ++ "</span>" ++
-    "<span class=\"logo-light\">" ++ logo_light_svg ++ "</span></a>\n";
+    logo_svg ++ "</a>";
 
 /// Skip-to-content link: the first `<main>` child on every HTML page,
 /// visually hidden until focused. Its target is the page `<h1>
@@ -1619,20 +1619,41 @@ pub fn pageHead(w: *std.Io.Writer, title: []const u8) !void {
     return pageHeadLive(w, title, false);
 }
 
-/// Page opener with the live-stream marker: when `live` is true the `<pre>`
-/// carries `data-live="1"`, which arms the live-update script (see
-/// `live_script`); otherwise the opener is byte-identical to `pageHead`, so
-/// static pages keep their exact bytes.
-pub fn pageHeadLive(w: *std.Io.Writer, title: []const u8, live: bool) !void {
+/// Shared document shell for pages whose body is not the normal `<pre>`
+/// view (currently the browser terminal tour). `head_extra` and
+/// `main_class` are compile-time/static application markup, never request
+/// data. Request-derived titles are escaped here exactly like regular pages.
+/// Keeping doctype, viewport, favicon, theme boot, design tokens, and main
+/// spacing in one function prevents special pages from quietly becoming a
+/// second site.
+pub fn pageMainHead(
+    w: *std.Io.Writer,
+    title: []const u8,
+    comptime head_extra: []const u8,
+    comptime main_class: ?[]const u8,
+) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">" ++
         "<title>");
     try escapeInto(w, title);
-    // Theme script before the stylesheet: the stored/OS theme lands on
-    // `data-theme` ahead of first CSS application, so navigating between
-    // pages never flashes the default theme (the reported "reset").
-    try w.writeAll("</title>" ++ theme_script ++ page_style ++ "</head><body><main>" ++ skip_link ++ home_logo_mark);
+    try w.writeAll("</title>" ++ theme_script ++ page_style ++ head_extra ++ "</head><body>");
+    if (main_class) |class| {
+        try w.writeAll("<main class=\"");
+        try w.writeAll(class);
+        try w.writeAll("\">");
+    } else {
+        try w.writeAll("<main>");
+    }
+}
+
+/// Page opener with the live-stream marker: when `live` is true the `<pre>`
+/// carries `data-live="1"`, which arms the live-update script (see
+/// `live_script`); otherwise the opener is byte-identical to `pageHead`, so
+/// static pages keep their exact bytes.
+pub fn pageHeadLive(w: *std.Io.Writer, title: []const u8, live: bool) !void {
+    try pageMainHead(w, title, "", null);
+    try w.writeAll(skip_link ++ home_logo_mark);
     if (live) {
         try w.writeAll("<pre data-live=\"1\">");
     } else {
@@ -1728,7 +1749,7 @@ pub fn escapeInto(w: *std.Io.Writer, value: []const u8) !void {
 
 const page_style =
     "<style>" ++ fonts.font_face_css ++
-    \\:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 "Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:"Sprts Braille","Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}}.logo-dark,.logo-light{display:block;margin:0 0 10px}.logo-light{display:none}html[data-theme="light"] .logo-dark{display:none}html[data-theme="light"] .logo-light{display:block}}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
+    \\:root{--bg:#0d0e10;--ink:#f2f3f4;--muted:#8a8f98;--link:#6fd3a0;--live:#ff7b7b;--up:#e8c547;--win:#5fd08a;--line:#2a332c}html[data-theme="light"]{--bg:#f4f1e8;--ink:#1c2420;--muted:#5f6a63;--link:#0b6e4f;--live:#c81e1e;--up:#8a6d00;--win:#0b6e4f;--line:#c9c4b8}html,body{margin:0;background:var(--bg);color:var(--ink)}main{max-width:640px;margin:auto;padding:20px 14px}pre{margin:0;font:16px/1.5 "Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;white-space:pre-wrap;word-wrap:break-word;font-kerning:none;font-variant-ligatures:none}pre span[aria-hidden="true"]{display:block;line-height:1;letter-spacing:0;word-spacing:0;white-space:pre;font-family:"Sprts Braille","Sprts Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-kerning:none;font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}a{color:var(--link)}pre a{color:var(--link);font-weight:bold;text-decoration:none}pre a:hover{text-decoration:underline;text-underline-offset:2px}.dim{color:var(--muted)}.live{color:var(--live);font-weight:bold}.upcoming{color:var(--up)}.win{color:var(--win);font-weight:bold}.nobr{white-space:nowrap}nav{margin-top:14px;font:14px "Sprts Mono",ui-monospace,monospace}nav a{margin-right:16px;padding:6px 2px}.logo-home{display:block;width:114px;height:30px;margin:0 0 10px;line-height:0;color:var(--ink)}.logo-home svg{display:block;width:114px;height:30px}a:focus-visible{outline:2px solid var(--link);outline-offset:2px}h1{margin:0;padding:0;font:inherit}.skip-link{position:absolute;left:-9999px;top:0;padding:8px;background:var(--bg);color:var(--link)}.skip-link:focus{position:static}.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}@media(max-width:480px){main{padding:12px 8px}pre{font-size:13px}.logo-home{width:95px;height:25px;margin-bottom:8px}.logo-home svg{width:95px;height:25px}}@media(prefers-contrast:more){.live{font-weight:900;text-decoration:underline}}</style>
     ;
 
 /// Site mark: 8x8 pixel S in chunky rects on a dark rounded square —
@@ -1739,17 +1760,12 @@ pub const favicon_svg =
     \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges"><rect width="64" height="64" fill="#0d0e10"/><g transform="translate(2,24) scale(0.3158)" fill="#f2f3f4"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></g></svg>
 ;
 
-/// Pixel wordmark `sprts` (lowercase, chunky rects like the
-/// favicon): transparent backgrounds so the page shows through.
-/// `logo_dark_svg` carries light ink for dark surfaces,
-/// `logo_light_svg` dark ink for light surfaces; the home page
-/// shows one or the other via the theme-swap classes below.
-pub const logo_dark_svg =
-    \\<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#f2f3f4"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
-;
-
-pub const logo_light_svg =
-    \\<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 210 70" width="120" shape-rendering="crispEdges" fill="#1c2420"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
+/// Pixel wordmark with a tight intrinsic box. Explicit width and height plus
+/// `display:block` in `page_style` avoid the inline-SVG baseline and default
+/// 150px replaced-element height differences seen across mobile engines.
+/// `currentColor` follows the shared theme without duplicate DOM nodes.
+pub const logo_svg =
+    \\<svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 190 50" width="114" height="30" shape-rendering="crispEdges" fill="currentColor"><polygon points="0,10 20,10 20,20 0,20" /><polygon points="0,20 30,20 30,30 0,30" /><polygon points="10,30 30,30 30,40 10,40" /><polygon points="40,10 50,10 50,50 40,50" /><polygon points="40,10 70,10 70,20 40,20" /><polygon points="60,20 70,20 70,40 60,40" /><polygon points="40,30 70,30 70,40 40,40" /><polygon points="80,10 90,10 90,40 80,40" /><polygon points="80,10 110,10 110,20 80,20" /><polygon points="130,40 130,20 120,20 120,10 130,10 130,0 140,0 140,10 150,10 150,20 140,20 140,30 150,30 150,40" /><polygon points="160,10 180,10 180,20 160,20" /><polygon points="160,20 190,20 190,30 160,30" /><polygon points="170,30 190,30 190,40 170,40" /></svg>
 ;
 /// Footer theme toggle: a single localStorage key persists the choice;
 /// without one the OS preference wins (matchMedia before first paint, so
@@ -2006,11 +2022,11 @@ test "HTML pages link and never carry ANSI" {
 
     const homepage = try homeHtml(std.testing.allocator);
     defer std.testing.allocator.free(homepage);
-    // Pixel mark above the table, outside the plaintext block: both
-    // theme variants ride along, CSS shows exactly one.
+    // Pixel mark above the table, outside the plaintext block: one SVG
+    // inherits the active theme color.
     try std.testing.expect(std.mem.indexOf(u8, homepage, home_logo_mark) != null);
-    try std.testing.expect(std.mem.indexOf(u8, homepage, "logo-dark") != null);
-    try std.testing.expect(std.mem.indexOf(u8, homepage, "logo-light") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, homepage, "<svg aria-hidden=\"true\""));
+    try std.testing.expect(std.mem.indexOf(u8, homepage, "fill=\"currentColor\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/mlb\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/docs\">docs</a>") != null);
     try std.testing.expect(std.mem.indexOf(u8, homepage, "<a href=\"/openapi.json\">spec</a>") != null);
@@ -2244,10 +2260,9 @@ test "web accessibility: names, focus, art, targets, live, headings, links" {
     const page = try scoreHtml(std.testing.allocator, board, null, null);
     defer std.testing.allocator.free(page);
 
-    // 1. Logo link has an accessible name; theme SVGs hide from AT.
+    // 1. Logo link has an accessible name; its decorative SVG hides from AT.
     try std.testing.expect(std.mem.indexOf(u8, page, "aria-label=\"sprts home\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "aria-hidden=\"true\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "aria-hidden=\"true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_svg, "aria-hidden=\"true\"") != null);
 
     // 2. Keyboard focus is visible.
     try std.testing.expect(std.mem.indexOf(u8, page_style, "a:focus-visible{outline:2px solid var(--link);outline-offset:2px}") != null);
@@ -2813,14 +2828,15 @@ test "footer nav ends with the theme toggle on every page" {
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<polygon") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<rect") != null);
     try std.testing.expect(std.mem.indexOf(u8, favicon_svg, "<text") == null);
-    // Wordmark variants: dark surfaces get light ink and vice versa, no
-    // fonts anywhere, theme swap rides the data-theme CSS classes.
-    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "#f2f3f4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "#1c2420") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logo_dark_svg, "viewBox=\"-10 -10 210 70\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logo_light_svg, "font") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-light") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-dark") != null);
+    // The wordmark has one theme-aware SVG with an explicit, tight box.
+    try std.testing.expect(std.mem.indexOf(u8, logo_svg, "fill=\"currentColor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_svg, "viewBox=\"0 0 190 50\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_svg, "width=\"114\" height=\"30\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logo_svg, "font") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, ".logo-home{display:block;width:114px;height:30px;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, ".logo-home svg{display:block;width:114px;height:30px}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-light") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_style, "logo-dark") == null);
     const err = try errorBody(std.testing.allocator, "nope", .html);
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "light/dark") != null);
